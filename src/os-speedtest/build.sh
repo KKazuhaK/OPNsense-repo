@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-speedtest}"
-VERSION="${VERSION:-1.0.1}"
+VERSION="${VERSION:-1.0.2}"
 ORIGIN="${ORIGIN:-opnsense/os-speedtest}"
 COMMENT="${COMMENT:-Internet speed test integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"

@@ -60,7 +60,9 @@ function speedtest_outbound_interfaces(): array {
     global $config;
     $result = [];
     foreach ((array)($config['interfaces'] ?? []) as $name => $item) {
-        if (!is_array($item) || empty($item['enable']) || empty($item['gateway']) || empty($item['if'])) continue;
+        if (!is_array($item) || empty($item['enable']) || empty($item['if'])) continue;
+        $is_dhcp = strtolower((string)($item['ipaddr'] ?? '')) === 'dhcp';
+        if (empty($item['gateway']) && !$is_dhcp) continue;
         $address = speedtest_runtime_ipv4((string)$item['if']);
         if ($address === '') continue;
         $description = trim((string)($item['descr'] ?? '')) ?: strtoupper((string)$name);
@@ -201,7 +203,7 @@ include('fbegin.inc');
 </div>
 <div class="panel panel-default speedtest-panel"><div class="speedtest-panel-heading"><?=speedtest_t('result')?></div><table class="table table-striped table-condensed speedtest-result">
 <tr><th><?=speedtest_t('time')?></th><td><?=htmlspecialchars((string)($result['timestamp']??''))?></td></tr>
-<tr><th><?=speedtest_t('isp')?></th><td><?=htmlspecialchars(trim((string)($user['isp']??'').' / '.(string)($user['IP']??$user['ip']??''),' /'))?></td></tr>
+<tr><th><?=speedtest_t('isp')?></th><td><?=htmlspecialchars(trim((string)($user['isp']??$user['Isp']??'').' / '.(string)($user['IP']??$user['ip']??''),' /'))?></td></tr>
 <tr><th><?=speedtest_t('test_server')?></th><td><?=htmlspecialchars('['.($server_result['id']??'').'] '.($server_result['name']??'').' - '.($server_result['sponsor']??''))?></td></tr>
 <tr><th><?=speedtest_t('distance')?></th><td><?=number_format((float)($server_result['distance']??0),2)?> km</td></tr>
 <tr><th><?=speedtest_t('engine')?></th><td>speedtest-go 1.7.10</td></tr></table></div>

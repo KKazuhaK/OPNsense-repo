@@ -15,6 +15,7 @@ const LANGTOOL_DOWNLOAD_URL = 'https://cloud.pfchina.org/index.php/s/CYFKMKGY7sp
 const LANGTOOL_TRUSTED_HOST = 'cloud.pfchina.org';
 const LANGTOOL_INSTALL_ROOT = '/usr/local';
 const LANGTOOL_EXPECTED_SHA256 = '';
+const LANGTOOL_SELF_PATH = 'www/lang_update.php';
 
 function langtool_language()
 {
@@ -222,12 +223,18 @@ function langtool_validate_entries($entries, &$log)
 {
     $allowed_prefixes = array('bin/', 'etc/', 'include/', 'lib/', 'man/', 'opnsense/', 'sbin/', 'share/', 'www/');
     foreach ($entries as $entry) {
-        if ($entry === 'readme.md' || substr($entry, -1) === '/') {
-            continue;
-        }
-        if ($entry[0] === '/' || strpos($entry, '\\') !== false || preg_match('#(^|/)\.\.($|/)#', $entry)) {
+        if (
+            $entry === '' ||
+            $entry[0] === '/' ||
+            strpos($entry, "\0") !== false ||
+            strpos($entry, '\\') !== false ||
+            preg_match('#(^|/)\.\.($|/)#', $entry)
+        ) {
             langtool_log($log, langtool_t('Archive contains unsafe path') . ': ' . $entry);
             return false;
+        }
+        if ($entry === 'readme.md') {
+            continue;
         }
         $allowed = false;
         foreach ($allowed_prefixes as $prefix) {
@@ -238,6 +245,92 @@ function langtool_validate_entries($entries, &$log)
         }
         if (!$allowed) {
             langtool_log($log, langtool_t('Archive contains unsupported path') . ': ' . $entry);
+            return false;
+        }
+    }
+    return true;
+}
+
+function langtool_ensure_directory($directory)
+{
+    $root = rtrim(LANGTOOL_INSTALL_ROOT, DIRECTORY_SEPARATOR);
+    if ($directory === $root) {
+        return is_dir($root);
+    }
+    if (strpos($directory, $root . DIRECTORY_SEPARATOR) !== 0) {
+        return false;
+    }
+
+    $relative = substr($directory, strlen($root) + 1);
+    $current = $root;
+    foreach (explode(DIRECTORY_SEPARATOR, $relative) as $component) {
+        if ($component === '') {
+            continue;
+        }
+        $current .= DIRECTORY_SEPARATOR . $component;
+        if (is_link($current)) {
+            return false;
+        }
+        if (!is_dir($current)) {
+            $old_umask = umask(0);
+            $created = mkdir($current, 0755);
+            umask($old_umask);
+            if (!$created) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+function langtool_install_files($staging, $entries, &$log)
+{
+    $staging_root = realpath($staging);
+    if ($staging_root === false) {
+        return false;
+    }
+
+    foreach ($entries as $entry) {
+        if ($entry === 'readme.md' || $entry === LANGTOOL_SELF_PATH || substr($entry, -1) === '/') {
+            continue;
+        }
+
+        $source = $staging_root . DIRECTORY_SEPARATOR . $entry;
+        $source_real = realpath($source);
+        if (
+            $source_real === false ||
+            strpos($source_real, $staging_root . DIRECTORY_SEPARATOR) !== 0 ||
+            is_link($source) ||
+            !is_file($source_real)
+        ) {
+            langtool_log($log, langtool_t('Archive contains unsupported path') . ': ' . $entry);
+            return false;
+        }
+
+        $destination = rtrim(LANGTOOL_INSTALL_ROOT, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $entry;
+        $destination_directory = dirname($destination);
+        if (!langtool_ensure_directory($destination_directory) || is_link($destination)) {
+            langtool_log($log, langtool_t('Installation failed.') . ' ' . $entry);
+            return false;
+        }
+
+        $mode = file_exists($destination) ? (fileperms($destination) & 0777) : 0644;
+        $owner = file_exists($destination) ? fileowner($destination) : 0;
+        $group = file_exists($destination) ? filegroup($destination) : 0;
+        $temporary = tempnam($destination_directory, '.lang_update_');
+        if ($temporary === false) {
+            langtool_log($log, langtool_t('Installation failed.') . ' ' . $entry);
+            return false;
+        }
+
+        $installed = copy($source_real, $temporary) &&
+            chmod($temporary, $mode) &&
+            chown($temporary, $owner) &&
+            chgrp($temporary, $group) &&
+            rename($temporary, $destination);
+        if (!$installed) {
+            @unlink($temporary);
+            langtool_log($log, langtool_t('Installation failed.') . ' ' . $entry);
             return false;
         }
     }
@@ -283,10 +376,7 @@ function langtool_install(&$log, &$readme)
             return false;
         }
 
-        // The staging directory itself is archived as "." and extracted over
-        // /usr/local, so keep its mode aligned with the destination root.
-        // Its parent remains private (0700) for the duration of the update.
-        mkdir($staging, 0755);
+        mkdir($staging, 0700);
         langtool_log($log, langtool_t('Extracting package...'));
         $extract = langtool_run('unzip -q -o ' . escapeshellarg($archive) . ' -d ' . escapeshellarg($staging));
         if ($extract['status'] !== 0) {
@@ -300,10 +390,7 @@ function langtool_install(&$log, &$readme)
         @unlink($readme_file);
 
         langtool_log($log, langtool_t('Installing localization files...'));
-        $install = langtool_run('tar -C ' . escapeshellarg($staging) . ' -cf - . | tar -C ' . escapeshellarg(LANGTOOL_INSTALL_ROOT) . ' -xf -');
-        if ($install['status'] !== 0) {
-            langtool_log($log, langtool_t('Installation failed.'));
-            $log = array_merge($log, $install['output']);
+        if (!langtool_install_files($staging, $entries, $log)) {
             return false;
         }
 

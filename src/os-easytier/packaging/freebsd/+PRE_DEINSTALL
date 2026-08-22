@@ -1,0 +1,27 @@
+#!/bin/sh
+# Stop EasyTier with a bounded wait.  rc.subr's normal process wait can block a
+# package operation for a long time when easytier-core is slow to terminate.
+pidfile=/var/run/easytier.pid
+pid=""
+[ -r "${pidfile}" ] && pid="$(cat "${pidfile}" 2>/dev/null || true)"
+case "${pid}" in
+    ''|*[!0-9]*) pid="" ;;
+esac
+if [ -n "${pid}" ] && /bin/ps -p "${pid}" -o command= 2>/dev/null | /usr/bin/grep -q '^/usr/local/sbin/easytier-core'; then
+    /bin/kill -TERM "${pid}" >/dev/null 2>&1 || true
+    count=0
+    while /bin/kill -0 "${pid}" >/dev/null 2>&1 && [ "${count}" -lt 5 ]; do
+        /bin/sleep 1
+        count=$((count + 1))
+    done
+    /bin/kill -KILL "${pid}" >/dev/null 2>&1 || true
+fi
+
+# Clean only EasyTier-owned runtime state.  Do not reload the global firewall,
+# which could disturb unrelated SSH sessions and other active connections.
+rm -f "${pidfile}" /var/run/easytier.rules
+/sbin/pfctl -a easytier -F rules >/dev/null 2>&1 || true
+if /sbin/ifconfig easytier0 >/dev/null 2>&1; then
+    /sbin/ifconfig easytier0 destroy >/dev/null 2>&1 || true
+fi
+sysrc -q -x easytier_enable >/dev/null 2>&1 || true

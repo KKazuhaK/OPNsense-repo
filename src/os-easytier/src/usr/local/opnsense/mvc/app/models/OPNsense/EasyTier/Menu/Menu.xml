@@ -1,0 +1,7 @@
+<menu>
+  <VPN>
+    <EasyTier VisibleName="EasyTier" order="70" cssClass="fa fa-share-alt fa-fw" url="/easytier.php">
+      <Args url="/easytier.php?*" visibility="hidden"/>
+    </EasyTier>
+  </VPN>
+</menu>

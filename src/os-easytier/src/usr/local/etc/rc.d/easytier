@@ -1,0 +1,79 @@
+#!/bin/sh
+# PROVIDE: easytier
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="easytier"
+rcvar="easytier_enable"
+desc="EasyTier mesh VPN"
+command="/usr/sbin/daemon"
+procname="/usr/local/sbin/easytier-core"
+pidfile="/var/run/easytier.pid"
+logfile="/var/log/easytier.log"
+configfile="/usr/local/etc/easytier/config.toml"
+command_args="-p ${pidfile} -o ${logfile} -t easytier ${procname} --config-file ${configfile}"
+start_precmd="easytier_prestart"
+start_postcmd="easytier_poststart"
+stop_postcmd="easytier_poststop"
+
+easytier_reload_filter()
+{
+    # Package removal must not reload the complete ruleset: a global reload can
+    # disturb unrelated management sessions.  The uninstall hook sets this
+    # flag and the dedicated EasyTier anchor is cleaned separately below.
+    [ "${easytier_skip_filter_reload:-NO}" = "YES" ] && return 0
+    /usr/local/sbin/configctl filter reload >/dev/null 2>&1 || true
+}
+
+easytier_load_anchor()
+{
+    rules="/var/run/easytier.rules"
+    umask 077
+    cat > "${rules}" <<'EOF'
+pass in quick on easytier0 inet from any to any flags S/SA keep state label "easytier_any_to_any_pass"
+EOF
+    /sbin/pfctl -n -f "${rules}" >/dev/null 2>&1 || return 1
+    /sbin/pfctl -a easytier -f "${rules}"
+}
+
+easytier_prestart()
+{
+    if [ ! -s "${configfile}" ]; then
+        echo "EasyTier configuration is missing or empty: ${configfile}"
+        return 1
+    fi
+    install -d -m 0700 /usr/local/etc/easytier
+    touch "${logfile}"
+    chmod 0600 "${logfile}" "${configfile}"
+    rm -f "${pidfile}"
+}
+
+easytier_poststart()
+{
+    count=0
+    while ! /sbin/ifconfig easytier0 >/dev/null 2>&1 && [ "${count}" -lt 10 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    easytier_reload_filter
+    if /sbin/ifconfig easytier0 >/dev/null 2>&1; then
+        easytier_load_anchor
+    fi
+}
+
+easytier_poststop()
+{
+    rm -f "${pidfile}"
+    rm -f /var/run/easytier.rules
+    /sbin/pfctl -a easytier -F rules >/dev/null 2>&1 || true
+    if /sbin/ifconfig easytier0 >/dev/null 2>&1; then
+        /sbin/ifconfig easytier0 destroy >/dev/null 2>&1 || true
+    fi
+    easytier_reload_filter
+}
+
+: ${easytier_enable:="NO"}
+load_rc_config "${name}"
+run_rc_command "$1"

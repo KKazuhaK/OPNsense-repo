@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+mkdir -p /usr/local/etc/easytier /var/log
+if [ ! -e /usr/local/etc/easytier/config.toml ]; then
+    install -m 0600 /usr/local/etc/easytier/config.toml.sample /usr/local/etc/easytier/config.toml
+fi
+chmod 0600 /usr/local/etc/easytier/config.toml
+touch /var/log/easytier.log
+chmod 0600 /var/log/easytier.log
+sysrc -q easytier_enable=NO >/dev/null 2>&1 || true
+service configd restart >/dev/null 2>&1 || true
+configctl filter reload >/dev/null 2>&1 || true
+# OPNsense caches the merged sidebar model for up to one hour.  Invalidate it
+# so the newly installed VPN menu entry is visible on the next page request.
+rm -f /var/lib/php/tmp/opnsense_menu_cache.xml
+echo "EasyTier installed. Open VPN > EasyTier to configure it."

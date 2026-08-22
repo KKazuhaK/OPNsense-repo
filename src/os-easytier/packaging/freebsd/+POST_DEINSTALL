@@ -1,0 +1,6 @@
+#!/bin/sh
+rm -f /var/run/easytier.pid
+service configd restart >/dev/null 2>&1 || true
+# Remove the cached menu model so the stale EasyTier entry disappears at once.
+rm -f /var/lib/php/tmp/opnsense_menu_cache.xml
+echo "EasyTier removed. Configuration and logs were preserved."

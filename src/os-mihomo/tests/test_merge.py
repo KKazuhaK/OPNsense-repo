@@ -16,8 +16,9 @@ class MergeTests(unittest.TestCase):
         self.data = m.parse_yaml(SUBSCRIPTION)
         self.overlay = m.parse_yaml((m.Path(m.__file__).resolve().parents[3] / 'share/mihomo/presets/full.yaml').read_bytes())
 
-    def generated(self, overlay=None, **kwargs):
-        return m.parse_yaml(m.render(self.data, self.settings, overlay=self.overlay if overlay is None else overlay, **kwargs))
+    def generated(self, overlay=None, settings=None, **kwargs):
+        return m.parse_yaml(m.render(self.data, settings or self.settings,
+            overlay=self.overlay if overlay is None else overlay, **kwargs))
 
     def test_deep_mapping_plain_replacement_and_all_six_extensions(self):
         base = {'dns': {'nameserver-policy': {'home.test': ['127.0.0.1']}, 'listen': ':1053'}, 'rules': ['MATCH,DIRECT'], 'proxies': ['old'], 'proxy-groups': ['old-group']}
@@ -50,8 +51,12 @@ class MergeTests(unittest.TestCase):
         for key in ('port', 'socks-port', 'mixed-port', 'redir-port', 'tproxy-port'):
             overlay = m.merge_yaml(self.overlay, {key: 53})
             with self.assertRaises(m.Error): self.generated(overlay)
-        for overlay in ({'dns': {'listen': '[::1]:53'}}, {'dns': {'listen': '127.0.0.1:053'}}, {'external-controller': '127.0.0.1:53'}, {'external-controller': '127.0.0.1:domain'}, {'listeners': [{'port': 53}]}, {'listeners': [{'port': '0x35'}]}):
+        for overlay in ({'dns': {'listen': '[::1]:53'}}, {'dns': {'listen': '127.0.0.1:053'}}, {'listeners': [{'port': 53}]}, {'listeners': [{'port': '0x35'}]}):
             with self.assertRaises(m.Error): self.generated(m.merge_yaml(self.overlay, overlay))
+        # The controller is settings policy now, so a merge YAML value never reaches render.
+        for controller in ('127.0.0.1:53', '127.0.0.1:domain'):
+            with self.assertRaises(m.Error):
+                self.generated(self.overlay, settings=dict(self.settings, controller=controller))
         self.data['port'] = 53
         with self.assertRaises(m.Error): self.generated()
 
@@ -280,3 +285,96 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual([], rendered['tun']['dns-hijack'])
         self.assertIs(False, rendered['tun']['enable'])
         self.assertIs(False, rendered['dns']['enable'])
+
+
+class ControllerTests(unittest.TestCase):
+    """The bind address is settings policy, like the secret, not a merge YAML key."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+
+    def rendered(self, overlay, **settings):
+        overlay = m.merge_yaml(copy.deepcopy(self.preset), overlay)
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings}, overlay=overlay))
+
+    def test_the_merge_yaml_cannot_move_the_controller(self):
+        overlay = {'external-controller': '192.0.2.1:9090'}
+        self.assertEqual(m.LOOPBACK_CONTROLLER, self.rendered(dict(overlay))['external-controller'])
+        self.assertEqual(m.ANY_CONTROLLER,
+                         self.rendered(dict(overlay), controller=m.ANY_CONTROLLER)['external-controller'])
+
+    def test_binding_every_interface_is_allowed_but_still_needs_a_secret(self):
+        manager = m.Manager.__new__(m.Manager)
+        self.settings.update(dns_fallback=True, service_enabled=True, device='router', subscription_url='')
+        manager.check_settings(dict(self.settings, controller=m.ANY_CONTROLLER))
+        manager.check_settings(dict(self.settings, controller='192.168.1.1:9090'))
+        for bad in ('0.0.0.0:53', '0.0.0.0', 'localhost:9090', '0.0.0.0:70000'):
+            with self.assertRaises(m.Error, msg=bad):
+                manager.check_settings(dict(self.settings, controller=bad))
+        with self.assertRaises(m.Error):
+            manager.check_settings(dict(self.settings, controller=m.ANY_CONTROLLER, secret=''))
+
+
+class BaselineTests(unittest.TestCase):
+    """A bare subscription gets a DNS policy; a complete one is never blended."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+
+    def generated(self, data, **settings):
+        return m.parse_yaml(m.render(data, {**self.settings, **settings},
+            overlay=copy.deepcopy(self.preset)))
+
+    def test_a_subscription_without_dns_is_given_the_baseline(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data.pop('dns')
+        dns = self.generated(data)['dns']
+        self.assertEqual(['system'], dns['nameserver-policy']['geosite:private'])
+        self.assertEqual(['223.5.5.5', '119.29.29.29'], dns['default-nameserver'])
+        self.assertIn('geosite:private', dns['fake-ip-filter'])
+
+    def test_a_subscription_with_dns_keeps_its_own_policy_whole(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data['dns'] = {'enable': True, 'listen': '127.0.0.1:1053',
+                       'nameserver': ['https://example.invalid/dns-query'],
+                       'nameserver-policy': {'geosite:cn': ['223.6.6.6']}}
+        dns = self.generated(data)['dns']
+        self.assertEqual(['https://example.invalid/dns-query'], dns['nameserver'])
+        self.assertEqual({'geosite:cn': ['223.6.6.6']}, dns['nameserver-policy'])
+        # None of the baseline leaks in beside it.
+        self.assertNotIn('default-nameserver', dns)
+        self.assertNotIn('fake-ip-filter', dns)
+
+    def test_the_selected_rule_database_reaches_the_configuration(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        generated = self.generated(data)
+        self.assertEqual(m.GEO_SOURCES['metacubex'], generated['geox-url'])
+        self.assertIs(True, generated['geodata-mode'])
+        self.assertEqual(m.GEO_UPDATE_HOURS, generated['geo-update-interval'])
+        other = self.generated(data, geo_source='loyalsoldier-cdn')
+        self.assertEqual(m.GEO_SOURCES['loyalsoldier-cdn'], other['geox-url'])
+        for urls in m.GEO_SOURCES.values():
+            self.assertTrue(all(u.startswith('https://') for u in urls.values()))
+
+    def test_a_known_url_set_is_absorbed_and_a_custom_one_is_reported(self):
+        overlay = {'geox-url': dict(m.GEO_SOURCES['loyalsoldier'])}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual('loyalsoldier', lifted['geo_source'])
+        self.assertNotIn('geox-url', overlay)
+        custom = {'geox-url': {'geoip': 'https://example.invalid/geoip.dat'}}
+        self.assertEqual(m.SWITCH_DEFAULTS['geo_source'],
+                         m.absorb_switches(custom, self.settings)['geo_source'])
+        self.assertEqual(['geo_source'], m.switch_overrides(custom))
+
+    def test_an_unknown_rule_database_is_refused(self):
+        manager = m.Manager.__new__(m.Manager)
+        base = dict(self.settings, dns_fallback=True, service_enabled=True,
+                    device='router', subscription_url='')
+        manager.check_settings(dict(base, geo_source='loyalsoldier'))
+        with self.assertRaises(m.Error):
+            manager.check_settings(dict(base, geo_source='nonexistent'))

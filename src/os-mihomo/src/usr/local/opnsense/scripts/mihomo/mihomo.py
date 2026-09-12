@@ -160,14 +160,84 @@ def advertises_ipv6(content):
 DNS_MODES = ('fake-ip', 'redir-host', 'normal')
 DNS_MODE_DEFAULT = 'fake-ip'
 HIJACK_TARGETS = ['any:53', 'tcp://any:53']
+# Rule databases, as verified reachable sets. A category that one source does not
+# publish makes every rule naming it fail, so the sets are never mixed.
+GEO_SOURCES = {
+    'metacubex': {
+        'geoip': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat',
+        'geosite': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat',
+        'mmdb': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb',
+        'asn': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb',
+    },
+    'loyalsoldier-cdn': {
+        'geoip': 'https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat',
+        'geosite': 'https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat',
+        'mmdb': 'https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/Country.mmdb',
+    },
+    'loyalsoldier': {
+        'geoip': 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat',
+        'geosite': 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat',
+        'mmdb': 'https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb',
+    },
+}
+# jsDelivr refuses MetaCubeX/meta-rules-dat: the repository is past its 50 MB
+# package limit, and it never serves release assets. Loyalsoldier is the mirrored set.
+GEO_SOURCE_DEFAULT = 'metacubex'
+GEO_UPDATE_HOURS = 24
+
+
+# What a subscription that ships no DNS policy gets instead of nothing. It sits
+# UNDER the subscription, so a provider that states its own dns block keeps it in
+# full: the two are never blended, because half of one policy and half of another
+# resolves neither correctly.
+BASELINE_DNS = {
+    'enable': True,
+    'prefer-h3': False,
+    'use-hosts': True,
+    'use-system-hosts': True,
+    # respect-rules needs the proxy path up before the first lookup resolves,
+    # which is a bootstrap loop on a router that has just started.
+    'respect-rules': False,
+    # Bootstrap servers must be IP-hosted, or there is nothing to resolve them with.
+    'default-nameserver': ['223.5.5.5', '119.29.29.29'],
+    'proxy-server-nameserver': ['https://dns.alidns.com/dns-query', 'https://doh.pub/dns-query'],
+    'nameserver': ['https://dns.alidns.com/dns-query', 'https://doh.pub/dns-query'],
+    'nameserver-policy': {
+        # Private names must go to the system resolver. A public DoH cannot answer
+        # .lan, .local or a NAS hostname, so sending them there breaks the LAN.
+        'geosite:private': ['system'],
+        'geosite:cn': ['https://dns.alidns.com/dns-query', 'https://doh.pub/dns-query'],
+        # Cloudflare by literal IP: its certificate carries IP SANs, so this
+        # validates without skip-cert-verify. Google by IP would not.
+        'geosite:geolocation-!cn': ['https://1.1.1.1/dns-query', 'https://1.0.0.1/dns-query'],
+    },
+    'fake-ip-range': '198.18.0.0/15',
+    'fake-ip-filter-mode': 'blacklist',
+    'fake-ip-filter': ['geosite:private', '*.lan', '*.local', '*.arpa', 'localhost',
+                       'localhost.*', '+.msftconnecttest.com', '+.msftncsi.com',
+                       '+.pool.ntp.org', 'time.*.com', 'time.*.gov', 'time.*.apple.com',
+                       '+.push.apple.com', '+.market.xiaomi.com'],
+}
+
+
+def baseline(data):
+    """Fill in a DNS policy only when the subscription carries none of its own."""
+    if isinstance(data.get('dns'), dict) and data['dns']:
+        return {}
+    return {'dns': copy.deepcopy(BASELINE_DNS)}
+
+
 # Simple switches for the settings a user changes most often. They are applied
 # UNDER the merge YAML, so a hand-written override always wins. When an overlay
 # states one of these keys in its canonical form, absorb_switches() lifts it into
 # the switch instead, so the UI never shows a value the config contradicts.
 SWITCH_DEFAULTS = {'router_dns': False, 'ipv6': False, 'dns_hijack': True,
-                   'dns_mode': DNS_MODE_DEFAULT}
+                   'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT}
 # Bumped only to re-seed the switches from an installation that predates them.
 SWITCH_SCHEMA = 1
+CONTROLLER_PORT = 9090
+LOOPBACK_CONTROLLER = '127.0.0.1:%d' % CONTROLLER_PORT
+ANY_CONTROLLER = '0.0.0.0:%d' % CONTROLLER_PORT
 
 
 def switch_overlay(settings):
@@ -178,6 +248,8 @@ def switch_overlay(settings):
         'dns': {'ipv6': ipv6,
                 'enhanced-mode': settings.get('dns_mode', DNS_MODE_DEFAULT)},
         'tun': {'dns-hijack': list(HIJACK_TARGETS) if settings.get('dns_hijack', True) else []},
+        'geox-url': dict(GEO_SOURCES[settings.get('geo_source') or GEO_SOURCE_DEFAULT]),
+        'geodata-mode': True, 'geo-auto-update': True, 'geo-update-interval': GEO_UPDATE_HOURS,
     }
 
 
@@ -219,6 +291,14 @@ def absorb_switches(overlay, settings):
     if dns.get('enhanced-mode') in DNS_MODES:
         settings['dns_mode'] = dns.pop('enhanced-mode')
 
+    urls = overlay.get('geox-url')
+    if isinstance(urls, dict):
+        for name, known in GEO_SOURCES.items():
+            if urls == known:
+                settings['geo_source'] = name
+                overlay.pop('geox-url')
+                break
+
     hijack = tun.get('dns-hijack')
     if isinstance(hijack, list) and (not hijack or hijack == HIJACK_TARGETS):
         settings['dns_hijack'] = bool(hijack)
@@ -249,6 +329,10 @@ def adopt_switches(rendered, settings):
         settings['dns_mode'] = dns['enhanced-mode']
     if tun.get('enable') is True and isinstance(tun.get('dns-hijack'), list):
         settings['dns_hijack'] = bool(tun['dns-hijack'])
+    for name, known in GEO_SOURCES.items():
+        if rendered.get('geox-url') == known:
+            settings['geo_source'] = name
+            break
     return settings
 
 
@@ -265,11 +349,13 @@ def switch_overrides(overlay):
         out.append('dns_mode')
     if 'dns-hijack' in tun:
         out.append('dns_hijack')
+    if 'geox-url' in probe:
+        out.append('geo_source')
     return out
 
 
 def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_advertised=False):
-    result = copy.deepcopy(data)
+    result = merge_yaml(baseline(data), data)
     router_dns = settings.get('router_dns', False)
     if router_dns:
         result = merge_yaml(result, {'dns': {
@@ -309,6 +395,7 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
     result.update({
         "external-ui": result.get('external-ui', HOME + "/ui"),
         "external-ui-url": result.get('external-ui-url', DEFAULT_UI_URL), "secret": settings["secret"],
+        "external-controller": settings.get('controller') or LOOPBACK_CONTROLLER,
     })
     for key in ('port', 'socks-port', 'mixed-port', 'redir-port', 'tproxy-port'):
         value = result.get(key, 0)
@@ -612,16 +699,18 @@ class Manager:
                 raise Error("Service policies must be boolean values.")
         if settings.get('dns_mode', DNS_MODE_DEFAULT) not in DNS_MODES:
             raise Error("The DNS mode must be one of: " + ", ".join(DNS_MODES) + ".")
+        if settings.get('geo_source', GEO_SOURCE_DEFAULT) not in GEO_SOURCES:
+            raise Error("The rule database must be one of: " + ", ".join(GEO_SOURCES) + ".")
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
         controller = settings.get("controller", "127.0.0.1:9090")
         try:
             host, port = controller.rsplit(":", 1)
-            address = ipaddress.IPv4Address(host)
-            if address.is_unspecified or not 1 <= int(port) <= 65535:
+            ipaddress.IPv4Address(host)
+            if not 1 <= int(port) <= 65535 or int(port) == 53:
                 raise ValueError
         except (AttributeError, ValueError):
-            raise Error("The controller must bind to a specific IPv4 address and port.") from None
+            raise Error("The controller must bind to an IPv4 address and port.") from None
         for key in ("subscription_url", "device"):
             if not isinstance(settings.get(key), str) or any(char in settings[key] for char in "\r\n\x00"):
                 raise Error("Invalid subscription settings.")
@@ -708,7 +797,11 @@ class Manager:
         if settings.get('switch_schema') != SWITCH_SCHEMA:
             if self.config_file.exists():
                 with contextlib.suppress(Error, OSError):
-                    settings = adopt_switches(parse_yaml(self.config_file.read_bytes()), settings)
+                    rendered = parse_yaml(self.config_file.read_bytes())
+                    settings = adopt_switches(rendered, settings)
+                    if isinstance(rendered.get('external-controller'), str):
+                        settings['controller'] = rendered['external-controller']
+            settings.setdefault('controller', ANY_CONTROLLER)
             settings['switch_schema'] = SWITCH_SCHEMA
             self.write_settings(settings)
         stored = parse_yaml(self.merge_file.read_bytes())
@@ -996,9 +1089,14 @@ class Manager:
             value = json.loads(Path(argument).read_bytes())
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
-                        'router_dns', 'ipv6', 'dns_hijack', 'dns_mode'):
+                        'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source'):
                 if key in value:
                     settings[key] = value[key]
+            if 'dashboard_any' in value:
+                current = settings.get('controller') or LOOPBACK_CONTROLLER
+                port = current.rsplit(':', 1)[-1] if ':' in current else str(CONTROLLER_PORT)
+                host = '0.0.0.0' if value['dashboard_any'] else '127.0.0.1'
+                settings['controller'] = host + ':' + port
             if self.source_file.exists():
                 return self.apply(self.source_file.read_bytes(), settings)
             base = {"proxies": [], "proxy-groups": [], "rules": ["MATCH,DIRECT"]}

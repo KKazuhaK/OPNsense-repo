@@ -58,7 +58,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'router_dns' => isset($_POST['router_dns']),
                         'ipv6' => isset($_POST['ipv6']),
                         'dns_hijack' => isset($_POST['dns_hijack']),
-                        'dns_mode' => (string)($_POST['dns_mode'] ?? 'fake-ip')];
+                        'dns_mode' => (string)($_POST['dns_mode'] ?? 'fake-ip'),
+                        'dashboard_any' => isset($_POST['dashboard_any']),
+                        'geo_source' => (string)($_POST['geo_source'] ?? 'metacubex')];
             $result = mihomo_action($action, json_encode($payload));
         } elseif ($action === 'sub-update' || $action === 'clear-sub-log') {
             $result = mihomo_action($action);
@@ -121,6 +123,15 @@ include('fbegin.inc');
             </td>
           </tr>
           <tr>
+            <td><a id="help_for_dashboard" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Reachable dashboard')?></td>
+            <td>
+              <input type="checkbox" name="dashboard_any" value="1" <?=strpos((string)($settings['controller'] ?? '127.0.0.1:9090'), '127.0.0.1:') !== 0 ? 'checked="checked"' : ''?>>
+              <div class="hidden" data-for="help_for_dashboard">
+                <?=gettext('Binds the control API and dashboard to every interface instead of loopback only, so it can be opened from the LAN at http://<router>:9090/ui/. The firewall still decides who reaches it, and the random dashboard secret above is what authenticates callers. Leave it off and reach the dashboard through an SSH tunnel if the WAN rules are permissive or untrusted devices share the LAN.')?>
+              </div>
+            </td>
+          </tr>
+          <tr>
             <td style="width:22%"><strong><?=gettext('DNS policy')?></strong></td>
             <td style="width:78%"></td>
           </tr>
@@ -164,6 +175,22 @@ include('fbegin.inc');
               <?=mihomo_override_badge($overrides, 'dns_hijack')?>
               <div class="hidden" data-for="help_for_hijack">
                 <?=gettext('Default on. Redirects DNS queries that enter the tunnel to Mihomo. Required for fake-ip. Turn it off to leave client DNS entirely to the router resolver. This switch only takes effect while transparent routing is enabled.')?>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td><a id="help_for_geo" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Rule database')?></td>
+            <td>
+              <select name="geo_source" class="selectpicker" data-style="btn-default" data-width="320px">
+                <?php foreach (['metacubex' => gettext('MetaCubeX (GitHub, official)'),
+                                'loyalsoldier-cdn' => gettext('Loyalsoldier (jsDelivr CDN)'),
+                                'loyalsoldier' => gettext('Loyalsoldier (GitHub)')] as $value => $label): ?>
+                  <option value="<?=mihomo_escape($value)?>" <?=($settings['geo_source'] ?? 'metacubex') === $value ? 'selected="selected"' : ''?>><?=mihomo_escape($label)?></option>
+                <?php endforeach; ?>
+              </select>
+              <?=mihomo_override_badge($overrides, 'geo_source')?>
+              <div class="hidden" data-for="help_for_geo">
+                <?=gettext('Where the geoip and geosite databases that GEOSITE and GEOIP rules match against are downloaded from, refreshed every 24 hours. Pick a source reachable from this router before any proxy is up: MetaCubeX is the set Mihomo is built around, and the jsDelivr option exists because that CDN reaches networks GitHub does not. The two projects do not publish the same categories, so switching can invalidate a rule that names a category the new source lacks; check the log after changing it.')?>
               </div>
             </td>
           </tr>

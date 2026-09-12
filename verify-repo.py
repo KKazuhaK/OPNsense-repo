@@ -71,11 +71,16 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
     if manifest['name'] != plugin or manifest['abi'] != 'FreeBSD:15:amd64':
         raise ValueError('Release package has incorrect identity or ABI.')
     expected = {'/' + str(p.relative_to(src / 'src')): p.read_bytes() for p in (src / 'src').rglob('*')
-                if p.is_file() and p.suffix != '.xz' and '__pycache__' not in p.parts and p.suffix != '.pyc'}
+                if p.is_file() and p.suffix not in {'.xz', '.pyc', '.pyo'} and '__pycache__' not in p.parts}
     expected['/usr/local/bin/' + binary] = lzma.decompress((src / 'src/usr/local/bin' / asset).read_bytes())
     actual = manifest['files']
     members = subprocess.check_output(['tar', '-tf', str(package)], text=True).splitlines()
     archive_paths = { '/' + name.removeprefix('./').lstrip('/'): name for name in members }
+    if any('__pycache__' in Path(name).parts or Path(name).suffix in {'.pyc', '.pyo'} for name in members):
+        raise ValueError('Python bytecode must not be packaged.')
+    archived_files = [ '/' + name.removeprefix('./').lstrip('/') for name in members if not name.endswith('/') ]
+    if len(archived_files) != len(set(archived_files)) or set(archived_files) != set(actual) | {'/+MANIFEST', '/+COMPACT_MANIFEST'}:
+        raise ValueError('Package archive inventory differs from its manifest.')
     if set(expected) != set(actual):
         raise ValueError('Package file inventory does not match the tested source.')
     for path, content in expected.items():

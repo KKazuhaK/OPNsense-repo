@@ -6,13 +6,13 @@ The existing RSA signing key stays on the local signing host with mode 0600. Git
 
 ## Build and exercise the real upgrade
 
-Copy the clean source revision to a FreeBSD 15 build host, excluding local instructions, secrets, Git metadata and build output. Requirements include Python 3.13, PyYAML, PHP with SimpleXML, curl, pkg, xz and the bundled assets.
+Copy the clean source revision to a FreeBSD 15 build host, excluding local instructions, secrets, Git metadata and build output. Requirements include Python 3.13, PyYAML, PHP with SimpleXML, curl, pkg, xz and the bundled assets. Mihomo builds use `python3.13` explicitly; an alternative path supplied through `MIHOMO_PYTHON` must still be Python 3.13 with the same patch version as the installed `python313` package. Python cache directories and `.pyc`/`.pyo` files are excluded and rejected in the final archive.
 
 ```sh
 (cd src/os-mihomo && sh build.sh)
 (cd src/os-sing-box && sh build.sh)
-python3 -m unittest discover -s src/os-mihomo/tests -v
-python3 -m unittest discover -s src/os-sing-box/tests -v
+python3.13 -B -m unittest discover -s src/os-mihomo/tests -v
+python3.13 -B -m unittest discover -s src/os-sing-box/tests -v
 sh src/os-mihomo/tests/jail/run.sh \
   src/os-mihomo/dist/os-mihomo-1.1.1.pkg legacy-1.0.2.pkg
 ```
@@ -32,7 +32,7 @@ SOURCE_COMMIT=<tested-40-character-commit> \
 python3 verify-repo.py .site --source .
 ```
 
-Output contains index.html, kazuha.conf, kazuha.pub, SHA256SUMS.txt, release.json/release.sig and complete repo/FreeBSD:14:amd64 and repo/FreeBSD:15:amd64 trees with meta.conf, data.pkg, packagesite.pkg and All/*.pkg. The release report binds the tested package digest to a source commit; additional updated packages are digest-bound too. Every current package is compared with its source. Legacy downloads are retained but have no new lifecycle-test attestation.
+Output contains index.html, kazuha.conf, kazuha.pub, SHA256SUMS.txt, release.json/release.sig and complete repo/FreeBSD:14:amd64 and repo/FreeBSD:15:amd64 trees with meta.conf, data.pkg, packagesite.pkg and All/*.pkg. The release report binds the tested package digest to a source commit; additional updated packages are digest-bound too. Every current package is compared with its source, including complete archive inventory checks that reject duplicate or unmanifested files and Python bytecode. Legacy downloads are retained but have no new lifecycle-test attestation.
 
 Do not treat pkg update exit status alone as signature acceptance. Check that the expected usable catalog exists; some pkg versions return zero after rejecting a signature.
 

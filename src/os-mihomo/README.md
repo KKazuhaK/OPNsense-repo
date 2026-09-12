@@ -18,4 +18,6 @@
 
 订阅直连下载，UA 格式固定为 `OPNsense-Mihomo/1 (device)`。4xx 不重试、不回退；仅 timeout/5xx 有最多四次请求。URL 不进入进程参数、日志或页面的已保存值。CLI、configd 和 cron 使用同一入口。
 
+构建固定使用 `python3.13`，并核对其版本与 `python313` 依赖一致。排除 `__pycache__`、`.pyc`、`.pyo`，且在暂存区和最终归档再次检查。
+
 在 FreeBSD 15 上运行 `sh build.sh` 生成 `dist/os-mihomo-1.1.1.pkg`。发布必须具备与包摘要匹配的真实 VNET jail 测试报告，Pages 再验证源码、测试和包内容。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。

@@ -51,4 +51,4 @@ Subscriptions are fetched directly with `OPNsense-Mihomo/1 (device)`. HTTP 4xx n
 
 ## Build and publish
 
-Run `sh build.sh` on FreeBSD 15 / OPNsense with Python 3.13, PyYAML and curl installed. It produces `dist/os-mihomo-1.1.1.pkg` using the bundled core. See [deployment](../../DEPLOYMENT.md) for actual VNET jail checks and publication. Signed release reports identify the tested package digest and source commit. Pages reruns source tests and verifies package content against that revision before deployment.
+Run `sh build.sh` on FreeBSD 15 / OPNsense with Python 3.13, PyYAML and curl installed. The build explicitly uses `python3.13` and checks its version against the `python313` dependency. It excludes `__pycache__`, `.pyc` and `.pyo`, then rejects bytecode in staging and the completed archive. It produces `dist/os-mihomo-1.1.1.pkg` using the bundled core. See [deployment](../../DEPLOYMENT.md) for actual VNET jail checks and publication. Signed release reports identify the tested package digest and source commit. Pages reruns source tests and verifies package content against that revision before deployment.

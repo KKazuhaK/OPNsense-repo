@@ -82,13 +82,17 @@ include('fbegin.inc');
       <div class="alert alert-<?=$ok ? 'success' : 'danger'?>"><?=mihomo_escape($message)?></div>
     <?php endif; ?>
 
-    <form method="post">
+    <form method="post" id="frmMihomoSub">
       <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
           <tr>
             <td style="width:22%"><strong><?=gettext('Subscription')?></strong></td>
-            <td style="width:78%"></td>
+            <td style="width:78%; text-align:right">
+              <small><?=gettext('full help')?> </small>
+              <i class="fa fa-toggle-off text-danger" style="cursor: pointer" id="show_all_help_page"></i>
+              &nbsp;&nbsp;
+            </td>
           </tr>
           <tr>
             <td><a id="help_for_url" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Subscription URL')?></td>
@@ -211,13 +215,18 @@ include('fbegin.inc');
       </div>
     </form>
 
-    <form method="post">
+    <form method="post" id="frmMihomoSubUpdate">
       <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
           <tr>
             <td style="width:22%"><strong><?=gettext('Subscription log')?></strong></td>
-            <td style="width:78%"><span id="mihomo-update-status" class="text-muted"></span></td>
+            <td style="width:78%; text-align:right">
+              <span id="mihomo-update-status" class="text-muted pull-left"></span>
+              <small><?=gettext('full help')?> </small>
+              <i class="fa fa-toggle-off text-danger" style="cursor: pointer" id="show_all_help_page_log"></i>
+              &nbsp;&nbsp;
+            </td>
           </tr>
           <tr>
             <td><a id="help_for_fetch" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Update')?></td>

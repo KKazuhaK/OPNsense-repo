@@ -75,13 +75,17 @@ include('fbegin.inc');
       <div class="alert alert-warning"><?=mihomo_escape($status['error'])?></div>
     <?php endif; ?>
 
-    <form method="post">
+    <form method="post" id="frmMihomo">
       <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
           <tr>
             <td style="width:22%"><strong><?=gettext('Service and transparent routing')?></strong></td>
-            <td style="width:78%"></td>
+            <td style="width:78%; text-align:right">
+              <small><?=gettext('full help')?> </small>
+              <i class="fa fa-toggle-off text-danger" style="cursor: pointer" id="show_all_help_page"></i>
+              &nbsp;&nbsp;
+            </td>
           </tr>
           <tr>
             <td><?=gettext('Service')?></td>

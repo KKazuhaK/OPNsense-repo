@@ -6,7 +6,7 @@ The existing RSA signing key stays on the local signing host with mode 0600. Git
 
 ## Build and exercise the real upgrade
 
-Copy the clean source revision to a FreeBSD 15 build host, excluding local instructions, secrets, Git metadata and build output. Requirements include Python 3.13, PyYAML, PHP with SimpleXML, curl, pkg, xz and the bundled assets. Mihomo builds use `python3.13` explicitly; an alternative path supplied through `MIHOMO_PYTHON` must still be Python 3.13 with the same patch version as the installed `python313` package. Python cache directories and `.pyc`/`.pyo` files are excluded and rejected in the final archive.
+Copy the clean source revision to the recipe's native build host, excluding local instructions, secrets, Git metadata and build output. Current 26.7 requirements include Python 3.13, PyYAML, PHP with DOM and SimpleXML enabled, curl, pkg, xz and the bundled assets. `MIHOMO_PYTHON` selects the build interpreter; its minor and patch must match the target and installed dependency. Python cache directories and `.pyc`/`.pyo` files are excluded and rejected in the final archive.
 
 ```sh
 (cd src/os-mihomo && sh build.sh)

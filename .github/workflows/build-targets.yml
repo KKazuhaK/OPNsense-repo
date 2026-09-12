@@ -41,8 +41,16 @@ jobs:
           usesh: true
           envs: 'TARGET_PROFILE TARGET_ABI TARGET_PYTHON TARGET_PRODUCT_ABI TARGET_PHP TARGET_DEPENDENCY_REPOSITORY TARGET_DEPENDENCY_FINGERPRINT'
           prepare: |
+            set -eu
             sh src/os-mihomo/packaging/prepare-builder.sh
             test -f /usr/local/etc/php.ini || cp /usr/local/etc/php.ini-production /usr/local/etc/php.ini
+            # Plain FreeBSD builders retain OPNsense extension configuration as samples.
+            for sample in /usr/local/etc/php/*.ini.sample; do
+              [ -f "$sample" ] || continue
+              active="${sample%.sample}"
+              if [ ! -f "$active" ]; then cp "$sample" "$active"; fi
+            done
+            php -r 'if (!class_exists("DOMDocument") || !class_exists("DOMXPath") || !class_exists("SimpleXMLElement")) { fwrite(STDERR, "Required PHP XML extensions are unavailable.\n"); exit(1); }'
           run: |
             set -eu
             sh src/os-mihomo/build.sh

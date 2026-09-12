@@ -157,6 +157,117 @@ def advertises_ipv6(content):
     return False
 
 
+DNS_MODES = ('fake-ip', 'redir-host', 'normal')
+DNS_MODE_DEFAULT = 'fake-ip'
+HIJACK_TARGETS = ['any:53', 'tcp://any:53']
+# Simple switches for the settings a user changes most often. They are applied
+# UNDER the merge YAML, so a hand-written override always wins. When an overlay
+# states one of these keys in its canonical form, absorb_switches() lifts it into
+# the switch instead, so the UI never shows a value the config contradicts.
+SWITCH_DEFAULTS = {'router_dns': False, 'ipv6': False, 'dns_hijack': True,
+                   'dns_mode': DNS_MODE_DEFAULT}
+# Bumped only to re-seed the switches from an installation that predates them.
+SWITCH_SCHEMA = 1
+
+
+def switch_overlay(settings):
+    """Base overlay produced by the simple switches."""
+    ipv6 = bool(settings.get('ipv6', False))
+    return {
+        'ipv6': ipv6,
+        'dns': {'ipv6': ipv6,
+                'enhanced-mode': settings.get('dns_mode', DNS_MODE_DEFAULT)},
+        'tun': {'dns-hijack': list(HIJACK_TARGETS) if settings.get('dns_hijack', True) else []},
+    }
+
+
+def switch_conflicts(rendered, settings):
+    """Switches whose effective value the merge YAML overrode."""
+    dns = rendered.get('dns') or {}
+    tun = rendered.get('tun') or {}
+    wanted = switch_overlay(settings)
+    out = []
+    if dns.get('ipv6') is not wanted['dns']['ipv6']:
+        out.append('ipv6')
+    if dns.get('enhanced-mode') != wanted['dns']['enhanced-mode']:
+        out.append('dns_mode')
+    if bool(tun.get('dns-hijack')) is not bool(wanted['tun']['dns-hijack']):
+        out.append('dns_hijack')
+    return out
+
+
+def absorb_switches(overlay, settings):
+    """Lift canonical switch values out of an overlay into the settings.
+
+    A value the switches cannot express (a custom dns-hijack target list, an
+    unknown DNS mode) is deliberately left in the overlay, where it keeps
+    winning; switch_conflicts() then reports it to the user.
+    """
+    if not isinstance(overlay, dict):
+        return settings
+    settings = dict(settings)
+    dns = overlay.get('dns') if isinstance(overlay.get('dns'), dict) else {}
+    tun = overlay.get('tun') if isinstance(overlay.get('tun'), dict) else {}
+
+    top6, dns6 = overlay.get('ipv6'), dns.get('ipv6')
+    stated = [v for v in (top6, dns6) if v is not None]
+    if stated and all(isinstance(v, bool) for v in stated) and len(set(stated)) == 1:
+        settings['ipv6'] = stated[0]
+        overlay.pop('ipv6', None)
+        dns.pop('ipv6', None)
+
+    if dns.get('enhanced-mode') in DNS_MODES:
+        settings['dns_mode'] = dns.pop('enhanced-mode')
+
+    hijack = tun.get('dns-hijack')
+    if isinstance(hijack, list) and (not hijack or hijack == HIJACK_TARGETS):
+        settings['dns_hijack'] = bool(hijack)
+        tun.pop('dns-hijack')
+
+    for key, section in (('dns', dns), ('tun', tun)):
+        if overlay.get(key) is section and not section:
+            overlay.pop(key)
+    return settings
+
+
+def adopt_switches(rendered, settings):
+    """Seed the switches from a configuration rendered before they existed.
+
+    Upgrades must not change behaviour, so the effective values win over the
+    defaults. The stored overlay is absorbed afterwards and overrides this,
+    because it states intent while a rendered file only states the outcome.
+    """
+    settings = dict(settings)
+    dns = rendered.get('dns') if isinstance(rendered.get('dns'), dict) else {}
+    tun = rendered.get('tun') if isinstance(rendered.get('tun'), dict) else {}
+    for value in (rendered.get('ipv6'), dns.get('ipv6')):
+        if isinstance(value, bool):
+            settings['ipv6'] = value
+            break
+    # A disabled section carries the inert state render() forces, not an intent.
+    if dns.get('enable') is True and dns.get('enhanced-mode') in DNS_MODES:
+        settings['dns_mode'] = dns['enhanced-mode']
+    if tun.get('enable') is True and isinstance(tun.get('dns-hijack'), list):
+        settings['dns_hijack'] = bool(tun['dns-hijack'])
+    return settings
+
+
+def switch_overrides(overlay):
+    """Switch keys a hand-written overlay still dictates after absorption."""
+    probe = copy.deepcopy(overlay) if isinstance(overlay, dict) else {}
+    absorb_switches(probe, {})
+    dns = probe.get('dns') if isinstance(probe.get('dns'), dict) else {}
+    tun = probe.get('tun') if isinstance(probe.get('tun'), dict) else {}
+    out = []
+    if 'ipv6' in probe or 'ipv6' in dns:
+        out.append('ipv6')
+    if 'enhanced-mode' in dns:
+        out.append('dns_mode')
+    if 'dns-hijack' in tun:
+        out.append('dns_hijack')
+    return out
+
+
 def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_advertised=False):
     result = copy.deepcopy(data)
     router_dns = settings.get('router_dns', False)
@@ -166,6 +277,7 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
             'default-nameserver': ['127.0.0.1'], 'nameserver-policy': {}}})
         # An empty policy replaces the provider policy rather than deep-merging it.
         result['dns']['nameserver-policy'] = {}
+    result = merge_yaml(result, switch_overlay(settings))
     if overlay is None:
         overlay = parse_yaml((Path(__file__).resolve().parents[3] / 'share/mihomo/presets/full.yaml').read_bytes())
         if settings.get('controller'):
@@ -485,18 +597,21 @@ class Manager:
     def settings(self):
         try:
             value = json.loads(self.settings_file.read_bytes())
-            value.setdefault('router_dns', False)
+            for key, fallback in SWITCH_DEFAULTS.items():
+                value.setdefault(key, fallback)
             self.check_settings(value)
             return value
         except (OSError, ValueError, TypeError, KeyError):
             raise Error("Mihomo settings are missing or invalid; run initialization first.") from None
 
     def check_settings(self, settings):
-        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns'):
-            if key == 'router_dns' and key not in settings:
+        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns', 'ipv6', 'dns_hijack'):
+            if key not in settings and key in SWITCH_DEFAULTS:
                 continue
             if not isinstance(settings.get(key), bool):
                 raise Error("Service policies must be boolean values.")
+        if settings.get('dns_mode', DNS_MODE_DEFAULT) not in DNS_MODES:
+            raise Error("The DNS mode must be one of: " + ", ".join(DNS_MODES) + ".")
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
         controller = settings.get("controller", "127.0.0.1:9090")
@@ -519,9 +634,14 @@ class Manager:
 
     def publish_status(self, settings=None, dns_active=False, error=""):
         settings = settings or self.settings()
+        overrides = []
+        if self.merge_file.exists():
+            with contextlib.suppress(Error, OSError):
+                overrides = switch_overrides(parse_yaml(self.merge_file.read_bytes()))
         status = {"running": self.system.running(), "transparent": settings["transparent"],
                   "dns_active": dns_active, "dns_fallback": settings["dns_fallback"],
-                  "service_enabled": settings["service_enabled"], "error": error, "updated": time.time()}
+                  "service_enabled": settings["service_enabled"], "overrides": overrides,
+                  "error": error, "updated": time.time()}
         atomic_write(self.status_file, json.dumps(status).encode(), 0o644)
         return status
 
@@ -559,8 +679,8 @@ class Manager:
             settings = {"subscription_url": env.get("mihomo_URL", ""),
                         "secret": env.get("mihomo_secret") or existing.get("secret") or secrets.token_hex(32),
                         "device": re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname())[:64] or "router",
-                        "transparent": False, 'router_dns': False,
-                        "dns_fallback": True, "service_enabled": True}
+                        "transparent": False, "dns_fallback": True, "service_enabled": True,
+                        **SWITCH_DEFAULTS}
             if existing:
                 atomic_write(self.source_file, source.read_bytes())
             self.write_settings(settings)
@@ -582,6 +702,22 @@ class Manager:
             if settings.get('controller'):
                 overlay['external-controller'] = settings['controller']
             atomic_write(self.merge_file, yaml.safe_dump(overlay, sort_keys=False).encode())
+        # The switches own these keys. Adopt whatever the installed configuration
+        # already does, then lift any canonical value out of the stored overlay, so
+        # a later toggle cannot be silently reverted by merge.yaml.
+        if settings.get('switch_schema') != SWITCH_SCHEMA:
+            if self.config_file.exists():
+                with contextlib.suppress(Error, OSError):
+                    settings = adopt_switches(parse_yaml(self.config_file.read_bytes()), settings)
+            settings['switch_schema'] = SWITCH_SCHEMA
+            self.write_settings(settings)
+        stored = parse_yaml(self.merge_file.read_bytes())
+        cleaned = copy.deepcopy(stored)
+        lifted = absorb_switches(cleaned, settings)
+        if cleaned != stored:
+            settings = lifted
+            self.write_settings(settings)
+            atomic_write(self.merge_file, yaml.safe_dump(cleaned, sort_keys=False, allow_unicode=True).encode())
         runtime_home = self.path(HOME)
         runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in ('GeoIP.dat', 'GeoSite.dat'):
@@ -670,6 +806,8 @@ class Manager:
 
     def apply(self, content, settings=None, subscription=True, overlay=None):
         settings = settings or self.settings()
+        if overlay is not None:
+            settings = absorb_switches(overlay, settings)
         self.check_settings(settings)
         data = parse_yaml(content)
         if subscription:
@@ -857,7 +995,8 @@ class Manager:
         if action == "set-settings":
             value = json.loads(Path(argument).read_bytes())
             settings = self.settings()
-            for key in ("subscription_url", "secret", "device", "dns_fallback", 'router_dns'):
+            for key in ("subscription_url", "secret", "device", "dns_fallback",
+                        'router_dns', 'ipv6', 'dns_hijack', 'dns_mode'):
                 if key in value:
                     settings[key] = value[key]
             if self.source_file.exists():

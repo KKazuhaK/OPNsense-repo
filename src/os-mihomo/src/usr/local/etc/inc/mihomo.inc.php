@@ -38,6 +38,25 @@ function mihomo_settings(): array
     return is_string($settings) ? (json_decode($settings, true) ?: []) : [];
 }
 
+function mihomo_override_badge(array $overrides, string $key): string
+{
+    /* The merge YAML states this key by hand, so the switch beside it is inert. */
+    if (!in_array($key, $overrides, true)) {
+        return '';
+    }
+    return '<span class="label label-warning" style="margin-left:6px">'
+        . htmlspecialchars(gettext('Overridden by the merge YAML'), ENT_QUOTES | ENT_HTML5, 'UTF-8')
+        . '</span>';
+}
+
+function mihomo_overrides(): array
+{
+    /* Switches the stored merge YAML dictates by hand; independent of service state. */
+    $status = @file_get_contents('/var/run/mihomo-status.json');
+    $result = is_string($status) ? json_decode($status, true) : null;
+    return is_array($result) && is_array($result['overrides'] ?? null) ? $result['overrides'] : [];
+}
+
 function mihomo_status(): array
 {
     $status = @file_get_contents('/var/run/mihomo-status.json');

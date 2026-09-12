@@ -1,4 +1,5 @@
 """Exercise merge policy, transport pins, and real System error boundaries."""
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -83,7 +84,10 @@ class MergeTests(unittest.TestCase):
         self.data['dns']['ipv6'] = False
         self.generated(upstreams='forward-addr: 192.0.2.53@853', ipv6_advertised=False)
         with self.assertRaises(m.Error): self.generated(upstreams='forward-addr: 192.0.2.53@853', ipv6_advertised=True)
+        # The switch owns IPv6, so the subscription alone no longer satisfies the guard.
         self.data['ipv6'] = self.data['dns']['ipv6'] = True
+        with self.assertRaises(m.Error): self.generated(upstreams='forward-addr: 192.0.2.53@853', ipv6_advertised=True)
+        self.settings['ipv6'] = True
         self.generated(upstreams='forward-addr: 192.0.2.53@853', ipv6_advertised=True)
         self.assertFalse(m.advertises_ipv6(b'<opnsense><radvd/><dhcpdv6/></opnsense>'))
         self.assertTrue(m.advertises_ipv6(b'<opnsense><radvd><lan><mode>assisted</mode></lan></radvd></opnsense>'))
@@ -192,3 +196,87 @@ class RuntimeBoundaryTests(unittest.TestCase):
             self.assertIsNone(system.valid_pid(str(pid), '/usr/local/bin/mihomo'))
         with patch.object(system, 'run', return_value=subprocess.CompletedProcess([], 0, b'/usr/local/bin/mihomo -f config.yaml\n', b'')):
             self.assertEqual(12345, system.valid_pid(str(pid), '/usr/local/bin/mihomo'))
+
+
+class SwitchTests(unittest.TestCase):
+    """The simple switches own dns.ipv6, dns.enhanced-mode and tun.dns-hijack."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        preset = m.Path(m.__file__).resolve().parents[3] / 'share/mihomo/presets/full.yaml'
+        self.overlay = m.parse_yaml(preset.read_bytes())
+        m.absorb_switches(self.overlay, self.settings)
+
+    def generated(self, overlay=None, **switches):
+        settings = {**self.settings, **switches}
+        return m.parse_yaml(m.render(self.data, settings,
+            overlay=copy.deepcopy(self.overlay if overlay is None else overlay)))
+
+    def test_each_switch_reaches_the_rendered_configuration(self):
+        default = self.generated()
+        self.assertEqual(m.HIJACK_TARGETS, default['tun']['dns-hijack'])
+        self.assertEqual('fake-ip', default['dns']['enhanced-mode'])
+        self.assertIs(False, default['dns']['ipv6'])
+        self.assertIs(False, default['ipv6'])
+        self.assertEqual([], self.generated(dns_hijack=False)['tun']['dns-hijack'])
+        self.assertEqual('redir-host', self.generated(dns_mode='redir-host')['dns']['enhanced-mode'])
+        both = self.generated(ipv6=True)
+        self.assertIs(True, both['ipv6'])
+        self.assertIs(True, both['dns']['ipv6'])
+
+    def test_the_shipped_presets_state_no_key_a_switch_owns(self):
+        for preset in ('full', 'tun-only', 'proxy-only'):
+            path = m.Path(m.__file__).resolve().parents[3] / ('share/mihomo/presets/' + preset + '.yaml')
+            overlay = m.parse_yaml(path.read_bytes())
+            lifted = m.absorb_switches(overlay, self.settings)
+            self.assertEqual([], m.switch_overrides(overlay), preset)
+            # Only the full preset captures client DNS; the other two leave the router resolver alone.
+            self.assertIs(preset == 'full', lifted['dns_hijack'], preset)
+
+    def test_a_value_no_switch_can_express_stays_in_the_yaml_and_is_reported(self):
+        overlay = copy.deepcopy(self.overlay)
+        overlay.setdefault('tun', {})['dns-hijack'] = ['udp://any:53']
+        settings = dict(self.settings, dns_hijack=False)
+        lifted = m.absorb_switches(overlay, settings)
+        self.assertEqual(['udp://any:53'], overlay['tun']['dns-hijack'])
+        self.assertIs(False, lifted['dns_hijack'])
+        self.assertEqual(['dns_hijack'], m.switch_overrides(overlay))
+        rendered = self.generated(overlay, dns_hijack=False)
+        self.assertEqual(['udp://any:53'], rendered['tun']['dns-hijack'])
+        self.assertEqual(['dns_hijack'], m.switch_conflicts(rendered, settings))
+
+    def test_disagreeing_ipv6_statements_are_left_for_the_operator(self):
+        overlay = {'ipv6': True, 'dns': {'ipv6': False}}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual({'ipv6': True, 'dns': {'ipv6': False}}, overlay)
+        self.assertIs(False, lifted['ipv6'])
+        self.assertEqual(['ipv6'], m.switch_overrides(overlay))
+
+    def test_an_unknown_dns_mode_is_never_absorbed(self):
+        overlay = {'dns': {'enhanced-mode': 'nonsense'}}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual('fake-ip', lifted['dns_mode'])
+        self.assertEqual(['dns_mode'], m.switch_overrides(overlay))
+
+    def test_an_upgrade_adopts_the_behaviour_the_installation_already_had(self):
+        rendered = {'ipv6': True, 'dns': {'enable': True, 'ipv6': True, 'enhanced-mode': 'redir-host'},
+                    'tun': {'enable': True, 'dns-hijack': []}}
+        adopted = m.adopt_switches(rendered, m.SWITCH_DEFAULTS)
+        self.assertEqual({'ipv6': True, 'dns_mode': 'redir-host', 'dns_hijack': False},
+                         {k: adopted[k] for k in ('ipv6', 'dns_mode', 'dns_hijack')})
+        # A configuration that states none of them leaves the defaults alone.
+        self.assertEqual(dict(m.SWITCH_DEFAULTS), m.adopt_switches({'proxies': []}, m.SWITCH_DEFAULTS))
+        # An inert section is render() enforcing transparent-off, never an intent.
+        inert = {'dns': {'enable': False, 'enhanced-mode': 'normal'}, 'tun': {'enable': False, 'dns-hijack': []}}
+        self.assertEqual(dict(m.SWITCH_DEFAULTS), m.adopt_switches(inert, m.SWITCH_DEFAULTS))
+        # A rendered file only reports the outcome, so the stored overlay still wins.
+        overlay = {'tun': {'dns-hijack': list(m.HIJACK_TARGETS)}}
+        self.assertIs(True, m.absorb_switches(overlay, adopted)['dns_hijack'])
+
+    def test_transparent_routing_off_forces_every_switch_inert(self):
+        settings = dict(self.settings, transparent=False, dns_hijack=True, ipv6=True)
+        rendered = m.parse_yaml(m.render(self.data, settings, overlay=copy.deepcopy(self.overlay)))
+        self.assertEqual([], rendered['tun']['dns-hijack'])
+        self.assertIs(False, rendered['tun']['enable'])
+        self.assertIs(False, rendered['dns']['enable'])

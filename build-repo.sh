@@ -9,7 +9,8 @@ SOURCE_COMMIT="${SOURCE_COMMIT:-}"
 die() { echo "error: $*" >&2; exit 1; }
 [ "$#" -ge 1 ] || die 'usage: build-repo.sh mihomo.pkg [additional.pkg ...]'
 [ "$(pkg config ABI)" = 'FreeBSD:15:amd64' ] || die 'sign on FreeBSD 15 amd64'
-[ -f "$SIGNING_KEY" ] && [ "$(stat -f '%Lp' "$SIGNING_KEY")" = 600 ] || die 'a local 0600 signing key is required'
+[ -f "$SIGNING_KEY" ] || die 'a local signing key is required'
+[ "$(stat -f '%Lp' "$SIGNING_KEY")" = 600 ] || die 'a local 0600 signing key is required'
 [ -f "$TEST_REPORT" ] || die 'actual FreeBSD jail test report is required'
 [ -n "$SOURCE_COMMIT" ] || die 'SOURCE_COMMIT must identify the tested source revision'
 python3 - "$TEST_REPORT" "$1" <<'PY'

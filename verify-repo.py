@@ -74,12 +74,14 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
                 if p.is_file() and p.suffix != '.xz' and '__pycache__' not in p.parts and p.suffix != '.pyc'}
     expected['/usr/local/bin/' + binary] = lzma.decompress((src / 'src/usr/local/bin' / asset).read_bytes())
     actual = manifest['files']
+    members = subprocess.check_output(['tar', '-tf', str(package)], text=True).splitlines()
+    archive_paths = { '/' + name.removeprefix('./').lstrip('/'): name for name in members }
     if set(expected) != set(actual):
         raise ValueError('Package file inventory does not match the tested source.')
     for path, content in expected.items():
         if actual[path] != '1$' + hashlib.sha256(content).hexdigest():
             raise ValueError('Package content differs from source: ' + path)
-        archived = subprocess.check_output(['tar', '-xOf', str(package), path.lstrip('/')])
+        archived = subprocess.check_output(['tar', '-xOf', str(package), archive_paths[path]])
         if archived != content:
             raise ValueError('Package archive differs from its manifest: ' + path)
     for phase in ('pre-install', 'post-install', 'pre-deinstall', 'post-deinstall'):

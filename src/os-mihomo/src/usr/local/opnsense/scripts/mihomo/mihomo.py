@@ -234,7 +234,7 @@ def baseline(data):
 SWITCH_DEFAULTS = {'router_dns': False, 'ipv6': False, 'dns_hijack': True,
                    'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT}
 # Bumped only to re-seed the switches from an installation that predates them.
-SWITCH_SCHEMA = 1
+SWITCH_SCHEMA = 2
 CONTROLLER_PORT = 9090
 LOOPBACK_CONTROLLER = '127.0.0.1:%d' % CONTROLLER_PORT
 ANY_CONTROLLER = '0.0.0.0:%d' % CONTROLLER_PORT
@@ -290,6 +290,15 @@ def absorb_switches(overlay, settings):
 
     if dns.get('enhanced-mode') in DNS_MODES:
         settings['dns_mode'] = dns.pop('enhanced-mode')
+
+    # The controller is settings policy now, so leaving it here would display a
+    # value the rendered configuration ignores.
+    controller = overlay.get('external-controller')
+    if isinstance(controller, str) and ':' in controller:
+        host, _, port = controller.rpartition(':')
+        if host in ('127.0.0.1', '0.0.0.0') and port.isdigit():
+            settings['controller'] = controller
+            overlay.pop('external-controller')
 
     urls = overlay.get('geox-url')
     if isinstance(urls, dict):
@@ -794,23 +803,26 @@ class Manager:
         # The switches own these keys. Adopt whatever the installed configuration
         # already does, then lift any canonical value out of the stored overlay, so
         # a later toggle cannot be silently reverted by merge.yaml.
-        if settings.get('switch_schema') != SWITCH_SCHEMA:
-            if self.config_file.exists():
-                with contextlib.suppress(Error, OSError):
-                    rendered = parse_yaml(self.config_file.read_bytes())
-                    settings = adopt_switches(rendered, settings)
-                    if isinstance(rendered.get('external-controller'), str):
-                        settings['controller'] = rendered['external-controller']
-            settings.setdefault('controller', ANY_CONTROLLER)
-            settings['switch_schema'] = SWITCH_SCHEMA
-            self.write_settings(settings)
+        migrating = settings.get('switch_schema') != SWITCH_SCHEMA
+        rendered = {}
+        if migrating and self.config_file.exists():
+            with contextlib.suppress(Error, OSError):
+                rendered = parse_yaml(self.config_file.read_bytes())
+                settings = adopt_switches(rendered, settings)
         stored = parse_yaml(self.merge_file.read_bytes())
         cleaned = copy.deepcopy(stored)
         lifted = absorb_switches(cleaned, settings)
         if cleaned != stored:
             settings = lifted
-            self.write_settings(settings)
             atomic_write(self.merge_file, yaml.safe_dump(cleaned, sort_keys=False, allow_unicode=True).encode())
+        if migrating:
+            # The stored overlay predates the address in use, so the running
+            # configuration decides where the controller is bound, not the file.
+            if isinstance(rendered.get('external-controller'), str):
+                settings['controller'] = rendered['external-controller']
+            settings.setdefault('controller', ANY_CONTROLLER)
+            settings['switch_schema'] = SWITCH_SCHEMA
+        self.write_settings(settings)
         runtime_home = self.path(HOME)
         runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in ('GeoIP.dat', 'GeoSite.dat'):
@@ -825,6 +837,9 @@ class Manager:
             atomic_write(self.config_file, candidate.read_bytes())
         finally:
             candidate.unlink(missing_ok=True)
+        # An upgrade replaces this file under a watchdog that already loaded the
+        # previous one. Retire it here so the next start runs the installed code.
+        self.system.stop_watch()
         self.publish_status(settings)
         return {"initialized": True, "transparent": settings["transparent"]}
 
@@ -1128,6 +1143,7 @@ class Manager:
             if action in {"restart", "wan-restart"} and self.system.running():
                 self.stop(settings)
             if self.system.running():
+                self.system.watch()
                 return self.publish_status(settings, settings["transparent"])
             return self.start(settings)
         if action == "status":
@@ -1150,12 +1166,17 @@ def main():
         return 1
     manager = Manager()
     if args.action == "watch":
+        reported = None
         while True:
             try:
                 with manager.lock(blocking=False):
                     manager.watchdog_tick()
-            except (Error, OSError):
-                pass
+                reported = None
+            except (Error, OSError) as failure:
+                message = str(failure)
+                if message != reported:
+                    reported = message
+                    print('watchdog tick failed: ' + message, flush=True)
             time.sleep(5)
     try:
         if args.action == "sub-update":

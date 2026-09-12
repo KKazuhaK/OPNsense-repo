@@ -306,6 +306,16 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(m.ANY_CONTROLLER,
                          self.rendered(dict(overlay), controller=m.ANY_CONTROLLER)['external-controller'])
 
+    def test_an_inert_controller_key_is_lifted_out_of_the_merge_yaml(self):
+        overlay = {'external-controller': m.ANY_CONTROLLER, 'mixed-port': 7890}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual(m.ANY_CONTROLLER, lifted['controller'])
+        self.assertEqual({'mixed-port': 7890}, overlay)
+        # An address the switch cannot express stays put rather than being rewritten.
+        kept = {'external-controller': '192.0.2.1:9090'}
+        self.assertNotIn('controller', m.absorb_switches(kept, self.settings))
+        self.assertEqual({'external-controller': '192.0.2.1:9090'}, kept)
+
     def test_binding_every_interface_is_allowed_but_still_needs_a_secret(self):
         manager = m.Manager.__new__(m.Manager)
         self.settings.update(dns_fallback=True, service_enabled=True, device='router', subscription_url='')

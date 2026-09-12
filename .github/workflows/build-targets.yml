@@ -26,9 +26,12 @@ jobs:
       matrix: ${{ fromJson(needs.targets.outputs.matrix) }}
     env:
       TARGET_PROFILE: ${{ matrix.profile }}
+      TARGET_ABI: ${{ matrix.abi }}
       TARGET_PYTHON: ${{ matrix.python }}
       TARGET_PRODUCT_ABI: ${{ matrix.product_abi }}
       TARGET_PHP: ${{ matrix.php }}
+      TARGET_DEPENDENCY_REPOSITORY: ${{ matrix.dependency_repository }}
+      TARGET_DEPENDENCY_FINGERPRINT: ${{ matrix.dependency_fingerprint }}
     steps:
       - uses: actions/checkout@v4
       - name: Build native candidates and run source regressions
@@ -36,10 +39,18 @@ jobs:
         with:
           release: ${{ matrix.native_freebsd }}
           usesh: true
-          envs: 'TARGET_PROFILE TARGET_PYTHON TARGET_PRODUCT_ABI TARGET_PHP'
+          envs: 'TARGET_PROFILE TARGET_ABI TARGET_PYTHON TARGET_PRODUCT_ABI TARGET_PHP TARGET_DEPENDENCY_REPOSITORY TARGET_DEPENDENCY_FINGERPRINT'
           prepare: |
-            pkg install -y curl python${TARGET_PYTHON%%.*}${TARGET_PYTHON#*.} py${TARGET_PYTHON%%.*}${TARGET_PYTHON#*.}-pyyaml php${TARGET_PHP%%.*}${TARGET_PHP#*.} php${TARGET_PHP%%.*}${TARGET_PHP#*.}-simplexml unbound
+            set -eu
+            sh src/os-mihomo/packaging/prepare-builder.sh
             test -f /usr/local/etc/php.ini || cp /usr/local/etc/php.ini-production /usr/local/etc/php.ini
+            # Plain FreeBSD builders retain OPNsense extension configuration as samples.
+            for sample in /usr/local/etc/php/*.ini.sample; do
+              [ -f "$sample" ] || continue
+              active="${sample%.sample}"
+              if [ ! -f "$active" ]; then cp "$sample" "$active"; fi
+            done
+            php -r 'if (!class_exists("DOMDocument") || !class_exists("DOMXPath") || !class_exists("SimpleXMLElement")) { fwrite(STDERR, "Required PHP XML extensions are unavailable.\n"); exit(1); }'
           run: |
             set -eu
             sh src/os-mihomo/build.sh
@@ -48,10 +59,13 @@ jobs:
             python${TARGET_PYTHON} -B -m unittest discover -s src/os-kazuha-repo/tests -v
             python${TARGET_PYTHON} -B -m unittest discover -s tests -v
             python${TARGET_PYTHON} -B verify-repo.py --help
+      - name: Archive candidates with their native directory layout
+        run: |
+          mkdir -p native-artifacts
+          tar -czf "native-artifacts/unsigned-candidates-${TARGET_PROFILE}.tar.gz" \
+            src/os-mihomo/dist src/os-kazuha-repo/dist
       - uses: actions/upload-artifact@v4
         with:
           name: unsigned-candidates-${{ matrix.profile }}
-          path: |
-            src/os-mihomo/dist/
-            src/os-kazuha-repo/dist/
+          path: native-artifacts/*.tar.gz
           if-no-files-found: error

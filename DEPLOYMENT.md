@@ -6,7 +6,7 @@ The existing RSA signing key stays on the local signing host with mode 0600. Git
 
 ## Build and exercise the real upgrade
 
-Copy the clean source revision to a FreeBSD 15 build host, excluding local instructions, secrets, Git metadata and build output. Requirements include Python 3.13, PyYAML, PHP with SimpleXML, curl, pkg, xz and the bundled assets. Mihomo builds use `python3.13` explicitly; an alternative path supplied through `MIHOMO_PYTHON` must still be Python 3.13 with the same patch version as the installed `python313` package. Python cache directories and `.pyc`/`.pyo` files are excluded and rejected in the final archive.
+Copy the clean source revision to the recipe's native build host, excluding local instructions, secrets, Git metadata and build output. Current 26.7 requirements include Python 3.13, PyYAML, PHP with DOM and SimpleXML enabled, curl, pkg, xz and the bundled assets. `MIHOMO_PYTHON` selects the build interpreter; its minor and patch must match the target and installed dependency. Python cache directories and `.pyc`/`.pyo` files are excluded and rejected in the final archive.
 
 ```sh
 (cd src/os-mihomo && sh build.sh)
@@ -68,7 +68,7 @@ On failure, delete the new plugin to restore owned DNS and remove owned configur
 ## Firmware release checklist
 
 1. Read the official target release/build configuration. Update product ABI, native FreeBSD release, Python and repository together; do not guess the next ABI. Same-ABI dependency changes need a separate series directory.
-2. Enable the complete target recipe, bump the plugin package version or revision, and run **Build native firmware targets**. Its per-target FreeBSD VM artifacts are unsigned build candidates, not publication authorization or proof of OPNsense API compatibility. The private key remains local.
+2. Enable the complete target recipe, including the matching official OPNsense dependency repository and committed public signing fingerprint, bump the plugin package version or revision, and run **Build native firmware targets**. The default FreeBSD package flavor may lack the target Python/PyYAML pair; the isolated builder uses only the target firmware's signed dependency source. Its per-target FreeBSD VM artifacts are unsigned candidates, not publication authorization or proof of OPNsense API compatibility. The private key remains local.
 3. Exercise each candidate on its matching native OPNsense target, including the real VNET lifecycle harness and native PF/template/configd behavior. Collect each adjacent report and sign all enabled targets together, retaining the current target during transition.
 4. Publish before upgrading clients. Verify every target with `python3 check-upgrade.py --abi FreeBSD:15:amd64 --product-abi 26.7`, substituting the officially announced target values. The command verifies the trust anchor, report/catalog signatures, catalog membership, package digest and native attestation; unavailable or untested targets exit nonzero.
 5. In a maintenance window, run the front-page repository bootstrap to install `os-kazuha-repo`, then install/upgrade Mihomo. Its post-install registers only `os-mihomo`; use `/usr/local/opnsense/scripts/firmware/register.php install os-mihomo` to register an already installed package without reinstalling or restarting it. Do not run blanket `resync`.

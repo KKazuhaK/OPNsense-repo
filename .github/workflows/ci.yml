@@ -26,6 +26,7 @@ jobs:
         run: find src/os-mihomo/src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
       - name: Check shell scripts
         run: |
+          shellcheck src/os-mihomo/packaging/prepare-builder.sh
           shellcheck build-repo.sh publish-repo.sh src/os-mihomo/build.sh src/os-mihomo/packaging/freebsd/+PRE_INSTALL src/os-mihomo/packaging/freebsd/+POST_INSTALL src/os-mihomo/packaging/freebsd/+PRE_DEINSTALL src/os-mihomo/packaging/freebsd/+POST_DEINSTALL src/os-mihomo/tests/jail/run.sh src/os-mihomo/tests/jail/prepare.sh src/os-sing-box/build.sh src/os-sing-box/src/usr/local/etc/sing-box/sub/sub.sh
           sh -n src/os-mihomo/src/usr/local/etc/rc.d/mihomo
           shellcheck client.sh src/os-kazuha-repo/build.sh src/os-kazuha-repo/src/usr/local/opnsense/scripts/firmware/repos/kazuha.sh src/os-kazuha-repo/packaging/freebsd/+POST_INSTALL src/os-kazuha-repo/packaging/freebsd/+POST_DEINSTALL

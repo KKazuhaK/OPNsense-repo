@@ -39,6 +39,7 @@ jobs:
       - run: python -m pip install PyYAML==6.0.3
       - name: Test the source that produced the candidate
         run: |
+          shellcheck source/src/os-mihomo/packaging/prepare-builder.sh
           python -m unittest discover -s source/src/os-mihomo/tests -v
           python -m unittest discover -s source/src/os-sing-box/tests -v
           python -m unittest discover -s source/src/os-kazuha-repo/tests -v

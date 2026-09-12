@@ -60,6 +60,8 @@ Follow the fingerprint-checked installation commands on the [repository front pa
 
 Installing a repo configuration and querying its catalog does not require installing or restarting the plugin. Install or upgrade `os-mihomo` from **System → Firmware → Plugins** during the router's maintenance window.
 
+The designated router's default curl connection to Pages encountered a TLS connection error during verification. Using IPv4 completed both the trust-anchor download and the isolated pkg update/query/fetch. If that connection error recurs on this network, use `curl --ipv4` or `pkg -4` for the corresponding download or catalog operation. No production network settings were changed for this check.
+
 ## Production installation window
 
 The designated test router is the household's only gateway. A package upgrade stops the old core and temporarily changes DNS and routes. The final live install requires a scheduled window even after isolated checks have passed.

@@ -33,4 +33,6 @@ PHP files pass target PHP 8.5 syntax checks. Shell scripts pass shellcheck and s
 
 The repository is signed using the existing RSA key. Independent OpenSSL verification checks both catalog signatures over ASCII SHA-256; package SHA-256 matches the signed compatibility manifest. An isolated loopback HTTP server and separate pkg configuration/database/cache validate client access. The correct trust anchor exposes `os-mihomo 1.1.0`; a wrong key causes signature rejection and leaves no usable catalog. `pkg update` exit status alone is insufficient to detect that rejection on pkg 2.3.1.
 
+The source validation and Pages deployment workflows also pass on GitHub Actions. Downloads from the public Pages endpoint pass independent signature and package-digest verification. The test router's isolated pkg client updates the published HTTPS catalog, queries `os-mihomo 1.1.0`, and fetches its package successfully with IPv4. The fetched SHA-256 is `87ce64c5aad735aa10cf4a8ce607aed6f1efe25eaa506f02227b00222fbdc469`. Production remains on `os-mihomo 1.0.2`.
+
 No live package install, DNS switch, core restart, or TUN change is part of these isolated checks. End-to-end upgrade, actual failure timing, controller login, and LAN connectivity remain scheduled production checks; see [deployment](../../DEPLOYMENT.md).

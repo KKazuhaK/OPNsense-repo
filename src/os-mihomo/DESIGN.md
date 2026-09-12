@@ -42,3 +42,11 @@ The tracked VNET jail harness executes real `pkg upgrade` from the unmodified pu
 A successful run writes a package-bound test report. The local signer refuses a package changed after that test, then signs the report with its source commit. Pages verifies the signed report, reruns tests against that commit and compares archived runtime files and lifecycle hooks with the source. Protected main requires the source `validate` status. Legacy packages are retained and catalog-signed but do not inherit the new release's test claim.
 
 Production installation, dashboard authentication, real OPNsense filter/template output and LAN connectivity require a maintenance window. A jail test is evidence for the exercised lifecycle, not certification of those remaining paths. See [deployment](../../DEPLOYMENT.md).
+
+## Completed release checks, 2026-09-12
+
+The FreeBSD host passed 39 Mihomo regression tests without skips and the Sing-box direct-subscription regression. Twelve real VNET lifecycle checks passed; SIGKILL to DNS restoration and TUN removal measured 3.666 seconds inside the jail. Twelve candidates from the existing provider configuration passed native core validation with nodes, groups and original rules retained.
+
+[Source validation](https://github.com/KKazuhaK/OPNsense-repo/actions/runs/34698294252) and [Pages validation/deployment](https://github.com/KKazuhaK/OPNsense-repo/actions/runs/34698388713) passed for the published source revision `3137bbdd34f15f65de69589e75f7b3bfcf3caf20`. The [signed release report](https://kkazuhak.github.io/OPNsense-repo/release.json) identifies Mihomo 1.1.1 SHA-256 `0b969f1fae6670a05a69766bd9fd43bc6ba5aa85ab838599fd5e7f2421d6040a` and Sing-box 1.0.3 SHA-256 `b12ae1666e7f720461f9c666256595e3a27720d8e015a701cf1157283641fac5`.
+
+All 27 catalog-listed packages downloaded from public Pages passed independent signature/digest verification; 29 legacy package/catalog URLs remained accessible. A separate FreeBSD pkg configuration/database/cache accepted the signed HTTPS catalog and fetched both current packages with the same digests using IPv4. Production remained on Mihomo 1.0.2 with its original process and TUN. Real GUI, PF and LAN checks still require the maintenance window.

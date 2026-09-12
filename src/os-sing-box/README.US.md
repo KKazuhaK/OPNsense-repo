@@ -87,7 +87,7 @@ forward-zone:
 Upload the package to OPNsense and run:
 
 ```sh
-pkg add -f os-sing-box.pkg
+pkg add -f os-sing-box-1.0.3.pkg
 ```
 
 Refresh the OPNsense WebGUI and go to:
@@ -103,6 +103,8 @@ pkg delete os-sing-box
 ```
 
 ## Subscription Updates
+
+Version 1.0.3 fetches a complete Sing-box JSON subscription directly; YAML/template conversion is no longer supported. The private URL stays outside process arguments and logs. HTTP failures do not retry. The current maintained package targets FreeBSD 15; legacy ABI downloads remain archived.
 
 Automatic subscription updates can be scheduled with Cron:
 
@@ -127,19 +129,19 @@ pkg, tar, make, xz, curl or fetch
 Run:
 
 ```sh
-make package ABI=universal
+make package ABI=native
 ```
 
 Output file:
 
 ```text
-dist/os-sing-box.pkg
+dist/os-sing-box-1.0.3.pkg
 ```
 
 Inspect package metadata:
 
 ```sh
-pkg info -F dist/os-sing-box.pkg
+pkg info -F dist/os-sing-box-1.0.3.pkg
 ```
 
 ## Common Commands

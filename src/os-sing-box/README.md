@@ -80,7 +80,7 @@ forward-zone:
 ## 安装命令
 将安装包上传到 OPNsense 后执行：
 ```sh
-pkg add -f os-sing-box.pkg
+pkg add -f os-sing-box-1.0.3.pkg
 ```
 刷新 OPNsense WebGUI，进入：
 ```text
@@ -91,6 +91,8 @@ VPN > Sing-Box
 pkg delete os-sing-box
 ```
 ## 订阅更新
+
+1.0.3 直接拉取完整 Sing-box JSON 订阅，不再支持 YAML 或模板转换。私密 URL 不进入进程参数或日志，HTTP 失败不重试。当前维护包面向 FreeBSD 15，旧 ABI 包作为兼容下载保留。
 自动更新订阅可通过 Cron 完成：
 ```text
 转到 系统>设置>任务
@@ -112,11 +114,11 @@ make package
 生成文件：
 
 ```text
-dist/os-sing-box.pkg
+dist/os-sing-box-1.0.3.pkg
 ```
 检查包元数据：
 ```sh
-pkg info -F dist/os-sing-box.pkg
+pkg info -F dist/os-sing-box-1.0.3.pkg
 ```
 ## 常用命令
 服务控制：

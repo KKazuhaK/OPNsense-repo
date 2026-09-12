@@ -146,7 +146,7 @@ include('fbegin.inc');
           <tr>
             <td><a id="help_for_dnsmode" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('DNS mode')?></td>
             <td>
-              <select name="dns_mode" class="form-control" style="display:inline-block;width:auto">
+              <select name="dns_mode" class="selectpicker" data-style="btn-default" data-width="260px">
                 <?php foreach (['fake-ip' => gettext('fake-ip (recommended)'), 'redir-host' => gettext('redir-host'), 'normal' => gettext('normal')] as $value => $label): ?>
                   <option value="<?=mihomo_escape($value)?>" <?=($settings['dns_mode'] ?? 'fake-ip') === $value ? 'selected="selected"' : ''?>><?=mihomo_escape($label)?></option>
                 <?php endforeach; ?>

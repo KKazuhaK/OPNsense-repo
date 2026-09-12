@@ -157,12 +157,12 @@ include('fbegin.inc');
           <tr>
             <td><a id="help_for_preset" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Preset')?></td>
             <td>
-              <select name="preset" class="form-control" style="display:inline-block;width:auto;margin-right:6px">
+              <select name="preset" class="selectpicker" data-style="btn-default" data-width="260px">
                 <?php foreach (glob('/usr/local/share/mihomo/presets/*.yaml') as $path): ?>
                   <option value="<?=mihomo_escape(basename($path))?>"><?=mihomo_escape(basename($path))?></option>
                 <?php endforeach; ?>
               </select>
-              <button type="submit" class="btn btn-default" name="action" value="load-preset"><?=gettext('Load preset')?></button>
+              <button type="submit" class="btn btn-default" style="margin-left:6px" name="action" value="load-preset"><?=gettext('Load preset')?></button>
               <div class="hidden" data-for="help_for_preset">
                 <?=gettext('Loading a preset replaces the entire merge file above. Save a copy of custom settings first.')?>
               </div>

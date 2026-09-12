@@ -1,82 +1,63 @@
-# Build, sign, and publish
+# Build, sign and publish
 
-Only **FreeBSD:15:amd64** and `os-mihomo` are published. The source branch does not track `repo/`, package output, or catalogs. Existing binary history is left intact; newly generated artifacts live on a replaceable `gh-pages` branch and are deployed through the Pages workflow.
+New maintained packages target **FreeBSD:15:amd64**. Source main excludes generated packages and catalogs; signed output lives on a replaceable gh-pages branch and Pages serves the full pkg repository tree. Legacy FreeBSD 14/15 downloads and Mihomo 1.0.2 remain available for compatibility and rollback. Unsafe Mihomo 1.1.0 is withdrawn.
 
-The RSA private key remains on the local signing router at `/root/pkgsign/kazuha-repo.key`, mode `0600`. GitHub receives signed catalogs, public key, packages, and static assets. No private-key GitHub Secret is required.
+The existing RSA signing key stays on the local signing host with mode 0600. GitHub receives signed catalogs, packages, a public key and a signed test report. No private key is uploaded or stored in GitHub Secrets.
 
-## Build on FreeBSD
+## Build and exercise the real upgrade
 
-Copy the source checkout to a FreeBSD 15 / OPNsense build host, excluding `.git`, local AI files, private material, previous build output, and repository artifacts. The build requires the bundled binary archive, Python 3.13, `py313-pyyaml`, `curl`, `pkg`, `tar`, `xz`, and `sha256`.
-
-```sh
-cd src/os-mihomo
-sh build.sh
-cd ../..
-SIGNING_KEY=/root/pkgsign/kazuha-repo.key \
-  sh build-repo.sh src/os-mihomo/dist/os-mihomo-1.1.0.pkg
-python3 verify-repo.py .site
-```
-
-`build-repo.sh` generates this independent deployment tree:
-
-```text
-.site/
-  index.html
-  kazuha.pub
-  kazuha.conf
-  opnwall.conf
-  SHA256SUMS.txt
-  repo/FreeBSD:15:amd64/
-    meta.conf
-    data.pkg
-    packagesite.pkg
-    All/os-mihomo-1.1.0.pkg
-```
-
-`opnwall.conf` is a compatibility download name; its content configures the signed `kazuha` repository. No unsigned upstream repo is deployed by this fork.
-
-`verify-repo.py` checks the pinned public-key fingerprint, the primary and compatibility catalog RSA signatures, the package name/ABI/path, and its SHA-256 digest. Do not use `pkg update` exit status alone as proof of signature acceptance: pkg 2.3.1 can return zero while reporting an invalid signature and removing the catalog.
-
-## Publish from the Mac
-
-Copy only `.site/` back from the signing host. Do not copy the private key. Then run:
+Copy the clean source revision to a FreeBSD 15 build host, excluding local instructions, secrets, Git metadata and build output. Requirements include Python 3.13, PyYAML, PHP with SimpleXML, curl, pkg, xz and the bundled assets.
 
 ```sh
-python3 verify-repo.py .site
+(cd src/os-mihomo && sh build.sh)
+(cd src/os-sing-box && sh build.sh)
+python3 -m unittest discover -s src/os-mihomo/tests -v
+python3 -m unittest discover -s src/os-sing-box/tests -v
+sh src/os-mihomo/tests/jail/run.sh \
+  src/os-mihomo/dist/os-mihomo-1.1.1.pkg legacy-1.0.2.pkg
+```
+
+The harness requires root, VIMAGE, TUN and enough disk for its disposable filesystem. It creates an isolated VNET with synthetic upstreams and its own FIBs. It does not connect the jail to production interfaces. Its report identifies the exact package SHA-256 and executed checks. Test adapters replace OPNsense configd/filter/template/GUI infrastructure; actual package hooks, core, daemon, TUN, routes and Unbound are exercised. Remaining production checks are listed below.
+
+## Sign the tested candidate
+
+Preserve a local legacy repo tree for compatibility downloads. Use the exact clean tested source commit and package filenames:
+
+```sh
+SOURCE_COMMIT=<tested-40-character-commit> \
+  LEGACY_REPO=/path/to/legacy/repo \
+  TEST_REPORT=src/os-mihomo/dist/test-report.json \
+  sh build-repo.sh src/os-mihomo/dist/os-mihomo-1.1.1.pkg \
+    src/os-sing-box/dist/os-sing-box-1.0.3.pkg
+python3 verify-repo.py .site --source .
+```
+
+Output contains index.html, kazuha.conf, kazuha.pub, SHA256SUMS.txt, release.json/release.sig and complete repo/FreeBSD:14:amd64 and repo/FreeBSD:15:amd64 trees with meta.conf, data.pkg, packagesite.pkg and All/*.pkg. The release report binds the tested package digest to a source commit; additional updated packages are digest-bound too. Every current package is compared with its source. Legacy downloads are retained but have no new lifecycle-test attestation.
+
+Do not treat pkg update exit status alone as signature acceptance. Check that the expected usable catalog exists; some pkg versions return zero after rejecting a signature.
+
+## Publish from a clean checkout
+
+Copy only .site back from the signer, never the private key, and run:
+
+```sh
+python3 verify-repo.py .site --source .
 sh publish-repo.sh
 ```
 
-The publisher uses the existing Git user identity. It creates a new orphan `gh-pages` commit containing generated artifacts, the verification script, and the Pages workflow. A force-with-lease replaces that generated branch so successive package binaries do not form a growing branch history. `main` is never force-pushed. GitHub garbage collection determines when unreachable prior deployment objects are removed.
+The publisher requires the report's source revision to equal the clean checkout, reruns regression tests and refuses private files. It uses the existing user Git identity, creates an orphan gh-pages artifact commit and replaces that branch with force-with-lease. Pages reruns tests from the signed source revision, PHP syntax including .inc, shell checks and package/source comparisons before deployment. Main requires a successful validate check. One authorized historical cleanup removed old package trees, local handoff files and AI trailers; ordinary source updates use protected main. GitHub caches, forks and unreferenced objects may retain earlier public material until separately purged.
 
-Enable GitHub Pages with **GitHub Actions** as its build source. The workflow rechecks signatures and digests and uploads an explicit static asset list. The URL is:
+Configure Pages to deploy with GitHub Actions. The [public endpoint](https://kkazuhak.github.io/OPNsense-repo/) supplies the hierarchy required by pkg, including legacy URLs. Flat Release attachments are not used as the pkg endpoint. opnwall.conf is not published; clients use the fingerprint-checked kazuha configuration on the front page.
 
-[https://kkazuhak.github.io/OPNsense-repo/](https://kkazuhak.github.io/OPNsense-repo/)
+## Production maintenance window
 
-The repository is privately maintained and signed; Pages downloads remain publicly accessible. Client `pkg` requires the complete Pages directory tree, rather than flat Release attachment URLs.
+Keep an offline copy of the signed trust anchor, legacy package, configuration backup, source subscription, settings and local workaround scripts. The gateway's package upgrade stops its old core. It must be performed in a scheduled window even after the isolated lifecycle checks pass.
 
-## Add the trust anchor to a router
+1. Upgrade starts proxy ports with TUN activation off; subscription, secret and cron are retained. Wait beyond the old delayed deletion before proceeding.
+2. Check proxy-only behavior, controller login and WAN behavior. Configure this router's merge and validate it.
+3. Explicitly enable the desired preset. Confirm native interface/firewall/template output and DNS readiness from router and LAN clients.
+4. Exercise router DNS only after confirming its resolver and DIRECT transport. IPv6 client enablement requires separate end-to-end validation; do not suppress AAAA as a workaround.
+5. Controlled core failure must remove TUN routes and follow the local DNS policy. Measure recovery from a LAN client.
+6. Stop must restore DNS and stop TUN; WAN must not revive it. Successful subscription update preserves credentials; invalid input preserves the prior service.
 
-Follow the fingerprint-checked installation commands on the [repository front page](index.html). The repo configuration uses `signature_type: "pubkey"`, `/usr/local/etc/pkg/keys/kazuha.pub`, and priority 10. Remove the old unsigned `opnwall.conf` client configuration before selecting the new repository.
-
-Installing a repo configuration and querying its catalog does not require installing or restarting the plugin. Install or upgrade `os-mihomo` from **System → Firmware → Plugins** during the router's maintenance window.
-
-The designated router's default curl connection to Pages encountered a TLS connection error during verification. Using IPv4 completed both the trust-anchor download and the isolated pkg update/query/fetch. If that connection error recurs on this network, use `curl --ipv4` or `pkg -4` for the corresponding download or catalog operation. No production network settings were changed for this check.
-
-## Production installation window
-
-The designated test router is the household's only gateway. A package upgrade stops the old core and temporarily changes DNS and routes. The final live install requires a scheduled window even after isolated checks have passed.
-
-Before installation, keep an offline copy of the old package, configuration backup, subscription YAML, subscription settings, and local workaround scripts. The new pre-install hook migrates legacy package-owned config before the old pre-deinstall hook removes it. Do not run the archived old repair script after upgrading; the new state manager replaces its purpose.
-
-Within the window, verify:
-
-1. The existing configuration, secret, rules, and transparent-routing policy survive the upgrade.
-2. Proxy-only mode has no TUN routes or DNS takeover; Start and WAN changes keep that policy.
-3. Transparent enablement starts the core/DNS listener before redirecting Unbound. Test connectivity from both the router and LAN clients.
-4. Explicit Stop restores original DNS-over-TLS configuration and removes runtime TUN routing. WAN events do not undo Stop.
-5. A controlled core crash follows the router's selected fallback policy, with DNS recovery measured from a LAN client.
-6. A successful subscription update preserves node/group/rule semantics and dashboard authentication; an invalid candidate leaves the previous active config intact.
-
-If the test fails, `pkg delete os-mihomo` restores plugin-managed DNS and removes plugin-created interface/firewall configuration. User state is retained in `/var/db/os-mihomo/` for recovery. Restore the offline legacy package and its archived local scripts only if returning to the old version is required. Never remove `/var/unbound/etc/dot.conf` as part of recovery.
-
-The local isolated checks do not certify LAN connectivity through a secondary router or its DNS rebinding protection. Those checks remain part of the scheduled window.
+On failure, delete the new plugin to restore owned DNS and remove owned configuration, then restore the offline legacy package and settings if necessary. User state remains in /var/db/os-mihomo. Do not run archived old repair scripts against the new manager, and do not delete generated Unbound dot.conf as a recovery action. Real PF policy routing, secondary-router rebinding protection and LAN connectivity remain production checks.

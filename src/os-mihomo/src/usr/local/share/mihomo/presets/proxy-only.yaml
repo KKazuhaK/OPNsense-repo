@@ -1,0 +1,8 @@
+# Local proxy ports without TUN or DNS takeover.
+external-controller: 127.0.0.1:9090
+mixed-port: 7890
+socks-port: 7891
+allow-lan: false
+bind-address: 127.0.0.1
+tun: {enable: false, dns-hijack: []}
+dns: {enable: false, enhanced-mode: normal, listen: ''}

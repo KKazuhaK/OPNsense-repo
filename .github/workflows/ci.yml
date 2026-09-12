@@ -17,10 +17,12 @@ jobs:
           python-version: '3.13'
       - run: python -m pip install PyYAML==6.0.3
       - name: Verify routing transitions and failure cases
-        run: python -m unittest discover -s src/os-mihomo/tests -v
+        run: |
+          python -m unittest discover -s src/os-mihomo/tests -v
+          python -m unittest discover -s src/os-sing-box/tests -v
       - name: Check PHP syntax
-        run: find src/os-mihomo/src -name '*.php' -print0 | xargs -0 -n 1 php -l
+        run: find src/os-mihomo/src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
       - name: Check shell scripts
         run: |
-          shellcheck build-repo.sh publish-repo.sh src/os-mihomo/build.sh src/os-mihomo/packaging/freebsd/+PRE_INSTALL src/os-mihomo/packaging/freebsd/+POST_INSTALL src/os-mihomo/packaging/freebsd/+PRE_DEINSTALL src/os-mihomo/packaging/freebsd/+POST_DEINSTALL
+          shellcheck build-repo.sh publish-repo.sh src/os-mihomo/build.sh src/os-mihomo/packaging/freebsd/+PRE_INSTALL src/os-mihomo/packaging/freebsd/+POST_INSTALL src/os-mihomo/packaging/freebsd/+PRE_DEINSTALL src/os-mihomo/packaging/freebsd/+POST_DEINSTALL src/os-mihomo/tests/jail/run.sh src/os-mihomo/tests/jail/prepare.sh src/os-sing-box/build.sh src/os-sing-box/src/usr/local/etc/sing-box/sub/sub.sh
           sh -n src/os-mihomo/src/usr/local/etc/rc.d/mihomo

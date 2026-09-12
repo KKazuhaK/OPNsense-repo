@@ -1,0 +1,5 @@
+#!/bin/sh
+# Service calls are confined to the synthetic jail and recorded for assertions.
+echo "service $*" >> /root/actions.log
+case "$1" in sing-box) exit 1 ;; mihomo) exec /usr/local/etc/rc.d/mihomo "$2" ;; esac
+exit 0

@@ -16,7 +16,7 @@
 <body>
   <p class="label">Kazuha · Signed package repository</p>
   <h1>Mihomo for OPNsense</h1>
-  <p>A privately maintained fork for <strong>FreeBSD:15:amd64</strong>. Packages and catalogs are signed with the fleet's RSA public key. Installation runs local proxy ports; transparent routing and DNS integration require explicit enablement.</p>
+  <p>Mihomo is maintained for <strong>FreeBSD:15:amd64</strong>; legacy plugin downloads for FreeBSD 14 and 15 are retained. Packages and catalogs are signed with the fleet's RSA public key. Installation runs local proxy ports; every upgrade requires explicit transparent re-enablement; YAML presets select the TUN/DNS mode.</p>
   <p><a href="https://github.com/KKazuhaK/OPNsense-repo">Source code</a> · <a href="kazuha.pub">Public key</a> · <a href="kazuha.conf">Repository configuration</a> · <a href="SHA256SUMS.txt">Checksums</a></p>
   <h2>Install the repository</h2>
   <p>Run once on each OPNsense router. Verify the public key fingerprint before enabling the repository.</p>

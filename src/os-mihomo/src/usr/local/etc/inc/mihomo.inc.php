@@ -2,7 +2,7 @@
 /* Share structured configd results and local status reads across Mihomo pages. */
 function mihomo_action(string $action, ?string $payload = null): array
 {
-    $allowed = ['start', 'stop', 'restart', 'enable-transparent', 'disable-transparent', 'sub-update', 'set-settings', 'save-config', 'clear-log', 'clear-sub-log'];
+    $allowed = ['start', 'stop', 'restart', 'enable-transparent', 'disable-transparent', 'sub-update', 'set-settings', 'save-config', 'save-merge', 'load-preset', 'clear-log', 'clear-sub-log'];
     if (!in_array($action, $allowed, true)) {
         return ['ok' => false, 'error' => 'Invalid action.'];
     }

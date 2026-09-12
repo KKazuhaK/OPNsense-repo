@@ -110,10 +110,30 @@ function mihomoCronCommand(string $command): bool
         '/usr/bin/mihomo_sub', '/usr/local/etc/mihomo/sub/sub.sh'], true);
 }
 
+function mihomoRemoveTun(DOMXPath $xpath, string $path): void
+{
+    $tun = mihomoState($path);
+    if ($tun !== null && $tun['created_interface']) {
+        $node = $xpath->query('/opnsense/interfaces/' . $tun['interface'])->item(0);
+        if ($node instanceof DOMElement && trim($xpath->evaluate('string(./if)', $node)) === 'tun_mihomo') {
+            $node->parentNode->removeChild($node);
+        }
+    }
+    if ($tun !== null && $tun['created_rule']) {
+        foreach ($xpath->query('/opnsense/filter/rule[@uuid="' . RULE_UUID . '"]') as $node) {
+            $node->parentNode->removeChild($node);
+        }
+    }
+}
+
 $mode = $argv[1] ?? '';
+// The old package may call the replacement helper during its removal phase.
+if ($mode === 'uninstall') {
+    $mode = 'disable';
+}
 $fallback = ($argv[2] ?? '1') === '1';
-if (!in_array($mode, ['enable', 'disable', 'remove', 'restore-cron'], true)) {
-    fwrite(STDERR, "usage: setup_unbound.php enable|disable|remove|restore-cron [fallback:0|1]\n");
+if (!in_array($mode, ['enable', 'enable-tun', 'disable', 'remove', 'restore-cron'], true)) {
+    fwrite(STDERR, "usage: setup_unbound.php enable|enable-tun|disable|remove|restore-cron [fallback:0|1]\n");
     exit(64);
 }
 $root = rtrim(getenv('OS_MIHOMO_ROOT') ?: '', '/');
@@ -147,18 +167,16 @@ try {
     $before = $doc->saveXML();
     $xpath = new DOMXPath($doc);
     if ($mode === 'restore-cron') {
-        $legacyPath = $stateDir . '/migrate/config.xml';
+        $legacyPath = $stateDir . '/migrate/cron.json';
         if (file_exists($legacyPath)) {
-            $legacy = new DOMDocument();
-            if (!$legacy->load($legacyPath, LIBXML_NONET)) {
-                throw new RuntimeException('Unable to load the migration backup.');
-            }
-            $old = new DOMXPath($legacy);
-            foreach ($old->query('/opnsense/cron/item') as $item) {
-                if (!mihomoCronCommand(trim($old->evaluate('string(./command)', $item)))) {
+            foreach (json_decode((string)file_get_contents($legacyPath), true, 512, JSON_THROW_ON_ERROR) as $item) {
+                if (!mihomoCronCommand(trim($item['command'] ?? ''))) {
                     continue;
                 }
-                $clone = $doc->importNode($item, true);
+                $clone = $doc->createElement('item');
+                foreach (['minutes', 'hours', 'mday', 'month', 'wday'] as $field) {
+                    mihomoChild($doc, $clone, $field, (string)($item[$field] ?? '*'));
+                }
                 mihomoChild($doc, $clone, 'command', 'mihomo sub-update');
                 $cron = $xpath->query('/opnsense/cron')->item(0);
                 if (!$cron instanceof DOMElement) {
@@ -183,6 +201,8 @@ try {
                 }
             }
         }
+    } elseif ($mode === 'enable-tun') {
+        mihomoEnsureTun($doc, $xpath, $tunStatePath);
     } else {
         $unbound = $xpath->query('/opnsense/OPNsense/unboundplus')->item(0);
         $forwarding = $xpath->query('./forwarding/enabled', $unbound)->item(0);
@@ -257,19 +277,8 @@ try {
                         $item->parentNode->removeChild($item);
                     }
                 }
-                $tun = mihomoState($tunStatePath);
-                if ($tun !== null && $tun['created_interface']) {
-                    $node = $xpath->query('/opnsense/interfaces/' . $tun['interface'])->item(0);
-                    if ($node instanceof DOMElement && trim($xpath->evaluate('string(./if)', $node)) === 'tun_mihomo') {
-                        $node->parentNode->removeChild($node);
-                    }
-                }
-                if ($tun !== null && $tun['created_rule']) {
-                    foreach ($xpath->query('/opnsense/filter/rule[@uuid="' . RULE_UUID . '"]') as $node) {
-                        $node->parentNode->removeChild($node);
-                    }
-                }
             }
+            mihomoRemoveTun($xpath, $tunStatePath);
         }
     }
     if ($before !== $doc->saveXML()) {
@@ -284,9 +293,11 @@ try {
     }
     if (in_array($mode, ['disable', 'remove'], true)) {
         @unlink($dnsStatePath);
-        if ($mode === 'remove') {
-            @unlink($tunStatePath);
-        }
+        @unlink($tunStatePath);
+    }
+    if ($mode === 'restore-cron') {
+        @unlink($stateDir . '/migrate/cron.json');
+        @unlink($stateDir . '/migrate/config.xml');
     }
     echo $before !== $doc->saveXML() ? "Mihomo integration updated.\n" : "Mihomo integration unchanged.\n";
 } catch (Throwable $error) {

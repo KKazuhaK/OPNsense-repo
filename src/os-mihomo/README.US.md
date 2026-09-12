@@ -1,62 +1,54 @@
-[中文](README.md) · English
+# os-mihomo
 
-# Mihomo for OPNsense
+An independently maintained Mihomo integration for OPNsense / FreeBSD 15 amd64.
 
-This independent fork targets **OPNsense 26.7 / FreeBSD:15:amd64**. Installations run local proxy ports without changing LAN routing or DNS. TUN and Unbound forwarding are enabled together by an explicit administrator action.
+Installation and every upgrade run ordinary local proxy ports only. A validated subscription and explicit activation are required for TUN. Upgrading from legacy 1.0.2 preserves the subscription URL, full YAML, secret and cron timing, but never inherits transparent enablement.
 
-## Configure
+Use **VPN → Proxy Suite** for service controls, subscription settings and the local merge editor. Runtime state is root-only under `/var/db/os-mihomo/`; static GeoIP data and presets are under `/usr/local/share/mihomo/`. Nothing depends on `/usr/local/etc/mihomo/`, which legacy packages delete asynchronously.
 
-1. Install `os-mihomo` from the signed Kazuha repository using **System → Firmware → Plugins**.
-2. Open **VPN → Proxy Suite → Mihomo Subscribe**. Save a complete Mihomo YAML subscription URL, a device label, and this router's dashboard IPv4 address and port. The default is `192.168.8.1:9090`; change it for routers with a different LAN address.
-3. Fetch and apply the subscription. No third-party converter receives its URL. The subscription's proxies, groups, and rules are retained. YAML is parsed structurally, so escaped emoji, key order, flow mappings, and zero-indent lists work.
-4. Verify connectivity through the local mixed proxy at `127.0.0.1:7890` or SOCKS5 at `127.0.0.1:7891` before enabling transparent routing. A fresh installation without a subscription uses `MATCH,DIRECT`.
-5. Open **VPN → Proxy Suite → Mihomo** and select **Enable transparent routing**. This starts the TUN configuration and then enables the DNS forwarder after the core and its DNS listener are ready. Use **Disable transparent routing** to return to proxy ports only.
+## Configuration
 
-The plugin owns local listener settings (`allow-lan`, bind address, proxy ports, dashboard, TUN and DNS enable/listen). Additional subscription inbound listeners are removed. Proxy listeners remain on loopback. TUN uses `tun_mihomo`, with gVisor, automatic routes, and DNS hijack only while transparent routing is enabled. The dashboard is bound to a specific IPv4 address with a persistent secret. Blank secret input preserves the existing secret.
+The configuration pipeline is:
 
-The four installation-specific settings are DNS at `127.0.0.1:1053`, the dashboard address, UI path plus persistent secret, and TUN device `tun_mihomo`. Subscription proxy, group, and rule semantics remain unchanged. Fake-IP ranges outside `198.18.0.0/15` are rejected before enabling TUN to keep Unbound rebinding protection consistent.
-
-## Failures and updates
-
-Runtime state lives under `/var/db/os-mihomo/`, outside the package file list:
-
-- `settings.json`: subscription URL, secret, controller address, device label, and policies; mode `0600`.
-- `subscription.yaml`: complete provider configuration; mode `0600`.
-- `config.yaml`: generated and validated effective configuration; mode `0600`.
-- `dns-state.json`, `tun-state.json`: the original DNS values and ownership records needed for restoration.
-
-Failed parsing or core validation does not replace these files or restart the running service. A failed restart restores the previous configuration and secret; if the old service cannot restart either, direct DNS remains restored and status reports the failure. State transitions are serialized by an OS file lock, including UI edits, update application, WAN hooks, and the watchdog. Downloads hold a separate update lock, allowing crash recovery during network waits. Configd queues updates; the UI displays their separate completion status.
-
-DNS fallback defaults to enabled and is configurable per router. On a core crash, Unbound permits fallback and a watchdog restores the original DNS configuration, including existing DNS-over-TLS entries, within its five-second polling interval plus service reload time. Explicit Stop always restores original DNS before stopping the core. No script edits `/etc/resolv.conf` or deletes OPNsense's `dot.conf`.
-
-Stop persists the administrative service state, so WAN events and reboot do not undo it. WAN events only restart an already-running service. Package upgrades preserve configuration, secret, service state, and transparent-routing policy. A new pre-install hook saves legacy package-owned configuration before the old removal hook runs. Known local workaround scripts are archived in `migrate/` and their old entry points are retired. Uninstall restores DNS and removes only plugin-created interface and firewall entries; state is retained for recovery, and a later fresh installation resets transparent routing to off.
-
-Subscription HTTP 4xx responses stop immediately, including 408 and 429. Only timeouts and HTTP 5xx permit retry and SOCKS5 fallback, with at most four requests per run. TLS, DNS lookup, and other failures are not retried. The URL is supplied through a mode-0600 curl configuration file rather than process arguments. Diagnostics never include the subscription URL, response body, or dashboard secret. An unwritable log does not prevent an update. Historical subscription logs are discarded during initial migration because older versions logged credentials.
-
-The User-Agent is `OPNsense-Mihomo/1 (device-label)`. Its format version stays fixed across software upgrades. Passwall-Sub-Panel uses case-insensitive substring matching in rule order; a dedicated `OPNsense-Mihomo/1` rule must precede its generic `mihomo` rule if separate fleet permissions are wanted. See [design and verification](DESIGN.md).
-
-Schedule updates under **System → Settings → Cron**, selecting **Renew mihomo Subscription**. UI, configd, `/usr/bin/mihomo_sub`, and `sub/sub.sh` all reach the same manager.
-
-## Build and inspect
-
-On FreeBSD 15 / OPNsense with `pkg`, `tar`, `xz`, `sha256`, `curl`, Python 3.13, and `py313-pyyaml` installed:
-
-```sh
-cd src/os-mihomo
-make package
-pkg info -F dist/os-mihomo-1.1.0.pkg
+```text
+complete subscription YAML
+  → router DNS overlay, if selected
+  → /var/db/os-mihomo/merge.yaml
+  → enforced invariants and activation gate
+  → mihomo -t validation
+  → transactional application
 ```
 
-The bundled archive is `src/usr/local/bin/clash-meta-freebsd-amd64.xz`, from [Vincent-Loeng/clash-meta](https://github.com/Vincent-Loeng/clash-meta). The build uses that exact asset and performs no compilation or download. FreeBSD 14 and universal ABI packages are deliberately unsupported.
+Mappings deep-merge; scalars and plain lists replace. Empty mappings clear the existing mapping. `prepend-rules` / `append-rules`, `prepend-proxy-groups` / `append-proxy-groups` and `prepend-proxies` / `append-proxies` extend lists. Appending after a provider `MATCH` rule will not change its priority. No JavaScript/script execution layer is supported.
 
-Run failure and lifecycle tests without changing host services:
+Three YAML presets are shipped: `full.yaml` (TUN and fake-IP DNS), `tun-only.yaml` (TUN without Mihomo DNS interception), and `proxy-only.yaml`. Loading a preset replaces the entire merge file; preserve custom content first. The initial merge uses full-mode defaults, with activation gated off. The dashboard initially binds loopback; configure this router's dashboard address in merge YAML. Default TUN MTU is 1420; adjust it to the smallest effective node transport MTU.
 
-```sh
-python3 -m unittest discover -s tests -v
+The code enforces `tun.device: tun_mihomo`, the stored dashboard secret and valid listener ports excluding 53, including extra listeners and the controller. Merge YAML cannot bypass disabled TUN activation. DNS forwarding integration is provided for `127.0.0.1:1053` when Mihomo DNS is enabled; custom listeners remain administrator-managed.
+
+## Resolve through router DNS
+
+This switch defaults off. It supplies exactly these DNS keys before the local merge:
+
+```yaml
+dns:
+  nameserver: [127.0.0.1]
+  proxy-server-nameserver: [127.0.0.1]
+  default-nameserver: [127.0.0.1]
+  nameserver-policy: {}
 ```
 
-See the root [deployment guide](../../DEPLOYMENT.md) for signing, Pages publication, and the production installation window.
+The switch leaves `dns-hijack`, enhanced mode and Unbound AAAA policy unchanged. Merge overrides remain explicit administrator choices. Provider fallback servers must be removed before activation; an unavailable local resolver fails startup rather than reverting to provider DNS. Unbound is never redirected back into Mihomo when this switch is selected.
 
-## Credits
+IPv4 and IPv6 forwarding addresses are read from the router's generated DoT configuration; saved ownership state recovers original upstreams during a transition out of Mihomo DNS forwarding. Host routes and `DST-PORT,853,DIRECT` precede subscription and merge rules. The watchdog refreshes them when upstream addresses change. This avoids routing Unbound's own DNS transport through a node whose hostname it must resolve.
 
-Based on [Opnwall/OPNsense-repo](https://github.com/Opnwall/OPNsense-repo), [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo), and the FreeBSD binary from [Vincent-Loeng](https://github.com/Vincent-Loeng/clash-meta). This plugin is maintained independently and is not an official OPNsense plugin.
+The current supported deployment scope is IPv4 clients. RA or DHCPv6 advertisement with disabled Mihomo IPv6 causes activation refusal and a visible runtime warning if enabled later. It does not suppress AAAA or configure RA/DHCPv6. Validate IPv6 end to end before enabling IPv6 for clients.
+
+## Recovery and subscriptions
+
+Every core crash removes runtime TUN routes. Automatic restoration of original Unbound DNS is enabled by default and configurable per router. Disabling DNS recovery leaves proxy forwarding in place after a crash, while routes still revert. Explicit Stop always stops the core and removes TUN even if DNS restoration fails; its pending restoration is retried, and a WAN event never revives an administratively stopped service. Disabling removes only plugin-created interface/firewall entries.
+
+Subscriptions are fetched directly with `OPNsense-Mihomo/1 (device)`. HTTP 4xx never retry or use fallback; only timeout/5xx permit at most two direct and two proxy attempts. The URL stays in a private curl file, outside command arguments and logs. The UI does not send the stored URL back as HTML. Updates preserve proxy/group/rule semantics and dashboard credentials. CLI `/usr/bin/mihomo_sub`, configd and cron use the same manager.
+
+## Build and publish
+
+Run `sh build.sh` on FreeBSD 15 / OPNsense with Python 3.13, PyYAML and curl installed. It produces `dist/os-mihomo-1.1.1.pkg` using the bundled core. See [deployment](../../DEPLOYMENT.md) for actual VNET jail checks and publication. Signed release reports identify the tested package digest and source commit. Pages reruns source tests and verifies package content against that revision before deployment.

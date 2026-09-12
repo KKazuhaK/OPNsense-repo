@@ -1,48 +1,21 @@
-中文 · [English](README.US.md)
+# os-mihomo
 
-# OPNsense 的 Mihomo 插件
+独立维护的 OPNsense Mihomo 插件，仅构建 FreeBSD 15 amd64。
 
-此独立 fork 面向 **OPNsense 26.7 / FreeBSD:15:amd64**。首次安装只启动本机代理端口，不接管 LAN 路由或 DNS。透明代理必须由管理员显式启用，TUN 与 Unbound DNS 转发作为一个整体开启。
+首次安装和每次升级都只运行普通代理端口，不继承旧包的透明模式。完整订阅 YAML 验证通过后，必须显式启用 TUN。订阅、secret、定时任务和每台路由器的配置保留在 `/var/db/os-mihomo/`，静态资源与预设位于 `/usr/local/share/mihomo/`，不依赖旧包会延迟删除的目录。
 
-## 配置
+在 **VPN → Proxy Suite** 管理服务、订阅与本地 YAML 合并配置。配置顺序为：完整订阅 → 路由器 DNS 开关覆盖 → 本地 `merge.yaml` → 代码约束与启用守卫 → mihomo 验证 → 事务应用。
 
-1. 在 **System → Firmware → Plugins** 从 Kazuha 签名仓库安装 `os-mihomo`。
-2. 打开 **VPN → Proxy Suite → Mihomo Subscribe**，保存完整 Mihomo YAML 订阅地址、设备标签与本机仪表盘的 IPv4 地址及端口。默认地址为 `192.168.8.1:9090`；其他 LAN 地址的路由器需要修改。
-3. 拉取并应用订阅。不会调用第三方转换器；订阅中的节点、分组和规则保持原有含义。YAML 解析支持 emoji 转义、任意顶层键顺序、行内映射及零缩进列表。
-4. 先验证本机代理端口是否可用：混合代理 `127.0.0.1:7890`，SOCKS5 `127.0.0.1:7891`。尚未配置订阅时使用 `MATCH,DIRECT`。
-5. 在 **VPN → Proxy Suite → Mihomo** 点击 **Enable transparent routing**。核心和 DNS 监听就绪后才启用 Unbound 转发。点击 **Disable transparent routing** 可退回普通代理端口模式。
+映射深度合并，普通值和列表替换；空映射清除已有映射。支持规则、代理组、代理的 `prepend-` / `append-` 六种列表扩展，不执行 JavaScript。三份预设为 `full.yaml`、`tun-only.yaml`、`proxy-only.yaml`。加载预设会替换整个合并文件，先保存自定义内容。Dashboard 默认绑定回环地址，在合并文件中设置本机的 LAN 地址；TUN 默认 MTU 1420，可按节点传输路径调整。
 
-插件统一管理本机监听地址、代理端口、仪表盘、TUN 和 DNS 的启用状态及监听地址。代理端口只监听 loopback，订阅额外声明的入站监听会移除。TUN 设备固定为 `tun_mihomo`，仅在启用透明代理时开启自动路由与 DNS 劫持。仪表盘绑定指定 IPv4 地址，secret 在刷新和升级时保留；密钥输入留空代表保留原值。
+合并文件不能改变 `tun_mihomo` 设备名、覆盖持久化 secret、让任何监听器占用 53，或绕过未启用的 TUN 守卫。DNS 集成支持 `127.0.0.1:1053`，自定义监听器由管理员管理。
 
-DNS 固定监听 `127.0.0.1:1053`，UI 目录为 `/usr/local/etc/mihomo/ui`。启用透明代理时，超出 `198.18.0.0/15` 的 fake-IP 网段会被拒绝，避免与 Unbound 的重绑定保护不一致。
+“通过路由器 DNS 解析”默认关闭。开启时仅覆盖 nameserver、proxy-server-nameserver、default-nameserver、nameserver-policy 四项；不改变 DNS 劫持、增强模式和 Unbound 的 AAAA 策略。根据本机 DoT 配置为 IPv4/IPv6 上游地址和 853 端口注入优先 DIRECT 规则，上游改变时自动刷新，避免节点解析死锁。该模式不把 Unbound 再转发给 Mihomo；必须移除订阅的 DNS fallback，上游不可用时明确失败。
 
-## 故障、升级与卸载
+当前发布范围是 IPv4 客户端。若 RA/DHCPv6 已向客户端提供 IPv6，而 Mihomo IPv6 关闭，插件拒绝启用；运行中出现这种变化会提示。未来启用客户端 IPv6 应作为独立项目完成端到端验证。
 
-订阅地址、secret、原始订阅、生成配置和恢复状态保存在 `/var/db/os-mihomo/`，不会被包升级覆盖；包含凭据的文件权限为 `0600`。候选配置通过解析与核心验证后才替换正式文件；启动失败会恢复旧配置与旧 secret。若旧服务也无法启动，会保留直连 DNS 并报告错误。
+核心异常退出后总会清除 TUN 路由；默认自动恢复原有直连 DNS，每台可配置。显式 Stop 即使 DNS 恢复失败也停止核心和 TUN，随后重试 DNS 恢复。WAN 事件不会重新启动手动停止的服务。关闭透明模式仅清除插件创建的接口和规则。
 
-核心意外退出后，默认自动恢复原有 DNS，包括 DNS-over-TLS 配置；可按每台路由器关闭该回退策略。watchdog 每五秒检查一次，随后执行恢复与服务重载。显式停止服务始终先恢复 DNS；WAN 事件和重启不会撤销管理员的停止操作。插件不修改 `/etc/resolv.conf`，也不删除 OPNsense 的 `dot.conf`。
+订阅直连下载，UA 格式固定为 `OPNsense-Mihomo/1 (device)`。4xx 不重试、不回退；仅 timeout/5xx 有最多四次请求。URL 不进入进程参数、日志或页面的已保存值。CLI、configd 和 cron 使用同一入口。
 
-升级会保留服务与透明代理状态。首次从旧版升级时，pre-install 会在旧卸载钩子执行前备份配置与本地补丁脚本。已知 workaround 的旧入口会停用，备份保存在 `migrate/`。卸载仅恢复插件修改的 DNS，以及移除插件创建的接口和防火墙规则；用户状态留作恢复，重新全新安装时透明代理仍默认关闭。
-
-HTTP 4xx（包括 408、429）立即失败，不重试、不走代理回退。只有超时与 HTTP 5xx 允许有限重试及 SOCKS5 回退，每次更新最多四个请求。日志不包含订阅 URL、响应正文或 secret；日志无法写入时仍可执行更新。首次迁移时会清理旧订阅日志，因为旧版会把凭据写入日志。
-
-UA 固定格式为 `OPNsense-Mihomo/1 (device-label)`，软件升级不会改变格式版本。面板使用按规则顺序、不区分大小写的子串匹配；若要单独控制路由器权限，`OPNsense-Mihomo/1` 规则必须放在通用 `mihomo` 规则之前。
-
-定时更新入口为 **System → Settings → Cron → Renew mihomo Subscription**。UI、configd、`/usr/bin/mihomo_sub` 和 `sub/sub.sh` 使用同一更新实现。
-
-## 构建
-
-在 FreeBSD 15 / OPNsense 上安装 `pkg`、`tar`、`xz`、`sha256`、`curl`、Python 3.13 和 `py313-pyyaml`，然后执行：
-
-```sh
-cd src/os-mihomo
-make package
-pkg info -F dist/os-mihomo-1.1.0.pkg
-python3 -m unittest discover -s tests -v
-```
-
-构建直接使用仓库的 `src/usr/local/bin/clash-meta-freebsd-amd64.xz`，不会编译或下载。仅支持 `FreeBSD:15:amd64`。
-
-签名和 Pages 发布步骤见根目录的 [DEPLOYMENT.md](../../DEPLOYMENT.md)，测试与架构说明见 [DESIGN.md](DESIGN.md)。
-
-此插件基于 [Opnwall/OPNsense-repo](https://github.com/Opnwall/OPNsense-repo)、[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) 及 [Vincent-Loeng](https://github.com/Vincent-Loeng/clash-meta) 的 FreeBSD 构建，独立维护，并非 OPNsense 官方插件。
+在 FreeBSD 15 上运行 `sh build.sh` 生成 `dist/os-mihomo-1.1.1.pkg`。发布必须具备与包摘要匹配的真实 VNET jail 测试报告，Pages 再验证源码、测试和包内容。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。

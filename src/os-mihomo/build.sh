@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME=os-mihomo
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd)"
 WORKDIR="$SCRIPT_DIR/work/freebsd-pkg"
 STAGEDIR="$WORKDIR/stage"
@@ -26,7 +26,7 @@ mkdir -p "$STAGEDIR" "$METADIR" "$DISTDIR"
 xz -t "$ASSET"
 xz -dc "$ASSET" > "$STAGEDIR/usr/local/bin/mihomo"
 chmod 0755 "$STAGEDIR/usr/local/bin/mihomo" "$STAGEDIR/usr/bin/mihomo_sub" \
-    "$STAGEDIR/usr/local/etc/rc.d/mihomo" "$STAGEDIR/usr/local/etc/mihomo/sub/sub.sh" \
+    "$STAGEDIR/usr/local/etc/rc.d/mihomo" \
     "$STAGEDIR/usr/local/opnsense/scripts/mihomo/mihomo.py" \
     "$STAGEDIR/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
 
@@ -34,6 +34,7 @@ chmod 0755 "$STAGEDIR/usr/local/bin/mihomo" "$STAGEDIR/usr/bin/mihomo_sub" \
 [ ! -e "$STAGEDIR/usr/local/etc/mihomo/config.yaml" ] || die 'runtime config must not be packaged'
 [ ! -e "$STAGEDIR/usr/local/etc/mihomo/sub/env" ] || die 'subscription credentials must not be packaged'
 [ ! -e "$STAGEDIR/etc/rc.conf.d/mihomo" ] || die 'rc state must not be packaged'
+[ ! -e "$STAGEDIR/usr/local/etc/mihomo" ] || die 'the legacy deletion target must not be packaged'
 
 STAGEDIR="$STAGEDIR" METADIR="$METADIR" SCRIPT_DIR="$SCRIPT_DIR" VERSION="$VERSION" python3 - <<'PY'
 import hashlib

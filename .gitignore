@@ -36,6 +36,7 @@ handoff.md
 .windsurf/
 .windsurfrules
 .aider*
+.idea/
 .github/copilot-instructions.md
 
 # Generated packages and repository catalogs are published separately.
@@ -44,5 +45,6 @@ handoff.md
 /.site/
 /src/os-mihomo/dist/
 /src/os-mihomo/work/
+/src/os-sing-box/dist/
 __pycache__/
 *.pyc

@@ -1,9 +1,29 @@
 #!/bin/sh
 set -eu
 # Save the original package-owned configuration before the old removal hook runs.
-if [ -n "${PKG_UPGRADE+x}" ] && [ ! -f /var/db/os-mihomo/settings.json ]; then
+if [ -n "${PKG_UPGRADE+x}" ]; then
     install -d -m 0700 /var/db/os-mihomo/migrate
-    install -m 0600 /conf/config.xml /var/db/os-mihomo/migrate/config.xml
+    # Extract only known cron timing; never retain the router's master secret store.
+    /usr/local/bin/python3 - <<'PY'
+import json, os, tempfile
+from pathlib import Path
+import xml.etree.ElementTree as ET
+state = Path('/var/db/os-mihomo/migrate')
+commands = {'mihomo sub-update', 'mihomolocal update', 'mihomolocal repair', '/usr/bin/mihomo_sub', '/usr/local/etc/mihomo/sub/sub.sh'}
+items = []
+for source in (state / 'config.xml', Path('/conf/config.xml')):
+    if source.exists():
+        for node in ET.parse(source).findall('./cron/item'):
+            if node.findtext('command', '').strip() in commands:
+                items.append({key: node.findtext(key, '*') for key in ('command', 'minutes', 'hours', 'mday', 'month', 'wday')})
+fd, name = tempfile.mkstemp(dir=state)
+with os.fdopen(fd, 'w') as stream:
+    os.fchmod(stream.fileno(), 0o600)
+    json.dump(items, stream)
+os.replace(name, state / 'cron.json')
+PY
+fi
+if [ -n "${PKG_UPGRADE+x}" ] && [ ! -f /var/db/os-mihomo/settings.json ]; then
     for entry in config.yaml sub/env update-sub.sh repair-after-upgrade.sh; do
         source="/usr/local/etc/mihomo/$entry"
         [ -f "$source" ] || continue

@@ -50,11 +50,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($action === 'set-settings') {
             $settings = mihomo_settings();
             $secret = trim((string)($_POST['secret'] ?? ''));
-            $payload = ['subscription_url' => trim((string)($_POST['subscription_url'] ?? '')),
+            $url = trim((string)($_POST['subscription_url'] ?? ''));
+            $payload = ['subscription_url' => isset($_POST['clear_url']) ? '' : ($url !== '' ? $url : ($settings['subscription_url'] ?? '')),
                         'secret' => $secret !== '' ? $secret : ($settings['secret'] ?? ''),
-                        'controller' => trim((string)($_POST['controller'] ?? '')),
                         'device' => trim((string)($_POST['device'] ?? '')),
-                        'dns_fallback' => isset($_POST['dns_fallback'])];
+                        'dns_fallback' => isset($_POST['dns_fallback']),
+                        'router_dns' => isset($_POST['router_dns'])];
             $result = mihomo_action($action, json_encode($payload));
         } elseif ($action === 'sub-update' || $action === 'clear-sub-log') {
             $result = mihomo_action($action);
@@ -77,7 +78,12 @@ include('fbegin.inc');
       <p><?=gettext('Fetch a complete Mihomo YAML subscription directly. The subscription URL and dashboard secret are never written to logs.')?></p>
       <form method="post">
         <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
-        <?php foreach (['subscription_url' => 'Subscription URL', 'controller' => 'Dashboard IPv4 address and port', 'device' => 'Device label'] as $key => $label): ?>
+        <div class="form-group"><label for="subscription_url"><?=gettext('New subscription URL')?></label>
+          <input type="password" class="form-control" id="subscription_url" name="subscription_url" autocomplete="new-password" placeholder="<?=gettext('Leave empty to keep the stored URL')?>">
+          <p><?=!empty($settings['subscription_url']) ? gettext('A subscription URL is stored.') : gettext('No subscription URL is stored.')?></p>
+          <label><input type="checkbox" name="clear_url" value="1"> <?=gettext('Remove the stored URL')?></label>
+        </div>
+        <?php foreach (['device' => 'Device label'] as $key => $label): ?>
           <div class="form-group"><label for="<?=$key?>"><?=gettext($label)?></label>
             <input class="form-control" id="<?=$key?>" name="<?=$key?>" value="<?=mihomo_escape($settings[$key] ?? '')?>" required autocomplete="off">
           </div>
@@ -88,6 +94,8 @@ include('fbegin.inc');
         <label><input type="checkbox" name="dns_fallback" value="1" <?=!empty($settings['dns_fallback']) ? 'checked' : ''?>>
           <?=gettext('Restore direct DNS automatically if Mihomo exits')?></label>
         <p><?=gettext('This policy is local to this router. Turning it off keeps proxy DNS forwarding in place after an unexpected exit. Explicit Stop always restores the original DNS configuration.')?></p>
+        <label><input type="checkbox" name="router_dns" value="1" <?=!empty($settings['router_dns']) ? 'checked' : ''?>> <?=gettext('Resolve through the router DNS')?></label>
+        <p><?=gettext('Default off. Uses the router resolver and pins its DNS transport DIRECT. It leaves DNS hijacking, enhanced mode, and the router AAAA policy unchanged. Activation is refused if clients are offered IPv6 while Mihomo IPv6 is disabled.')?></p>
         <button type="submit" class="btn btn-primary" name="action" value="set-settings"><?=gettext('Save settings')?></button>
       </form>
       <form method="post">

@@ -54,6 +54,8 @@ class FakeSystem:
     def stop_watch(self): pass
     def destroy_tun(self): self.events.append('destroy-tun')
     def remove(self): self.events.append('remove-owned-integration')
+    def tun(self): self.events.append('assign-tun')
+    def check_router_dns(self): self.events.append('check-router-dns')
 
 
 class StateTests(unittest.TestCase):
@@ -93,7 +95,8 @@ class StateTests(unittest.TestCase):
         self.manager.dispatch('suspend')
         self.manager.initialize(upgrade=True)
         self.manager.dispatch('boot')
-        self.assertTrue(self.system.forwarded)
+        self.assertFalse(self.system.forwarded)
+        self.assertFalse(self.manager.settings()['transparent'])
         self.assertEqual(secret, self.manager.settings()['secret'])
         self.assertEqual(secret, m.parse_yaml(self.manager.config_file.read_bytes())['secret'])
 
@@ -257,6 +260,7 @@ class FetchTests(unittest.TestCase):
             config = Path(args[args.index('--config') + 1])
             self.assertEqual(0o600, config.stat().st_mode & 0o777)
             self.assertIn('PRIVATE_TOKEN', config.read_text())
+            self.assertEqual('url = "https://example.invalid/sub/PRIVATE_TOKEN"\n', config.read_text())
             result = results.pop(0)
             if result == (0, '200'):
                 Path(args[args.index('--output') + 1]).write_bytes(SUBSCRIPTION)
@@ -380,8 +384,7 @@ class CronMigrationTests(unittest.TestCase):
     def test_restore_cron_is_idempotent_and_does_not_touch_dns(self):
         state = self.root / 'var/db/os-mihomo/migrate'
         state.mkdir(parents=True)
-        legacy = self.config.read_text().replace('</opnsense>', '<cron><item><command>mihomolocal repair</command><minutes>30</minutes><hours>*/12</hours></item></cron></opnsense>')
-        (state / 'config.xml').write_text(legacy)
+        (state / 'cron.json').write_text(json.dumps([{'command': 'mihomolocal repair', 'minutes': '30', 'hours': '*/12'}]))
         self.assertEqual(0, self.helper('restore-cron').returncode)
         first = self.xml()
         self.assertEqual(0, self.helper('restore-cron').returncode)

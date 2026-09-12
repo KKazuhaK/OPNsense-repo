@@ -1,0 +1,30 @@
+#!/usr/local/bin/python3
+"""Run the real resolver with synthetic templates inside the VNET jail."""
+from pathlib import Path
+import subprocess
+import sys
+import time
+args = sys.argv[1:]
+with Path('/root/actions.log').open('a') as stream:
+    stream.write('configctl ' + ' '.join(args) + '\n')
+if Path('/root/fail-configctl').exists():
+    print('Execute error')
+    sys.exit(0)
+if args == ['template', 'reload', 'OPNsense/Unbound']:
+    Path('/var/unbound/unbound.conf').write_text('''server:
+  interface: 127.0.0.1
+  port: 53
+  username: ""
+  chroot: ""
+  directory: /var/unbound
+  pidfile: /var/run/unbound.pid
+  use-syslog: no
+  local-zone: "policy.test." static
+  local-data: "policy.test. IN A 192.0.2.20"
+''')
+if args == ['unbound', 'restart']:
+    if Path('/var/run/unbound.pid').exists():
+        subprocess.run(['/usr/bin/pkill', '-F', '/var/run/unbound.pid'])
+        time.sleep(.1)
+    subprocess.run(['/usr/local/sbin/unbound', '-c', '/var/unbound/unbound.conf'], check=True)
+    time.sleep(.2)

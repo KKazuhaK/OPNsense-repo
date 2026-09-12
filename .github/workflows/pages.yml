@@ -1,19 +1,15 @@
 name: Deploy signed GitHub Pages repository
-
 on:
   push:
     branches: [gh-pages]
   workflow_dispatch:
-
 permissions:
   contents: read
   pages: write
   id-token: write
-
 concurrency:
   group: pages
   cancel-in-progress: true
-
 jobs:
   deploy:
     environment:
@@ -24,22 +20,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: gh-pages
-      - name: Validate generated site
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate signed release and assets
+        id: release
         run: |
           test -f index.html
-          test -f kazuha.pub
-          test -f repo/FreeBSD:15:amd64/meta.conf
-          test -f repo/FreeBSD:15:amd64/packagesite.pkg
-          test -f repo/FreeBSD:15:amd64/data.pkg
-          test "$(sha256sum kazuha.pub | cut -d ' ' -f 1)" = "92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b"
+          test -f kazuha.conf
           if find . -type f -not -path './.git/*' | grep -E '\.(key|pem)$|/(AGENTS|CLAUDE|HANDOFF|MEMORY)\.md$'; then exit 1; fi
           if grep -R --exclude-dir=.git -l -E -- '-----BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----' .; then exit 1; fi
-      - name: Verify catalog signatures and package digest
-        run: python3 verify-repo.py .
-      - name: Prepare site artifact
+          python3 verify-repo.py .
+          python3 -c 'import json; print("source_commit=" + json.load(open("release.json"))["source_commit"])' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.source_commit }}
+          path: source
+      - run: python -m pip install PyYAML==6.0.3
+      - name: Test the source that produced the candidate
+        run: |
+          python -m unittest discover -s source/src/os-mihomo/tests -v
+          python -m unittest discover -s source/src/os-sing-box/tests -v
+          find source/src/os-mihomo/src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
+          shellcheck source/build-repo.sh source/publish-repo.sh source/src/os-mihomo/build.sh source/src/os-mihomo/packaging/freebsd/+PRE_INSTALL source/src/os-mihomo/packaging/freebsd/+POST_INSTALL source/src/os-mihomo/packaging/freebsd/+PRE_DEINSTALL source/src/os-mihomo/packaging/freebsd/+POST_DEINSTALL source/src/os-mihomo/tests/jail/run.sh source/src/os-mihomo/tests/jail/prepare.sh source/src/os-sing-box/build.sh source/src/os-sing-box/src/usr/local/etc/sing-box/sub/sub.sh
+          python3 source/verify-repo.py . --source source
+      - name: Prepare static site
         run: |
           mkdir -p _site
-          cp index.html kazuha.pub kazuha.conf opnwall.conf SHA256SUMS.txt _site/
+          cp index.html kazuha.pub kazuha.conf SHA256SUMS.txt release.json release.sig _site/
           cp -RL repo _site/
           touch _site/.nojekyll
       - uses: actions/configure-pages@v5

@@ -2,20 +2,20 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-sing-box}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.0.3}"
 ORIGIN="${ORIGIN:-opnsense/os-sing-box}"
 COMMENT="${COMMENT:-sing-box proxy integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
 WWW="${WWW:-https://sing-box.sagernet.org/}"
 PREFIX="${PREFIX:-/usr/local}"
 FORMAT="${FORMAT:-tgz}"
-ABI="${ABI:-universal}"
-OUTPUT_NAME="${OUTPUT_NAME:-${PKG_NAME}.pkg}"
+ABI="${ABI:-native}"
+OUTPUT_NAME="${OUTPUT_NAME:-${PKG_NAME}-${VERSION}.pkg}"
 SING_BOX_ASSET="${SING_BOX_ASSET:-bsd-box-reF1nd-freebsd-amd64.xz}"
 SING_BOX_DOWNLOAD_URL="${SING_BOX_DOWNLOAD_URL:-https://github.com/Vincent-Loeng/bsd-box/releases/latest/download/$SING_BOX_ASSET}"
 DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-300}"
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd)"
 WORKDIR="${WORKDIR:-"$SCRIPT_DIR/work/freebsd-pkg"}"
 STAGEDIR="$WORKDIR/stage"
 METADIR="$WORKDIR/meta"
@@ -94,7 +94,7 @@ copy_tree() {
     src="$1"
     dst="$2"
     mkdir -p "$dst"
-    (cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '*.xz' -cf - .) | (cd "$dst" && tar -xf -)
+    (cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '*.xz' --exclude '__pycache__' --exclude '*.pyc' -cf - .) | (cd "$dst" && tar -xf -)
 }
 
 download_file() {
@@ -205,24 +205,9 @@ echo "==> Generating metadata"
 cp "$METADIR/+MANIFEST" "$METADIR/+COMPACT_MANIFEST"
 
 echo "==> Creating package for $PKG_ABI"
-PKGROOT="$WORKDIR/package-root"
-TARLIST="$WORKDIR/pkg-tarlist"
-rm -rf "$PKGROOT"
-mkdir -p "$PKGROOT"
-install -m 0644 "$METADIR/+COMPACT_MANIFEST" "$PKGROOT/+COMPACT_MANIFEST"
-install -m 0644 "$METADIR/+MANIFEST" "$PKGROOT/+MANIFEST"
-copy_tree "$STAGEDIR" "$PKGROOT"
-{
-    printf '%s\n' '+COMPACT_MANIFEST' '+MANIFEST'
-    find "$PKGROOT" -type f ! -name '+COMPACT_MANIFEST' ! -name '+MANIFEST' |
-        sed "s#^$PKGROOT/##" |
-        sort
-} > "$TARLIST"
-tar -cPzf "$DISTDIR/$OUTPUT_NAME" \
-    -C "$PKGROOT" \
-    -s ',^etc,/etc,' \
-    -s ',^usr,/usr,' \
-    -T "$TARLIST"
+pkg create -M "$METADIR/+MANIFEST" -r "$STAGEDIR" -o "$DISTDIR"
+created_package="$DISTDIR/$PKG_NAME-$VERSION.pkg"
+[ "$created_package" = "$DISTDIR/$OUTPUT_NAME" ] || mv "$created_package" "$DISTDIR/$OUTPUT_NAME"
 
 echo "==> Package: $DISTDIR/$OUTPUT_NAME"
 pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null

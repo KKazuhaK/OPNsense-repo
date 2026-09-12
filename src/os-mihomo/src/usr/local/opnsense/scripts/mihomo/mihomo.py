@@ -23,8 +23,9 @@ import yaml
 MAX_CONFIG = 16 * 1024 * 1024
 SCRIPT = "/usr/local/opnsense/scripts/mihomo/mihomo.py"
 HELPER = "/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
-HOME = "/usr/local/etc/mihomo"
 STATE = "/var/db/os-mihomo"
+HOME = STATE + "/home"
+SHARE = "/usr/local/share/mihomo"
 PID = "/var/run/mihomo-child.pid"
 DAEMON_PID = "/var/run/mihomo.pid"
 WATCH_PID = "/var/run/mihomo-watch.pid"
@@ -97,15 +98,93 @@ def check_subscription(data):
         raise Error("The subscription must include proxy-groups and a nonempty rules list.")
 
 
-def render(data, settings, transparent=None):
+def merge_yaml(base, overlay):
+    """Deep-merge mappings and apply the six explicit list extensions."""
+    result = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if key.startswith(('prepend-', 'append-')):
+            target = key.split('-', 1)[1]
+            if target not in {'rules', 'proxy-groups', 'proxies'} or not isinstance(value, list):
+                raise Error("Unsupported list extension in merge YAML.")
+            continue
+        if isinstance(value, dict) and value and isinstance(result.get(key), dict):
+            result[key] = merge_yaml(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    for target in ('rules', 'proxy-groups', 'proxies'):
+        if any(prefix + target in overlay for prefix in ('prepend-', 'append-')):
+            current = result.get(target, [])
+            if not isinstance(current, list):
+                raise Error("List extensions require a list value.")
+            result[target] = copy.deepcopy(overlay.get('prepend-' + target, [])) + current + copy.deepcopy(overlay.get('append-' + target, []))
+    return result
+
+
+def dns_transport_rules(content):
+    """Read literal upstream IPs without resolving their verification names."""
+    addresses = set()
+    for value in re.findall(r'^\s*forward-addr:\s*([^\s#]+)', content, re.MULTILINE):
+        address = value.strip('"').split('@', 1)[0].strip('[]')
+        try:
+            addresses.add(ipaddress.ip_address(address))
+        except ValueError:
+            raise Error("The router DNS upstream must use literal IP addresses.") from None
+    if not addresses:
+        raise Error("No router DNS upstream addresses were found. Configure explicit forwarding upstreams first.")
+    return [('IP-CIDR' if ip.version == 4 else 'IP-CIDR6') + ',' + str(ip) + ('/32' if ip.version == 4 else '/128') + ',DIRECT,no-resolve'
+            for ip in sorted(addresses, key=lambda ip: (ip.version, int(ip)))] + ['DST-PORT,853,DIRECT']
+
+
+def advertises_ipv6(content):
+    """Detect enabled router-advertisement or DHCPv6 server configuration."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        raise Error("Unable to inspect the router IPv6 configuration.") from None
+    for group in ('radvd', 'dhcpdv6'):
+        for entry in root.findall('./' + group + '/*'):
+            enabled = entry.find('enable')
+            if enabled is not None and (enabled.text or '').strip().lower() not in {'0', 'false', 'no'}:
+                return True
+            if group == 'radvd' and entry.findtext('mode', '').lower() not in {'', 'disabled'}:
+                return True
+    for service in ('Kea/dhcp6', 'Dhcprelay/dhcp6', 'RouterAdvertisements'):
+        for entry in root.findall('./OPNsense/' + service + '//enabled'):
+            if (entry.text or '').strip() == '1':
+                return True
+    return False
+
+
+def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_advertised=False):
     result = copy.deepcopy(data)
+    router_dns = settings.get('router_dns', False)
+    if router_dns:
+        result = merge_yaml(result, {'dns': {
+            'nameserver': ['127.0.0.1'], 'proxy-server-nameserver': ['127.0.0.1'],
+            'default-nameserver': ['127.0.0.1'], 'nameserver-policy': {}}})
+        # An empty policy replaces the provider policy rather than deep-merging it.
+        result['dns']['nameserver-policy'] = {}
+    if overlay is None:
+        overlay = parse_yaml((Path(__file__).resolve().parents[3] / 'share/mihomo/presets/full.yaml').read_bytes())
+        if settings.get('controller'):
+            overlay['external-controller'] = settings['controller']
+    result = merge_yaml(result, overlay)
     enabled = settings["transparent"] if transparent is None else transparent
     dns = result.get("dns", {})
     if not isinstance(dns, dict):
         raise Error("The dns section must be a mapping.")
-    dns["enable"] = enabled
-    dns["listen"] = "127.0.0.1:1053"
-    if enabled and dns.get("enhanced-mode") == "fake-ip":
+    tun = result.get('tun', {})
+    if not isinstance(tun, dict):
+        raise Error("The tun section must be a mapping.")
+    for section in (tun, dns):
+        if 'enable' in section and not isinstance(section['enable'], bool):
+            raise Error("TUN and DNS enablement must be boolean values.")
+    if not enabled:
+        tun.update(enable=False, **{'auto-route': False, 'strict-route': False, 'dns-hijack': []})
+        dns.update(enable=False, listen='')
+    tun['device'] = 'tun_mihomo'
+    if enabled and tun.get('enable') and dns.get('enable') and dns.get("enhanced-mode") == "fake-ip":
         try:
             network = ipaddress.ip_network(dns.get("fake-ip-range", "198.18.0.1/16"), strict=False)
         except ValueError:
@@ -113,18 +192,34 @@ def render(data, settings, transparent=None):
         if network.version != 4 or not network.subnet_of(ipaddress.ip_network("198.18.0.0/15")):
             raise Error("The fake-IP range must stay within 198.18.0.0/15.")
     result["dns"] = dns
-    result["tun"] = {
-        "enable": enabled, "stack": "gvisor", "device": "tun_mihomo", "mtu": 1500,
-        "auto-route": enabled, "strict-route": enabled, "auto-detect-interface": enabled,
-        "dns-hijack": ["any:53", "tcp://any:53"] if enabled else [],
-    }
+    result['tun'] = tun
     result.update({
-        "external-controller": settings["controller"], "external-ui": HOME + "/ui",
-        "external-ui-url": DEFAULT_UI_URL, "secret": settings["secret"],
-        "allow-lan": False, "bind-address": "127.0.0.1", "socks-port": 7891, "mixed-port": 7890,
+        "external-ui": result.get('external-ui', HOME + "/ui"),
+        "external-ui-url": result.get('external-ui-url', DEFAULT_UI_URL), "secret": settings["secret"],
     })
-    for key in ("redir-port", "tproxy-port", "listeners", "external-controller-tls", "external-controller-unix"):
-        result.pop(key, None)
+    for key in ('port', 'socks-port', 'mixed-port', 'redir-port', 'tproxy-port'):
+        value = result.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 65535 or value == 53:
+            raise Error("Proxy listener ports must be valid and cannot use port 53.")
+    for value in (dns.get('listen', ''), result.get('external-controller', ''), result.get('external-controller-tls', '')):
+        if value:
+            if not isinstance(value, str) or ':' not in value:
+                raise Error('Listeners require a numeric port other than 53.')
+            port = value.rsplit(':', 1)[-1]
+            if not re.fullmatch('[0-9]{1,5}', port) or not 0 <= int(port) <= 65535 or int(port) == 53:
+                raise Error('Listeners require a numeric port other than 53.')
+    for listener in result.get('listeners', []):
+        if not isinstance(listener, dict):
+            raise Error('Additional listeners must be mappings.')
+        port = listener.get('port', 0)
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535 or port == 53:
+            raise Error("Additional listeners cannot bind port 53.")
+    if router_dns:
+        if ipv6_advertised and not (result.get('ipv6') is True and dns.get('ipv6') is True):
+            raise Error("Clients are being offered IPv6 while Mihomo IPv6 is disabled. Validate IPv6 before enabling router DNS.")
+        if dns.get('fallback'):
+            raise Error("Remove DNS fallback upstreams from merge YAML before enabling router DNS.")
+        result['rules'] = dns_transport_rules(upstreams) + result.get('rules', [])
     return yaml.safe_dump(result, allow_unicode=True, sort_keys=False).encode()
 
 
@@ -154,7 +249,8 @@ class System:
             result = subprocess.run(args, capture_output=True, timeout=timeout)
         except (subprocess.TimeoutExpired, OSError):
             raise Error("A system operation failed or timed out.") from None
-        failed_action = args[0] == "/usr/local/sbin/configctl" and (b"Execute error" in result.stdout or b"Error (" in result.stdout)
+        output = result.stdout + result.stderr
+        failed_action = args[0] == "/usr/local/sbin/configctl" and (b"Execute error" in output or b"Error (" in output)
         if check and (result.returncode or failed_action):
             raise Error("A system operation failed; the previous configuration was retained.")
         return result
@@ -165,7 +261,9 @@ class System:
             if pid <= 1:
                 return None
             result = self.run(["/bin/ps", "-p", str(pid), "-o", "command="], check=False)
-            if result.returncode == 0 and expected in result.stdout.decode(errors="replace"):
+            command = shlex.split(result.stdout.decode(errors='replace'))
+            matches = expected in command if expected == SCRIPT else bool(command and (command[0] == expected or (expected == 'daemon' and Path(command[0]).name in {'daemon', 'daemon:'})))
+            if result.returncode == 0 and matches:
                 return pid
         except (OSError, ValueError):
             pass
@@ -180,6 +278,8 @@ class System:
             raise Error("Mihomo rejected the configuration. No configuration was applied.")
 
     def start(self, config, transparent):
+        data = parse_yaml(Path(config).read_bytes())
+        needs_dns = data.get('dns', {}).get('enable') and data.get('dns', {}).get('listen') == '127.0.0.1:1053'
         if transparent and self.run(["/usr/sbin/service", "sing-box", "onestatus"], check=False).returncode == 0:
             raise Error("Sing-box already owns transparent routing.")
         if self.running() or self.run(["/usr/bin/pgrep", "-x", "mihomo"], check=False).returncode == 0:
@@ -189,7 +289,23 @@ class System:
                   "-t", "mihomo", "/usr/local/bin/mihomo", "-d", HOME, "-f", str(config)])
         for _ in range(30):
             if self.running():
-                if not transparent:
+                port = data.get('mixed-port') or data.get('socks-port') or data.get('port')
+                if port:
+                    bind = data.get('bind-address', '127.0.0.1')
+                    bind = '127.0.0.1' if bind in {'*', '0.0.0.0', '::'} else bind.strip('[]')
+                    try:
+                        with socket.create_connection((bind, port), timeout=0.5):
+                            pass
+                    except OSError:
+                        time.sleep(0.5)
+                        continue
+                if transparent:
+                    present = self.run(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
+                    routed = not data.get('tun', {}).get('auto-route') or b'tun_mihomo' in self.run(['/sbin/route', '-n', 'get', '8.8.8.8'], check=False).stdout
+                    if not (present and routed):
+                        time.sleep(0.5)
+                        continue
+                if not needs_dns:
                     return
                 try:
                     with socket.create_connection(("127.0.0.1", 1053), timeout=0.5):
@@ -251,6 +367,31 @@ class System:
         self.run(["/usr/local/bin/php", HELPER, "remove"], timeout=90)
         self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
         self.run(["/usr/local/sbin/configctl", "cron", "restart"], timeout=90)
+
+    def tun(self):
+        self.run(['/usr/local/bin/php', HELPER, 'enable-tun'], timeout=90)
+        self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
+
+    def check_router_dns(self):
+        import struct
+        query = struct.pack('!HHHHHH', 0x4d48, 0x100, 1, 0, 0, 0) + b'\x09localhost\x00\x00\x01\x00\x01'
+        try:
+            with socket.create_connection(('127.0.0.1', 53), timeout=3) as client:
+                client.sendall(struct.pack('!H', len(query)) + query)
+                length = client.recv(2)
+                if len(length) != 2:
+                    raise ValueError
+                response = b''
+                size = struct.unpack('!H', length)[0]
+                while len(response) < size:
+                    part = client.recv(size - len(response))
+                    if not part:
+                        raise ValueError
+                    response += part
+                if len(response) < 12 or response[:2] != query[:2] or response[3] & 15:
+                    raise ValueError
+        except (OSError, ValueError):
+            raise Error('The router DNS resolver did not answer successfully. No provider DNS fallback is used.') from None
 
     def watch(self):
         if not self.valid_pid(WATCH_CHILD_PID, SCRIPT):
@@ -322,6 +463,7 @@ class Manager:
         self.settings_file = self.state / "settings.json"
         self.source_file = self.state / "subscription.yaml"
         self.config_file = self.state / "config.yaml"
+        self.merge_file = self.state / 'merge.yaml'
         self.status_file = self.path("/var/run/mihomo-status.json")
 
     def path(self, path):
@@ -342,18 +484,21 @@ class Manager:
     def settings(self):
         try:
             value = json.loads(self.settings_file.read_bytes())
+            value.setdefault('router_dns', False)
             self.check_settings(value)
             return value
         except (OSError, ValueError, TypeError, KeyError):
             raise Error("Mihomo settings are missing or invalid; run initialization first.") from None
 
     def check_settings(self, settings):
-        for key in ("transparent", "dns_fallback", "service_enabled"):
+        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns'):
+            if key == 'router_dns' and key not in settings:
+                continue
             if not isinstance(settings.get(key), bool):
                 raise Error("Service policies must be boolean values.")
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
-        controller = settings.get("controller", "")
+        controller = settings.get("controller", "127.0.0.1:9090")
         try:
             host, port = controller.rsplit(":", 1)
             address = ipaddress.IPv4Address(host)
@@ -412,15 +557,29 @@ class Manager:
                         raise Error("The legacy subscription settings could not be read.") from None
             settings = {"subscription_url": env.get("mihomo_URL", ""),
                         "secret": env.get("mihomo_secret") or existing.get("secret") or secrets.token_hex(32),
-                        "controller": "192.168.8.1:9090", "device": re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname())[:64] or "router",
-                        "transparent": bool(upgrade and existing.get("tun", {}).get("enable", False)),
+                        "device": re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname())[:64] or "router",
+                        "transparent": False, 'router_dns': False,
                         "dns_fallback": True, "service_enabled": True}
             if existing:
                 atomic_write(self.source_file, source.read_bytes())
             self.write_settings(settings)
-        if not upgrade:
-            settings.update(transparent=False, service_enabled=True)
-            self.write_settings(settings)
+        # Every installation or upgrade requires an explicit new TUN activation.
+        settings.update(transparent=False, service_enabled=True)
+        self.write_settings(settings)
+        if not self.merge_file.exists():
+            preset = self.path(SHARE + '/presets/full.yaml')
+            if not preset.exists():
+                preset = Path(__file__).resolve().parents[3] / 'share/mihomo/presets/full.yaml'
+            overlay = parse_yaml(preset.read_bytes())
+            if settings.get('controller'):
+                overlay['external-controller'] = settings['controller']
+            atomic_write(self.merge_file, yaml.safe_dump(overlay, sort_keys=False).encode())
+        runtime_home = self.path(HOME)
+        runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for name in ('GeoIP.dat', 'GeoSite.dat'):
+            target = runtime_home / name
+            if not target.exists() and not target.is_symlink():
+                target.symlink_to(SHARE + '/' + name)
         data = parse_yaml(self.source_file.read_bytes()) if self.source_file.exists() else {
             "proxies": [], "proxy-groups": [], "rules": ["MATCH,DIRECT"], "log-level": "info"}
         candidate = self.candidate(data, settings)
@@ -432,8 +591,23 @@ class Manager:
         self.publish_status(settings)
         return {"initialized": True, "transparent": settings["transparent"]}
 
-    def candidate(self, data, settings):
-        content = render(data, settings)
+    def router_context(self, settings):
+        if not settings.get('router_dns'):
+            return '', False
+        config = self.path('/conf/config.xml').read_bytes()
+        upstreams = self.path('/var/unbound/etc/dot.conf').read_text()
+        if (self.state / 'dns-state.json').exists():
+            import xml.etree.ElementTree as ET
+            snapshot = json.loads((self.state / 'dns-state.json').read_bytes())
+            entries = ET.fromstring(config).findall('./OPNsense/unboundplus/dots/dot')
+            upstreams = '\n'.join('forward-addr: ' + node.findtext('server', '') + '@' + node.findtext('port', '853')
+                for node in entries if node.get('uuid') != 'b126bf65-a985-49ca-a9d2-16f156aac198'
+                and (node.findtext('enabled') == '1' or snapshot.get('roots', {}).get(node.get('uuid')) == '1'))
+        return upstreams, advertises_ipv6(config)
+
+    def candidate(self, data, settings, overlay=None):
+        upstreams, ipv6 = self.router_context(settings)
+        content = render(data, settings, overlay=overlay if overlay is not None else parse_yaml(self.merge_file.read_bytes()), upstreams=upstreams, ipv6_advertised=ipv6)
         fd, name = tempfile.mkstemp(prefix=".candidate-", suffix=".yaml", dir=self.state)
         os.close(fd)
         path = Path(name)
@@ -443,38 +617,61 @@ class Manager:
     def stop(self, settings=None):
         settings = settings or self.settings()
         # Restore direct DNS before stopping the listener, even for fail-closed policy.
-        self.system.dns(False, settings)
-        self.system.stop()
-        self.publish_status(settings)
+        failed = None
+        try:
+            self.system.dns(False, settings)
+        except (Error, OSError) as error:
+            failed = error
+        try:
+            self.system.stop()
+        finally:
+            self.publish_status(settings, dns_active=failed is not None,
+                error='DNS restoration failed; the core and TUN were stopped. Recovery will be retried.' if failed else '')
+        if failed:
+            raise Error('DNS restoration failed; the core and TUN were stopped. Recovery will be retried.') from None
 
     def start(self, settings=None):
         settings = settings or self.settings()
         if not settings["service_enabled"]:
             self.publish_status(settings)
             return {"running": False, "message": "The service is administratively stopped."}
-        self.system.validate(self.config_file)
-        self.system.start(self.config_file, settings["transparent"])
+        data = parse_yaml(self.source_file.read_bytes()) if self.source_file.exists() else {'proxies': [], 'proxy-groups': [], 'rules': ['MATCH,DIRECT']}
+        candidate = self.candidate(data, settings)
         try:
-            if settings["transparent"]:
+            self.system.validate(candidate)
+            generated = parse_yaml(candidate.read_bytes())
+            atomic_write(self.config_file, candidate.read_bytes())
+        finally:
+            candidate.unlink(missing_ok=True)
+        tun = bool(generated.get('tun', {}).get('enable'))
+        dns_active = bool(tun and generated.get('dns', {}).get('enable') and generated['dns'].get('listen') == '127.0.0.1:1053' and not settings.get('router_dns'))
+        self.system.dns(False, settings)
+        if settings.get('router_dns'):
+            self.system.check_router_dns()
+        self.system.start(self.config_file, tun)
+        try:
+            if tun:
+                self.system.tun()
+            if dns_active:
                 self.system.dns(True, settings)
             self.system.watch()
         except Error:
             self.stop(settings)
             raise
-        return self.publish_status(settings, settings["transparent"])
+        return self.publish_status(settings, dns_active)
 
-    def apply(self, content, settings=None, subscription=True):
+    def apply(self, content, settings=None, subscription=True, overlay=None):
         settings = settings or self.settings()
         self.check_settings(settings)
         data = parse_yaml(content)
         if subscription:
             check_subscription(data)
-        candidate = self.candidate(data, settings)
+        candidate = self.candidate(data, settings, overlay)
         backup_dir = Path(tempfile.mkdtemp(prefix=".rollback-", dir=self.state))
         try:
             self.system.validate(candidate)
             before = {}
-            for path in (self.config_file, self.source_file, self.settings_file):
+            for path in (self.config_file, self.source_file, self.settings_file, self.merge_file):
                 backup = backup_dir / path.name
                 if path.exists():
                     os.link(path, backup)
@@ -490,6 +687,8 @@ class Manager:
                 if subscription:
                     atomic_write(self.source_file, content)
                 self.write_settings(settings)
+                if overlay is not None:
+                    atomic_write(self.merge_file, yaml.safe_dump(overlay, sort_keys=False, allow_unicode=True).encode())
                 if running:
                     self.start(settings)
                 else:
@@ -536,6 +735,8 @@ class Manager:
             raise Error("Fetch and validate a subscription before enabling transparent routing.")
         if enabled and not self.system.running():
             raise Error("Start the proxy service before enabling transparent routing.")
+        if enabled and not parse_yaml(self.merge_file.read_bytes()).get('tun', {}).get('enable'):
+            raise Error('Choose a TUN preset or enable TUN in merge YAML before activation.')
         if self.source_file.exists():
             result = self.apply(self.source_file.read_bytes(), settings)
         else:
@@ -559,7 +760,14 @@ class Manager:
                 raise Error("A subscription update is already running.") from None
             with self.lock():
                 settings = self.settings()
-                proxy = "127.0.0.1:7891" if self.system.running() else ""
+                proxy = ''
+                if self.system.running():
+                    current = parse_yaml(self.config_file.read_bytes())
+                    port = current.get('socks-port') or current.get('mixed-port')
+                    bind = current.get('bind-address', '127.0.0.1')
+                    bind = '127.0.0.1' if bind in {'*', '0.0.0.0', '::'} else bind
+                    if port:
+                        proxy = ('[' + bind + ']' if ':' in bind else bind) + ':' + str(port)
             self.update_status("running")
             self.log("Fetching the subscription directly.")
             try:
@@ -596,10 +804,20 @@ class Manager:
         except (OSError, ValueError):
             status = {}
         active = bool(status.get("dns_active"))
-        if active and not self.system.running() and settings["dns_fallback"]:
-            self.system.dns(False, settings)
+        if not self.system.running():
             self.system.destroy_tun()
-            return self.publish_status(settings, error="Mihomo exited. Direct DNS was restored automatically.")
+            if active and (settings['dns_fallback'] or not settings['service_enabled'] or (self.state / 'dns-reload-pending').exists()):
+                self.system.dns(False, settings)
+                return self.publish_status(settings, error="Mihomo exited. Direct DNS and routing were restored automatically.")
+        if settings.get('router_dns'):
+            upstreams, ipv6 = self.router_context(settings)
+            data = parse_yaml(self.config_file.read_bytes())
+            if ipv6 and not (data.get('ipv6') is True and data.get('dns', {}).get('ipv6') is True):
+                return self.publish_status(settings, active, error='IPv6 is now being advertised to clients while Mihomo IPv6 is disabled. Disable router DNS or validate IPv6 support.')
+            pins = dns_transport_rules(upstreams)
+            if self.system.running() and data.get('rules', [])[:len(pins)] != pins:
+                self.apply(self.source_file.read_bytes(), settings)
+                return self.publish_status(settings, active)
         return self.publish_status(settings, active)
 
     def dispatch(self, action, argument=None):
@@ -616,10 +834,20 @@ class Manager:
             return self.update()
         if action == "save-config":
             return self.apply(Path(argument).read_bytes())
+        if action in {'save-merge', 'load-preset'}:
+            path = Path(argument)
+            if action == 'load-preset':
+                name = argument if re.fullmatch(r'[a-z0-9-]+\.yaml', argument or '') else path.read_text().strip()
+                if not re.fullmatch(r'[a-z0-9-]+\.yaml', name):
+                    raise Error('Invalid preset name.')
+                path = self.path(SHARE + '/presets/' + name)
+            overlay = parse_yaml(path.read_bytes())
+            content = self.source_file.read_bytes() if self.source_file.exists() else b'proxies: []\nproxy-groups: []\nrules: ["MATCH,DIRECT"]\n'
+            return self.apply(content, subscription=self.source_file.exists(), overlay=overlay)
         if action == "set-settings":
             value = json.loads(Path(argument).read_bytes())
             settings = self.settings()
-            for key in ("subscription_url", "secret", "controller", "device", "dns_fallback"):
+            for key in ("subscription_url", "secret", "device", "dns_fallback", 'router_dns'):
                 if key in value:
                     settings[key] = value[key]
             if self.source_file.exists():
@@ -630,6 +858,9 @@ class Manager:
             return self.set_policy(action == "enable-transparent")
         settings = self.settings()
         if action in {"suspend", "stop", "remove"}:
+            if action != 'suspend':
+                settings['service_enabled'] = False
+                self.write_settings(settings)
             self.stop(settings)
             self.system.stop_watch()
             if action != "suspend":
@@ -656,7 +887,7 @@ class Manager:
                 status = json.loads(self.status_file.read_bytes())
             except (OSError, ValueError):
                 status = {}
-            return self.publish_status(settings, bool(status.get("dns_active")))
+            return self.publish_status(settings, bool(status.get("dns_active")), error=status.get('error', ''))
         raise Error("Unknown action.")
 
 

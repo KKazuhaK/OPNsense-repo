@@ -47,8 +47,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $message = 'CSRF validation failed. Refresh the page and try again.';
     } else {
         $action = (string)($_POST['action'] ?? '');
-        if ($action === 'save-config') {
-            $result = mihomo_action($action, (string)($_POST['config_content'] ?? ''));
+        if ($action === 'save-config' || $action === 'save-merge') {
+            $result = mihomo_action($action, (string)($_POST[$action === 'save-merge' ? 'merge_content' : 'config_content'] ?? ''));
+        } elseif ($action === 'load-preset') {
+            $preset = (string)($_POST['preset'] ?? '');
+            $result = preg_match('/^[a-z0-9-]+\.yaml$/', $preset) ? mihomo_action($action, $preset) : ['ok' => false, 'error' => 'Invalid preset.'];
         } else {
             $result = mihomo_action($action);
         }
@@ -59,6 +62,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $status = mihomo_status();
 $settings = mihomo_settings();
 $source = @file_get_contents('/var/db/os-mihomo/subscription.yaml');
+$merge = @file_get_contents('/var/db/os-mihomo/merge.yaml');
 include('head.inc');
 include('fbegin.inc');
 ?>
@@ -71,7 +75,7 @@ include('fbegin.inc');
     <div class="content-box">
       <h3><?=gettext('Service and transparent routing')?></h3>
       <p id="mihomo-status"><?=mihomo_escape($status['running'] ? 'Mihomo is running.' : 'Mihomo is stopped.')?></p>
-      <p><?=gettext('Installation starts local proxy ports only: mixed proxy 127.0.0.1:7890 and SOCKS5 127.0.0.1:7891. Transparent routing takes over TUN and DNS together after a subscription has been validated.')?></p>
+      <p><?=gettext('Installation and upgrades start proxy ports only. Explicit transparent activation uses the validated merge YAML, including its TUN and DNS mode.')?></p>
       <p><?=gettext('Transparent routing configured')?>: <?=!empty($settings['transparent']) ? gettext('Yes') : gettext('No')?>.
          <?=gettext('DNS integration active')?>: <?=!empty($status['dns_active']) ? gettext('Yes') : gettext('No')?>.</p>
       <?php if (!empty($status['error'])): ?><div class="alert alert-warning"><?=mihomo_escape($status['error'])?></div><?php endif; ?>
@@ -80,6 +84,17 @@ include('fbegin.inc');
         <?php foreach (['start' => 'Start', 'stop' => 'Stop', 'restart' => 'Restart', 'enable-transparent' => 'Enable transparent routing', 'disable-transparent' => 'Disable transparent routing', 'clear-log' => 'Clear log'] as $action => $label): ?>
           <button type="submit" class="btn btn-default" name="action" value="<?=$action?>"><?=gettext($label)?></button>
         <?php endforeach; ?>
+      </form>
+    </div>
+    <div class="content-box">
+      <h3><?=gettext('Local merge YAML')?></h3>
+      <p><?=gettext('Mappings deep-merge. Plain values replace; prepend/append-rules, -proxy-groups and -proxies extend lists. This file controls the dashboard address and proxy ports. TUN device, the stored secret and the port 53 restriction are enforced. Loading a preset replaces this entire file; save a copy of custom settings first.')?></p>
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
+        <textarea name="merge_content" rows="18" class="form-control" spellcheck="false"><?=mihomo_escape($merge ?: '')?></textarea>
+        <button type="submit" class="btn btn-primary" name="action" value="save-merge"><?=gettext('Validate and apply merge')?></button>
+        <select name="preset"><?php foreach (glob('/usr/local/share/mihomo/presets/*.yaml') as $path): ?><option value="<?=mihomo_escape(basename($path))?>"><?=mihomo_escape(basename($path))?></option><?php endforeach; ?></select>
+        <button type="submit" class="btn btn-default" name="action" value="load-preset"><?=gettext('Load preset')?></button>
       </form>
     </div>
     <div class="content-box">

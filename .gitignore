@@ -2,3 +2,36 @@
 ._*
 .private/
 work/
+
+# 签名私钥 —— 绝不入库
+*.key
+*.pem
+pkgsign/
+.secrets/
+
+# AI 指令、记忆与本地工具配置 —— 仅保留在本地
+AGENT.md
+agent.md
+AGENTS.md
+agents.md
+AGENTS.override.md
+agents.override.md
+CLAUDE.md
+claude.md
+CLAUDE.local.md
+claude.local.md
+GEMINI.md
+gemini.md
+MEMORY.md
+memory.md
+.agent/
+.agents/
+.codex/
+.claude/
+.gemini/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.aider*
+.github/copilot-instructions.md

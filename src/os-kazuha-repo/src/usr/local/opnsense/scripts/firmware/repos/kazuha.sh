@@ -6,10 +6,10 @@ case "$root" in ''|/*) ;; *) echo 'error: repository root must be absolute' >&2;
 root="${root%/}"
 fingerprint=92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b
 source_key="$root/usr/local/share/kazuha-repo/kazuha.pub"
-[ -f "$source_key" ] && [ "$(sha256 -q "$source_key")" = "$fingerprint" ] || {
+if [ ! -f "$source_key" ] || [ "$(sha256 -q "$source_key")" != "$fingerprint" ]; then
     echo 'error: repository public key does not match the trust anchor' >&2
     exit 1
-}
+fi
 series="$(opnsense-version -x)"
 case "$series" in [0-9][0-9].[17]) ;; *) echo 'error: invalid OPNsense release series' >&2; exit 1 ;; esac
 suffix="/$series"

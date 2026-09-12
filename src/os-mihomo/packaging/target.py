@@ -60,9 +60,22 @@ def enabled_targets(project):
             target = target_values(item.get('abi'), item.get('product_abi'), item.get('python'),
                                    item['native_freebsd'], item['repository'], profile)
             target['php'] = item['php']
+            expected_repository = 'https://pkg.opnsense.org/' + target['abi'] + '/' + target['product_abi'] + '/latest'
+            if item.get('dependency_repository') != expected_repository:
+                raise ValueError('An enabled target has no matching official dependency repository.')
+            fingerprint = item.get('dependency_fingerprint') or ''
+            if not re.fullmatch(r'packaging/OPNsense/trusted/pkg\.opnsense\.org\.[0-9]{8}', fingerprint):
+                raise ValueError('An enabled target has no committed official dependency fingerprint.')
+            target['dependency_repository'] = expected_repository
+            target['dependency_fingerprint'] = fingerprint
             result.append(target)
     if not result:
         raise ValueError('No complete build targets are enabled.')
+    for target in result:
+        fingerprint_file = Path(project) / target['dependency_fingerprint']
+        if (not fingerprint_file.is_file() or fingerprint_file.is_symlink() or
+                not re.fullmatch(r'function: "sha256"\nfingerprint: "[0-9a-f]{64}"\n?', fingerprint_file.read_text())):
+            raise ValueError('An enabled target has an invalid official dependency fingerprint.')
     return result
 
 

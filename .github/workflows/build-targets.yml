@@ -26,9 +26,12 @@ jobs:
       matrix: ${{ fromJson(needs.targets.outputs.matrix) }}
     env:
       TARGET_PROFILE: ${{ matrix.profile }}
+      TARGET_ABI: ${{ matrix.abi }}
       TARGET_PYTHON: ${{ matrix.python }}
       TARGET_PRODUCT_ABI: ${{ matrix.product_abi }}
       TARGET_PHP: ${{ matrix.php }}
+      TARGET_DEPENDENCY_REPOSITORY: ${{ matrix.dependency_repository }}
+      TARGET_DEPENDENCY_FINGERPRINT: ${{ matrix.dependency_fingerprint }}
     steps:
       - uses: actions/checkout@v4
       - name: Build native candidates and run source regressions
@@ -36,9 +39,9 @@ jobs:
         with:
           release: ${{ matrix.native_freebsd }}
           usesh: true
-          envs: 'TARGET_PROFILE TARGET_PYTHON TARGET_PRODUCT_ABI TARGET_PHP'
+          envs: 'TARGET_PROFILE TARGET_ABI TARGET_PYTHON TARGET_PRODUCT_ABI TARGET_PHP TARGET_DEPENDENCY_REPOSITORY TARGET_DEPENDENCY_FINGERPRINT'
           prepare: |
-            pkg install -y curl python${TARGET_PYTHON%%.*}${TARGET_PYTHON#*.} py${TARGET_PYTHON%%.*}${TARGET_PYTHON#*.}-pyyaml php${TARGET_PHP%%.*}${TARGET_PHP#*.} php${TARGET_PHP%%.*}${TARGET_PHP#*.}-simplexml unbound
+            sh src/os-mihomo/packaging/prepare-builder.sh
             test -f /usr/local/etc/php.ini || cp /usr/local/etc/php.ini-production /usr/local/etc/php.ini
           run: |
             set -eu

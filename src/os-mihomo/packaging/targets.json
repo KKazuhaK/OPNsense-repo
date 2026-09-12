@@ -9,7 +9,9 @@
       "python": "3.13",
       "php": "8.5",
       "native_freebsd": "15.1",
-      "repository": "repo/FreeBSD:15:amd64"
+      "repository": "repo/FreeBSD:15:amd64",
+      "dependency_repository": "https://pkg.opnsense.org/FreeBSD:15:amd64/26.7/latest",
+      "dependency_fingerprint": "packaging/OPNsense/trusted/pkg.opnsense.org.20260608"
     },
     "27.1": {
       "enabled": false,
@@ -19,6 +21,8 @@
       "php": null,
       "native_freebsd": null,
       "repository": null,
+      "dependency_repository": null,
+      "dependency_fingerprint": null,
       "reason": "Await the official FreeBSD/Python tuple and native validation."
     }
   }

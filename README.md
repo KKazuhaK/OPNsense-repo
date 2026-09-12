@@ -1,77 +1,17 @@
+# Kazuha OPNsense 仓库
 
-<div align="center">
-  <a href="README.md">中文</a> |
-  <a href="README.US.md">English</a>
-</div>
+独立维护的 `os-mihomo` fork，面向 **OPNsense 26.7 / FreeBSD:15:amd64**，通过签名 pkg 仓库分发。
 
-# OPNsense Community Repository
+首次安装只运行本机代理端口，不接管 LAN 路由和 DNS。直接拉取完整 YAML 订阅，保留服务商的节点、分组和规则；配置与仪表盘密钥在升级时保留。透明代理需要显式同时启用 TUN 与 DNS，故障时的自动 DNS 回退可按每台路由器配置。
 
-**Community Plugins for OPNsense**
+- [插件配置与构建](src/os-mihomo/README.md)
+- [架构与验证](src/os-mihomo/DESIGN.md)
+- [签名与部署](DEPLOYMENT.md)
+- [签名仓库](https://kkazuhak.github.io/OPNsense-repo/)
+- [English](README.US.md)
 
-[![OPNsense](https://img.shields.io/badge/OPNsense-26.x-orange)]()
-[![Platform](https://img.shields.io/badge/Platform-amd64-blue)]()
-[![License](https://img.shields.io/badge/License-Multiple-green)]()
-[![GitHub
-Pages](https://img.shields.io/badge/Hosted-GitHub%20Pages-brightgreen)]()
+`main` 保留源码与已有运行资产，生成的 `repo/`、构建包与目录元数据已忽略。签名产物发布到可替换的 `gh-pages` 分支，再由 GitHub Actions 部署到 Pages。签名私钥始终留在本地路由器，不上传 GitHub。
 
-这是一个面向 **OPNsense amd64**的社区软件仓库，为 OPNsense 提供代理集成、DNS 增强、动态 DNS、中文汉化、系统诊断和网络工具等扩展。。
+其他插件源码保留自 [Opnwall/OPNsense-repo](https://github.com/Opnwall/OPNsense-repo)，不作修改。此 fork 的 pkg 仓库仅发布 FreeBSD 15 的 `os-mihomo`。
 
-主要包含：
-
--   🌐 代理插件（Mihomo、sing-box）
--   🛡 DNS 增强
--   ☁️ DDNS
--   🌏 中文语言包
--   🔧 网络工具
--   📊 系统诊断插件
-
-## 安装方法
-进入终端，运行以下命令添加社区存储库：
-``` sh
-fetch -o /usr/local/etc/pkg/repos/opnwall.conf https://opnwall.github.io/OPNsense-repo/opnwall.conf
-pkg update -f
-```
-
-然后进入：
-
-    系统
-    └── 固件
-        └── 插件
-
-安装所有 `os-` 开头的软件包。
-
-## 删除仓库
-
-``` sh
-rm -f /usr/local/etc/pkg/repos/opnwall.conf
-pkg update -f
-```
-
-不会卸载已经安装的插件。
-
-## 插件列表
-
-| 插件 | 版本 | 描述 |
-| --- | --- | --- |
-| `os-ddclient-opnwall` | 1.0.2 | 增强版 DDClient 替代方案，支持阿里云、腾讯云及 IPv6 接口 |
-| `os-ddns-go` | 1.0.2 | DDNS-Go 动态 DNS |
-| `os-easytier` | 1.0.0 | EasyTier 组网 VPN，支持 WebGUI、动态接口和子网代理 |
-| `os-lang` | 1.0.4 | 中文汉化工具 |
-| `os-lucky` | 1.0.2 | Lucky 网络工具箱 |
-| `os-mihomo` | 1.0.2 | Mihomo 代理工具 |
-| `os-pftop` | 1.0.2 | pfTop 诊断工具 |
-| `os-sing-box` | 1.0.2 | sing-box 代理工具 |
-| `os-staticarp` | 1.0.2 | ARP 静态绑定工具 |
-| `os-speedtest` | 1.0.2 | Speedtest 互联网测速工具 |
-| `os-ttyd` | 1.0.2 | ttyd 终端程序 |
-| `os-unboundcustom` | 1.0.2 | Unbound DNS 自定义选项 |
-
-## 插件源码
-
-已发布插件的完整源码位于 [`src/`](src/) 目录。每个 `os-*`目录都是独立项目，可在 OPNsense/FreeBSD 主机上使用项目内的 `build.sh` 编译。
-
-## 许可声明
-源码及其中包含的第三方组件分别遵循各项目附带的许可证和声明。
-
-##  免责声明
-本仓库为社区项目，与 OPNsense 官方无任何关联，也不提供官方支持。
+[许可证](LICENSE)

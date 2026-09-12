@@ -9,14 +9,9 @@ arch: "@ARCH@"
 prefix: "@PREFIX@"
 flatsize: @FLATSIZE@
 deps: {
-    jq: {
-        origin: "textproc/jq"
-        version: ">=0"
-    },
-    curl: {
-        origin: "ftp/curl"
-        version: ">=0"
-    }
+    curl: { origin: "ftp/curl", version: "@CURL_VERSION@" },
+    python313: { origin: "lang/python313", version: "@PYTHON_VERSION@" },
+    py313-pyyaml: { origin: "devel/py-pyyaml", version: "@PYYAML_VERSION@" }
 }
 desc: <<EOD
 @DESC@

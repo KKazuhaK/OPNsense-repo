@@ -1,148 +1,62 @@
-<div align="center">
-  <a href="README.md">中文</a> |
-  <a href="README.US.md">English</a>
-</div>
+[中文](README.md) · English
 
 # Mihomo for OPNsense
 
-![OPNsense](https://img.shields.io/badge/OPNsense-orange)
-![Mihomo](https://img.shields.io/badge/Mihomo-MetaCubeX-purple)
+This independent fork targets **OPNsense 26.7 / FreeBSD:15:amd64**. Installations run local proxy ports without changing LAN routing or DNS. TUN and Unbound forwarding are enabled together by an explicit administrator action.
 
-Mihomo, formerly Clash Meta, is a high-performance open source proxy core compatible with Clash configuration files. It provides rule-based routing, DNS handling, load balancing, and transparent proxy support.
+## Configure
 
-This project packages Mihomo as an OPNsense plugin so it can run on OPNsense and provide transparent proxy functionality through the OPNsense WebGUI.
+1. Install `os-mihomo` from the signed Kazuha repository using **System → Firmware → Plugins**.
+2. Open **VPN → Proxy Suite → Mihomo Subscribe**. Save a complete Mihomo YAML subscription URL, a device label, and this router's dashboard IPv4 address and port. The default is `192.168.8.1:9090`; change it for routers with a different LAN address.
+3. Fetch and apply the subscription. No third-party converter receives its URL. The subscription's proxies, groups, and rules are retained. YAML is parsed structurally, so escaped emoji, key order, flow mappings, and zero-indent lists work.
+4. Verify connectivity through the local mixed proxy at `127.0.0.1:7890` or SOCKS5 at `127.0.0.1:7891` before enabling transparent routing. A fresh installation without a subscription uses `MATCH,DIRECT`.
+5. Open **VPN → Proxy Suite → Mihomo** and select **Enable transparent routing**. This starts the TUN configuration and then enables the DNS forwarder after the core and its DNS listener are ready. Use **Disable transparent routing** to return to proxy ports only.
 
-Tested on:
+The plugin owns local listener settings (`allow-lan`, bind address, proxy ports, dashboard, TUN and DNS enable/listen). Additional subscription inbound listeners are removed. Proxy listeners remain on loopback. TUN uses `tun_mihomo`, with gVisor, automatic routes, and DNS hijack only while transparent routing is enabled. The dashboard is bound to a specific IPv4 address with a persistent secret. Blank secret input preserves the existing secret.
 
-- OPNsense 25.1
+The four installation-specific settings are DNS at `127.0.0.1:1053`, the dashboard address, UI path plus persistent secret, and TUN device `tun_mihomo`. Subscription proxy, group, and rule semantics remain unchanged. Fake-IP ranges outside `198.18.0.0/15` are rejected before enabling TUN to keep Unbound rebinding protection consistent.
 
-![](images/mihomo.us.png)
+## Failures and updates
 
-## Binary
+Runtime state lives under `/var/db/os-mihomo/`, outside the package file list:
 
-The project uses the static binary from [Vincent-Loeng](https://github.com/Vincent-Loeng/clash-meta). The default local asset path is:
+- `settings.json`: subscription URL, secret, controller address, device label, and policies; mode `0600`.
+- `subscription.yaml`: complete provider configuration; mode `0600`.
+- `config.yaml`: generated and validated effective configuration; mode `0600`.
+- `dns-state.json`, `tun-state.json`: the original DNS values and ownership records needed for restoration.
 
-```text
-bin/clash-meta-freebsd-amd64.xz
-```
+Failed parsing or core validation does not replace these files or restart the running service. A failed restart restores the previous configuration and secret; if the old service cannot restart either, direct DNS remains restored and status reports the failure. State transitions are serialized by an OS file lock, including UI edits, update application, WAN hooks, and the watchdog. Downloads hold a separate update lock, allowing crash recovery during network waits. Configd queues updates; the UI displays their separate completion status.
 
-The build script prefers the local `bin/clash-meta-freebsd-amd64.xz` file. If it is missing, the script downloads it from GitHub:
+DNS fallback defaults to enabled and is configurable per router. On a core crash, Unbound permits fallback and a watchdog restores the original DNS configuration, including existing DNS-over-TLS entries, within its five-second polling interval plus service reload time. Explicit Stop always restores original DNS before stopping the core. No script edits `/etc/resolv.conf` or deletes OPNsense's `dot.conf`.
 
-```text
-https://github.com/Vincent-Loeng/clash-meta/releases/latest/download/clash-meta-freebsd-amd64.xz
-```
+Stop persists the administrative service state, so WAN events and reboot do not undo it. WAN events only restart an already-running service. Package upgrades preserve configuration, secret, service state, and transparent-routing policy. A new pre-install hook saves legacy package-owned configuration before the old removal hook runs. Known local workaround scripts are archived in `migrate/` and their old entry points are retired. Uninstall restores DNS and removes only plugin-created interface and firewall entries; state is retained for recovery, and a later fresh installation resets transparent routing to off.
 
-## Notes
+Subscription HTTP 4xx responses stop immediately, including 408 and 429. Only timeouts and HTTP 5xx permit retry and SOCKS5 fallback, with at most four requests per run. TLS, DNS lookup, and other failures are not retried. The URL is supplied through a mode-0600 curl configuration file rather than process arguments. Diagnostics never include the subscription URL, response body, or dashboard secret. An unwritable log does not prevent an update. Historical subscription logs are discarded during initial migration because older versions logged credentials.
 
-1. Only x86_64 / amd64 is currently supported.
-2. After installation, no interface or firewall rule needs to be added manually. Edit the node information in the default configuration and use it directly.
-3. After debugging is complete, set the log level to `error` to avoid excessive long-term logs.
-4. The default configuration enables the Clash API. You can open the dashboard at `http://LAN_IP:9090/ui`.
-5. Do not change the TUN interface name `tun_mihomo` in `config.yaml`, otherwise the installer-generated firewall rules may stop matching.
-6. If a LAN client uses the OPNsense LAN address as its DNS server, Unbound processes queries locally before they reach mihomo. To ensure mihomo handles DNS queries, you can redirect LAN DNS traffic via NAT, assign an external DNS server to clients via DHCP, or enable query forwarding in Unbound. This installation package configures Unbound to forward queries to port 1053 (the port mihomo listens on) and applies a `geosite:cn` filter to the Fake-IP mechanism; this ensures that domestic domains resolve to their actual IP addresses, while foreign domains utilize Fake-IPs.
+The User-Agent is `OPNsense-Mihomo/1 (device-label)`. Its format version stays fixed across software upgrades. Passwall-Sub-Panel uses case-insensitive substring matching in rule order; a dedicated `OPNsense-Mihomo/1` rule must precede its generic `mihomo` rule if separate fleet permissions are wanted. See [design and verification](DESIGN.md).
 
-## Install
+Schedule updates under **System → Settings → Cron**, selecting **Renew mihomo Subscription**. UI, configd, `/usr/bin/mihomo_sub`, and `sub/sub.sh` all reach the same manager.
 
-Upload the package to OPNsense and run:
+## Build and inspect
 
-```sh
-pkg add -f os-mihomo.pkg
-```
-
-After installation, refresh the OPNsense WebGUI and go to:
-
-```text
-Services > Mihomo
-```
-
-## Uninstall
+On FreeBSD 15 / OPNsense with `pkg`, `tar`, `xz`, `sha256`, `curl`, Python 3.13, and `py313-pyyaml` installed:
 
 ```sh
-pkg delete os-mihomo
+cd src/os-mihomo
+make package
+pkg info -F dist/os-mihomo-1.1.0.pkg
 ```
 
-## Subscription Updates
+The bundled archive is `src/usr/local/bin/clash-meta-freebsd-amd64.xz`, from [Vincent-Loeng/clash-meta](https://github.com/Vincent-Loeng/clash-meta). The build uses that exact asset and performs no compilation or download. FreeBSD 14 and universal ABI packages are deliberately unsupported.
 
-Automatic subscription updates can be scheduled with Cron:
-
-```text
-System > Settings > Cron
-```
-
-Add a scheduled task and select:
-
-```text
-Renew mihomo Subscription
-```
-
-## Build pkg
-
-Build on a FreeBSD or OPNsense host. The following commands are required:
+Run failure and lifecycle tests without changing host services:
 
 ```sh
-pkg, tar, make, xz, curl or fetch
+python3 -m unittest discover -s tests -v
 ```
 
-Run:
-
-```sh
-make package ABI=universal
-```
-
-Output file:
-
-```text
-dist/os-mihomo.pkg
-```
-
-Inspect package metadata:
-
-```sh
-pkg info -F dist/os-mihomo.pkg
-```
-
-## Common Commands
-
-Service control:
-
-```sh
-service mihomo start
-service mihomo stop
-service mihomo status
-service mihomo restart
-service mihomo rcvar
-```
-
-View logs:
-
-```sh
-tail -f /var/log/mihomo.log
-```
-
-Check listening ports:
-
-```sh
-sockstat -4 -l | egrep ':53|:7891|:9090'
-```
-
-Check the TUN interface:
-
-```sh
-ifconfig tun_mihomo
-```
-
-Check runtime firewall rules:
-
-```sh
-pfctl -sr | grep -E 'tun_mihomo'
-```
+See the root [deployment guide](../../DEPLOYMENT.md) for signing, Pages publication, and the production installation window.
 
 ## Credits
 
-[MetaCubeX](https://github.com/MetaCubeX/mihomo)<br>
-[Vincent-Loeng](https://github.com/Vincent-Loeng?tab=repositories)
-
-## Disclaimer
-
-> [!CAUTION]
-> This is an unofficial plugin and is not supported by the OPNsense team. Use it at your own risk.
+Based on [Opnwall/OPNsense-repo](https://github.com/Opnwall/OPNsense-repo), [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo), and the FreeBSD binary from [Vincent-Loeng](https://github.com/Vincent-Loeng/clash-meta). This plugin is maintained independently and is not an official OPNsense plugin.

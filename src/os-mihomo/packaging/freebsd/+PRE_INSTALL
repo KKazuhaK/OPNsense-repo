@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+# Save the original package-owned configuration before the old removal hook runs.
+if [ -n "${PKG_UPGRADE+x}" ] && [ ! -f /var/db/os-mihomo/settings.json ]; then
+    install -d -m 0700 /var/db/os-mihomo/migrate
+    install -m 0600 /conf/config.xml /var/db/os-mihomo/migrate/config.xml
+    for entry in config.yaml sub/env update-sub.sh repair-after-upgrade.sh; do
+        source="/usr/local/etc/mihomo/$entry"
+        [ -f "$source" ] || continue
+        install -m 0600 "$source" "/var/db/os-mihomo/migrate/$(basename "$entry")"
+    done
+    if [ -f /usr/local/opnsense/service/conf/actions.d/actions_mihomolocal.conf ]; then
+        install -m 0600 /usr/local/opnsense/service/conf/actions.d/actions_mihomolocal.conf /var/db/os-mihomo/migrate/actions_mihomolocal.conf
+    fi
+fi

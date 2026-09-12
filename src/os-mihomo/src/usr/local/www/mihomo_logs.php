@@ -30,6 +30,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+require_once("guiconfig.inc");
+
 const LOG_FILE = "/var/log/mihomo.log";
 const LOG_TAIL_LINES = 200;
 const LOG_MAX_BYTES = 262144;

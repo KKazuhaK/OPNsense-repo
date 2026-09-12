@@ -46,5 +46,5 @@ function mihomo_syslog()
 
 function mihomo_restart()
 {
-    exec('/usr/local/sbin/configctl mihomo restart');
+    exec('/usr/local/sbin/configctl mihomo wan-restart');
 }

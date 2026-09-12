@@ -3,13 +3,13 @@
 .private/
 work/
 
-# 签名私钥 —— 绝不入库
+# Signing private keys must never be committed.
 *.key
 *.pem
 pkgsign/
 .secrets/
 
-# AI 指令、记忆与本地工具配置 —— 仅保留在本地
+# Keep AI instructions, memory, and tool configuration local.
 AGENT.md
 agent.md
 AGENTS.md
@@ -35,3 +35,12 @@ memory.md
 .windsurfrules
 .aider*
 .github/copilot-instructions.md
+
+# Generated packages and repository catalogs are published separately.
+/repo/
+/SHA256SUMS.txt
+/.site/
+/src/os-mihomo/dist/
+/src/os-mihomo/work/
+__pycache__/
+*.pyc

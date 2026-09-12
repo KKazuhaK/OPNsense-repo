@@ -1,9 +1,8 @@
-name: Deploy GitHub Pages
+name: Deploy signed GitHub Pages repository
 
 on:
   push:
-    branches:
-      - main
+    branches: [gh-pages]
   workflow_dispatch:
 
 permissions:
@@ -22,28 +21,30 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Prepare static repository
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+      - name: Validate generated site
+        run: |
+          test -f index.html
+          test -f kazuha.pub
+          test -f repo/FreeBSD:15:amd64/meta.conf
+          test -f repo/FreeBSD:15:amd64/packagesite.pkg
+          test -f repo/FreeBSD:15:amd64/data.pkg
+          test "$(sha256sum kazuha.pub | cut -d ' ' -f 1)" = "92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b"
+          if find . -type f -not -path './.git/*' | grep -E '\.(key|pem)$|/(AGENTS|CLAUDE|HANDOFF|MEMORY)\.md$'; then exit 1; fi
+          if grep -R --exclude-dir=.git -l -E -- '-----BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----' .; then exit 1; fi
+      - name: Verify catalog signatures and package digest
+        run: python3 verify-repo.py .
+      - name: Prepare site artifact
         run: |
           mkdir -p _site
-          rsync -aL \
-            --exclude '.git/' \
-            --exclude '.github/' \
-            --exclude '.private/' \
-            --exclude 'work/' \
-            ./ _site/
+          cp index.html kazuha.pub kazuha.conf opnwall.conf SHA256SUMS.txt _site/
+          cp -RL repo _site/
           touch _site/.nojekyll
-
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
-
-      - name: Deploy Pages
+      - uses: actions/deploy-pages@v4
         id: deployment
-        uses: actions/deploy-pages@v4

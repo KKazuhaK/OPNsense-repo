@@ -1,76 +1,17 @@
-<div align="center">
-  <a href="README.md">中文</a> |
-  <a href="README.US.md">English</a>
-</div>
+# Kazuha OPNsense repository
 
-# OPNsense Community Repository
+An independent `os-mihomo` fork for **OPNsense 26.7 / FreeBSD:15:amd64**, distributed through a signed package repository.
 
-**Community Plugins for OPNsense**
+Fresh installation runs loopback proxy ports without taking over LAN routing or DNS. Complete subscription YAML is fetched directly, keeping the provider's nodes, groups and rules. Persistent configuration and dashboard credentials survive upgrades. Transparent TUN and DNS forwarding require explicit enablement; automatic DNS recovery is configurable per router.
 
-[![OPNsense](https://img.shields.io/badge/OPNsense-26.x-orange)]()
-[![Platform](https://img.shields.io/badge/Platform-amd64-blue)]()
-[![License](https://img.shields.io/badge/License-Multiple-green)]()
-[![GitHub
-Pages](https://img.shields.io/badge/Hosted-GitHub%20Pages-brightgreen)]()
+- [Plugin configuration and build guide](src/os-mihomo/README.US.md)
+- [Design and verification](src/os-mihomo/DESIGN.md)
+- [Signing and deployment](DEPLOYMENT.md)
+- [Signed repository](https://kkazuhak.github.io/OPNsense-repo/)
+- [中文](README.md)
 
+`main` contains source and bundled runtime assets; generated `repo/`, package output, and catalogs are ignored. Signed artifacts are published on a replaceable `gh-pages` branch and deployed by GitHub Actions. The signing private key stays on the local router and is never uploaded to GitHub.
 
-------------------------------------------------------------------------
-This is a community software repository for **OPNsense amd64**，It extends OPNsense with proxy integrations, DNS enhancements, Dynamic DNS, localization, diagnostics and system utilities.
+Sibling plugin sources are retained from [Opnwall/OPNsense-repo](https://github.com/Opnwall/OPNsense-repo) and are unchanged. This fork's repository publishes only `os-mihomo` for FreeBSD 15.
 
-It provides networking plugins that extend OPNsense with proxy
-integrations, DNS enhancements, Dynamic DNS, localization, diagnostics
-and system utilities.
-
-## Installation
-Open the terminal and run the following command to add the community repository:
-``` sh
-fetch -o /usr/local/etc/pkg/repos/opnwall.conf https://opnwall.github.io/OPNsense-repo/opnwall.conf
-pkg update -f
-```
-
-Open:
-
-    System
-    └── Firmware
-        └── Plugins
-
-Install any package beginning with `os-`.
-
-## Remove Repository
-
-``` sh
-rm -f /usr/local/etc/pkg/repos/opnwall.conf
-pkg update -f
-```
-
-Installed plugins remain available.
-
-## Plugins
-
-| Package | Version | Description |
-| --- | --- | --- |
-| `os-ddclient-opnwall` | 1.0.2 | Extended DDClient replacement with Aliyun, Tencent Cloud and IPv6 interface support |
-| `os-ddns-go` | 1.0.2 | DDNS-Go dynamic DNS integration |
-| `os-easytier` | 1.0.0 | EasyTier mesh VPN with WebGUI, dynamic interface and subnet proxy support |
-| `os-lang` | 1.0.4 | Chinese localization updater |
-| `os-lucky` | 1.0.2 | Lucky network toolbox integration |
-| `os-mihomo` | 1.0.2 | Mihomo proxy integration |
-| `os-pftop` | 1.0.2 | pfTop diagnostics page |
-| `os-sing-box` | 1.0.2 | sing-box proxy integration |
-| `os-staticarp` | 1.0.2 | Static ARP binding integration |
-| `os-speedtest` | 1.0.1 | Speedtest internet speed test |
-| `os-ttyd` | 1.0.2 | ttyd terminal integration |
-| `os-unboundcustom` | 1.0.2 | Safe custom options for Unbound DNS |
-
-## Source code
-
-The complete source tree for every published plugin is available under
-[`src/`](src/). Each `src/os-*` directory is an independent project and can
-be built on a compatible OPNsense/FreeBSD host with its included `build.sh`.
-
-## License
-Source code and bundled third-party components remain subject to the license
-files and notices included with each project.
-
-## Disclaimer
-This repository is **NOT** affiliated with or supported by the OPNsense Project.
+[License](LICENSE)

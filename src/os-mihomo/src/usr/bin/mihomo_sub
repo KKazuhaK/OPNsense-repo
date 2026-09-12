@@ -1,2 +1,3 @@
 #!/bin/sh
-exec /bin/sh /usr/local/etc/mihomo/sub/sub.sh "$@"
+# Keep the historical CLI and cron entry point stable.
+exec /usr/local/bin/python3 /usr/local/opnsense/scripts/mihomo/mihomo.py sub-update "$@"

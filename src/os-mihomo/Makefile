@@ -1,14 +1,9 @@
-PKG_NAME?=	os-mihomo
-VERSION?=	1.0.2
-ABI?=		universal
+VERSION?= 1.1.0
+ABI?= FreeBSD:15:amd64
 
-.PHONY: package install clean
-
+.PHONY: package clean
 package:
-	ABI="$(ABI)" PKG_NAME="$(PKG_NAME)" VERSION="$(VERSION)" ./build.sh
-
-install: package
-	pkg add -f "dist/$(PKG_NAME).pkg"
+	ABI="$(ABI)" VERSION="$(VERSION)" sh ./build.sh
 
 clean:
 	rm -rf work/freebsd-pkg

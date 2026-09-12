@@ -2,3 +2,5 @@
 # Retain user configuration for recovery; never schedule background directory deletion.
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 service configd restart >/dev/null 2>&1 || true
+# Firmware removes the desired registration after an explicit GUI uninstall.
+# Solver removal must retain it so firmware can restore the missing package.

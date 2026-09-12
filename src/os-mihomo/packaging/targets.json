@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "default": "26.7",
+  "targets": {
+    "26.7": {
+      "enabled": true,
+      "abi": "FreeBSD:15:amd64",
+      "product_abi": "26.7",
+      "python": "3.13",
+      "php": "8.5",
+      "native_freebsd": "15.1",
+      "repository": "repo/FreeBSD:15:amd64"
+    },
+    "27.1": {
+      "enabled": false,
+      "product_abi": "27.1",
+      "abi": null,
+      "python": null,
+      "php": null,
+      "native_freebsd": null,
+      "repository": null,
+      "reason": "Await the official FreeBSD/Python tuple and native validation."
+    }
+  }
+}

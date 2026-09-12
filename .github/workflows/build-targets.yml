@@ -1,0 +1,57 @@
+name: Build native firmware targets
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/os-mihomo/**'
+      - 'src/os-kazuha-repo/**'
+      - '.github/workflows/build-targets.yml'
+permissions:
+  contents: read
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: targets
+        run: echo "matrix=$(python3 src/os-mihomo/packaging/target.py --matrix)" >> "$GITHUB_OUTPUT"
+  build:
+    needs: targets
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.targets.outputs.matrix) }}
+    env:
+      TARGET_PROFILE: ${{ matrix.profile }}
+      TARGET_PYTHON: ${{ matrix.python }}
+      TARGET_PRODUCT_ABI: ${{ matrix.product_abi }}
+      TARGET_PHP: ${{ matrix.php }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native candidates and run source regressions
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.native_freebsd }}
+          usesh: true
+          envs: 'TARGET_PROFILE TARGET_PYTHON TARGET_PRODUCT_ABI TARGET_PHP'
+          prepare: |
+            pkg install -y curl python${TARGET_PYTHON%%.*}${TARGET_PYTHON#*.} py${TARGET_PYTHON%%.*}${TARGET_PYTHON#*.}-pyyaml php${TARGET_PHP%%.*}${TARGET_PHP#*.} php${TARGET_PHP%%.*}${TARGET_PHP#*.}-simplexml unbound
+            test -f /usr/local/etc/php.ini || cp /usr/local/etc/php.ini-production /usr/local/etc/php.ini
+          run: |
+            set -eu
+            sh src/os-mihomo/build.sh
+            sh src/os-kazuha-repo/build.sh
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-mihomo/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-kazuha-repo/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s tests -v
+            python${TARGET_PYTHON} -B verify-repo.py --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-candidates-${{ matrix.profile }}
+          path: |
+            src/os-mihomo/dist/
+            src/os-kazuha-repo/dist/
+          if-no-files-found: error

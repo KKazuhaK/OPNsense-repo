@@ -1,8 +1,8 @@
 # os-mihomo
 
-An independently maintained Mihomo integration for OPNsense / FreeBSD 15 amd64.
+An independently maintained Mihomo integration for OPNsense CE, currently validated on 26.7 / FreeBSD 15 amd64. Committed recipes parameterize future targets.
 
-Installation and every upgrade run ordinary local proxy ports only. A validated subscription and explicit activation are required for TUN. Upgrading from legacy 1.0.2 preserves the subscription URL, full YAML, secret and cron timing, but never inherits transparent enablement.
+Fresh installation and unrecognized legacy migration run ordinary local proxy ports only. A validated subscription and explicit activation are required for TUN. Once 1.1.2 establishes managed state, subsequent upgrade/reinstall preserves explicit TUN consent and administrative Stop. Legacy migration preserves the subscription URL, full YAML, secret and cron timing, but never inherits transparent enablement.
 
 Use **VPN → Proxy Suite** for service controls, subscription settings and the local merge editor. Runtime state is root-only under `/var/db/os-mihomo/`; static GeoIP data and presets are under `/usr/local/share/mihomo/`. Nothing depends on `/usr/local/etc/mihomo/`, which legacy packages delete asynchronously.
 

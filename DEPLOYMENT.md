@@ -1,6 +1,6 @@
 # Build, sign and publish
 
-New maintained packages target **FreeBSD:15:amd64**. Source main excludes generated packages and catalogs; signed output lives on a replaceable gh-pages branch and Pages serves the full pkg repository tree. Legacy FreeBSD 14/15 downloads and Mihomo 1.0.2 remain available for compatibility and rollback. Unsafe Mihomo 1.1.0 is withdrawn.
+Maintained packages use committed OPNsense CE target recipes in `src/os-mihomo/packaging/targets.json`. The enabled target is **26.7 / FreeBSD:15:amd64 / Python 3.13**. The unannounced 27.1 target remains disabled. Source main excludes generated packages and catalogs; signed output lives on a replaceable gh-pages branch and Pages serves the full pkg repository tree. Legacy FreeBSD 14/15 downloads and Mihomo 1.0.2 remain available for compatibility and rollback. Unsafe Mihomo 1.1.0 is withdrawn.
 
 The existing RSA signing key stays on the local signing host with mode 0600. GitHub receives signed catalogs, packages, a public key and a signed test report. No private key is uploaded or stored in GitHub Secrets.
 
@@ -11,10 +11,11 @@ Copy the clean source revision to a FreeBSD 15 build host, excluding local instr
 ```sh
 (cd src/os-mihomo && sh build.sh)
 (cd src/os-sing-box && sh build.sh)
+(cd src/os-kazuha-repo && sh build.sh)
 python3.13 -B -m unittest discover -s src/os-mihomo/tests -v
 python3.13 -B -m unittest discover -s src/os-sing-box/tests -v
 sh src/os-mihomo/tests/jail/run.sh \
-  src/os-mihomo/dist/os-mihomo-1.1.1.pkg legacy-1.0.2.pkg
+  src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.1.2.pkg legacy-1.0.2.pkg
 ```
 
 The harness requires root, VIMAGE, TUN and enough disk for its disposable filesystem. It creates an isolated VNET with synthetic upstreams and its own FIBs. It does not connect the jail to production interfaces. Its report identifies the exact package SHA-256 and executed checks. Test adapters replace OPNsense configd/filter/template/GUI infrastructure; actual package hooks, core, daemon, TUN, routes and Unbound are exercised. Remaining production checks are listed below.
@@ -26,13 +27,15 @@ Preserve a local legacy repo tree for compatibility downloads. Use the exact cle
 ```sh
 SOURCE_COMMIT=<tested-40-character-commit> \
   LEGACY_REPO=/path/to/legacy/repo \
-  TEST_REPORT=src/os-mihomo/dist/test-report.json \
-  sh build-repo.sh src/os-mihomo/dist/os-mihomo-1.1.1.pkg \
-    src/os-sing-box/dist/os-sing-box-1.0.3.pkg
+  sh build-repo.sh src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.1.2.pkg \
+    src/os-sing-box/dist/os-sing-box-1.0.3.pkg \
+    src/os-kazuha-repo/dist/os-kazuha-repo-1.0.0.pkg
 python3 verify-repo.py .site --source .
 ```
 
-Output contains index.html, kazuha.conf, kazuha.pub, SHA256SUMS.txt, release.json/release.sig and complete repo/FreeBSD:14:amd64 and repo/FreeBSD:15:amd64 trees with meta.conf, data.pkg, packagesite.pkg and All/*.pkg. The release report binds the tested package digest to a source commit; additional updated packages are digest-bound too. Every current package is compared with its source, including complete archive inventory checks that reject duplicate or unmanifested files and Python bytecode. Legacy downloads are retained but have no new lifecycle-test attestation.
+Each Mihomo package reads its adjacent `test-report.json`; `TEST_REPORT` remains an optional override for the first candidate. Supply every enabled target in one signing run. Reports bind the native kernel/userland ABI, native OPNsense series, Python, executed lifecycle checks and exact archive digest to the source commit. The signer rejects disabled, missing, duplicate and mismatched targets. Additional updated packages are digest-bound and source-checked. `os-kazuha-repo` contains only a shell hook, public key and metadata; its ABI-independent archive has no Python dependency. Legacy downloads have no new lifecycle attestation.
+
+Catalog creation scans an isolated `All/` tree for each target. This prevents recursive `pkg repo` scans from mixing nested series. Current 26.7 retains `repo/FreeBSD:15:amd64`; other series use `repo/ABI/SERIES` when dependencies differ. The repository hook selects these addresses using `opnsense-version -x`, rather than an unsupported pkg series placeholder.
 
 Do not treat pkg update exit status alone as signature acceptance. Check that the expected usable catalog exists; some pkg versions return zero after rejecting a signature.
 
@@ -53,7 +56,7 @@ Configure Pages to deploy with GitHub Actions. The [public endpoint](https://kka
 
 Keep an offline copy of the signed trust anchor, legacy package, configuration backup, source subscription, settings and local workaround scripts. The gateway's package upgrade stops its old core. It must be performed in a scheduled window even after the isolated lifecycle checks pass.
 
-1. Upgrade starts proxy ports with TUN activation off; subscription, secret and cron are retained. Wait beyond the old delayed deletion before proceeding.
+1. First migration from unrecognized legacy state starts proxy ports with TUN activation off; subscription, secret and cron are retained. Wait beyond the old delayed deletion before proceeding. Once managed state exists, ordinary upgrade/reinstall preserves explicit TUN consent and administrative Stop.
 2. Check proxy-only behavior, controller login and WAN behavior. Configure this router's merge and validate it.
 3. Explicitly enable the desired preset. Confirm native interface/firewall/template output and DNS readiness from router and LAN clients.
 4. Exercise router DNS only after confirming its resolver and DIRECT transport. IPv6 client enablement requires separate end-to-end validation; do not suppress AAAA as a workaround.
@@ -61,3 +64,14 @@ Keep an offline copy of the signed trust anchor, legacy package, configuration b
 6. Stop must restore DNS and stop TUN; WAN must not revive it. Successful subscription update preserves credentials; invalid input preserves the prior service.
 
 On failure, delete the new plugin to restore owned DNS and remove owned configuration, then restore the offline legacy package and settings if necessary. User state remains in /var/db/os-mihomo. Do not run archived old repair scripts against the new manager, and do not delete generated Unbound dot.conf as a recovery action. Real PF policy routing, secondary-router rebinding protection and LAN connectivity remain production checks.
+
+## Firmware release checklist
+
+1. Read the official target release/build configuration. Update product ABI, native FreeBSD release, Python and repository together; do not guess the next ABI. Same-ABI dependency changes need a separate series directory.
+2. Enable the complete target recipe, bump the plugin package version or revision, and run **Build native firmware targets**. Its per-target FreeBSD VM artifacts are unsigned build candidates, not publication authorization or proof of OPNsense API compatibility. The private key remains local.
+3. Exercise each candidate on its matching native OPNsense target, including the real VNET lifecycle harness and native PF/template/configd behavior. Collect each adjacent report and sign all enabled targets together, retaining the current target during transition.
+4. Publish before upgrading clients. Verify every target with `python3 check-upgrade.py --abi FreeBSD:15:amd64 --product-abi 26.7`, substituting the officially announced target values. The command verifies the trust anchor, report/catalog signatures, catalog membership, package digest and native attestation; unavailable or untested targets exit nonzero.
+5. In a maintenance window, run the front-page repository bootstrap to install `os-kazuha-repo`, then install/upgrade Mihomo. Its post-install registers only `os-mihomo`; use `/usr/local/opnsense/scripts/firmware/register.php install os-mihomo` to register an already installed package without reinstalling or restarting it. Do not run blanket `resync`.
+6. Test the complete firmware upgrade before rollout. The official `<plugins>` list restores missing names using enabled repositories; it does not force reinstall present packages. True pkg upgrade/reinstall preserves policy, but a major upgrade solver that removes the package as a genuine uninstall revokes it. Verify that boundary on the actual target image before claiming end-to-end transparent resumption.
+
+The currently observed production router still uses the archived unsigned upstream source and lacks Mihomo registration. Source/artifact work does not change its running 1.0.2 service. Repository bootstrap and gateway migration remain maintenance steps; they must precede reliance on automatic recovery after firmware upgrade.

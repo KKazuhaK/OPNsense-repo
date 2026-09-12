@@ -16,23 +16,18 @@
 <body>
   <p class="label">Kazuha · Signed package repository</p>
   <h1>Mihomo for OPNsense</h1>
-  <p>Mihomo is maintained for <strong>FreeBSD:15:amd64</strong>; legacy plugin downloads for FreeBSD 14 and 15 are retained. Packages and catalogs are signed with the fleet's RSA public key. Installation runs local proxy ports; every upgrade requires explicit transparent re-enablement; YAML presets select the TUN/DNS mode.</p>
+  <p>Mihomo 1.1.2 is maintained for <strong>OPNsense CE 26.7 / FreeBSD:15:amd64</strong>; legacy downloads for FreeBSD 14 and 15 are retained. Installation and legacy migration run local proxy ports. Later upgrades and reinstalls preserve explicit transparent activation and administrative Stop. Packages and catalogs are signed with the existing RSA key.</p>
   <p><a href="https://github.com/KKazuhaK/OPNsense-repo">Source code</a> · <a href="kazuha.pub">Public key</a> · <a href="kazuha.conf">Repository configuration</a> · <a href="SHA256SUMS.txt">Checksums</a></p>
   <h2>Install the repository</h2>
   <p>Run once on each OPNsense router. Verify the public key fingerprint before enabling the repository.</p>
-  <pre><code>install -d -m 0755 /usr/local/etc/pkg/keys /usr/local/etc/pkg/repos
-fetch -o /tmp/kazuha.pub https://kkazuhak.github.io/OPNsense-repo/kazuha.pub
-test "$(sha256 -q /tmp/kazuha.pub)" = \
-  "92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b" || exit 1
-install -m 0644 /tmp/kazuha.pub /usr/local/etc/pkg/keys/kazuha.pub
-fetch -o /tmp/kazuha.conf https://kkazuhak.github.io/OPNsense-repo/kazuha.conf
-install -m 0644 /tmp/kazuha.conf /usr/local/etc/pkg/repos/kazuha.conf
-rm -f /usr/local/etc/pkg/repos/opnwall.conf
-pkg update -f -r kazuha</code></pre>
+  <pre><code>fetch -o /tmp/kazuha-bootstrap.sh \
+  https://kkazuhak.github.io/OPNsense-repo/client.sh
+sh /tmp/kazuha-bootstrap.sh</code></pre>
   <h2>Install and configure the plugin</h2>
-  <p>Open <strong>System → Firmware → Plugins</strong> and install <code>os-mihomo</code>. Then open <strong>VPN → Proxy Suite → Mihomo Subscribe</strong>, save the full YAML subscription URL and this router's dashboard address, and fetch the subscription.</p>
+  <p>Install <code>os-kazuha-repo</code> from <strong>System → Firmware → Plugins</strong> to keep the signed repository configured across firmware updates, then install <code>os-mihomo</code>. The repository <a href="client.sh">bootstrap script</a> verifies the trust anchor and catalog before installing only the repository plugin. Perform gateway plugin migration in a maintenance window. Open <strong>VPN → Proxy Suite → Mihomo Subscribe</strong>, save the full YAML subscription URL and this router's dashboard address, and fetch the subscription.</p>
   <p>Local proxy ports are <code>127.0.0.1:7890</code> (mixed) and <code>127.0.0.1:7891</code> (SOCKS5). Use <strong>Enable transparent routing</strong> on the Mihomo page to activate TUN and DNS together. DNS falls back to the original router configuration after a core crash by default; this policy can be changed per router.</p>
   <h2>Trust anchor</h2>
+  <p>Before a firmware upgrade, download <a href="check-upgrade.py">check-upgrade.py</a> and <a href="verify-repo.py">verify-repo.py</a> into the same directory, then run <code>python3 check-upgrade.py --abi TARGET_ABI --product-abi TARGET_SERIES</code> with the officially announced values. Every published target requires native testing. The next 27.1 base is not yet announced; FreeBSD 16 support is not claimed. See the <a href="https://github.com/KKazuhaK/OPNsense-repo/blob/main/DEPLOYMENT.md">release checklist</a>.</p>
   <p>SHA-256 of the public key:</p>
   <pre><code>92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b</code></pre>
   <p>The signing private key stays on the local signing router. GitHub Pages receives signed artifacts. This site is publicly accessible; repository signing controls package authenticity, rather than download access.</p>

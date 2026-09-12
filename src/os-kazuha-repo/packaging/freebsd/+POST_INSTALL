@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+/usr/local/opnsense/scripts/firmware/repos/kazuha.sh
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-kazuha-repo
+fi

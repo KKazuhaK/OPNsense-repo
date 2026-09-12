@@ -2,24 +2,27 @@
 set -eu
 
 PKG_NAME=os-mihomo
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.1.2}"
 SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd)"
-WORKDIR="$SCRIPT_DIR/work/freebsd-pkg"
-STAGEDIR="$WORKDIR/stage"
-METADIR="$WORKDIR/meta"
 DISTDIR="${DISTDIR:-$SCRIPT_DIR/dist}"
 ASSET="$SCRIPT_DIR/src/usr/local/bin/clash-meta-freebsd-amd64.xz"
-MIHOMO_PYTHON="${MIHOMO_PYTHON:-python3.13}"
+MIHOMO_PYTHON="${MIHOMO_PYTHON:-python${TARGET_PYTHON:-3.13}}"
 export PYTHONDONTWRITEBYTECODE=1
 
 die() { echo "error: $*" >&2; exit 1; }
-for tool in pkg tar xz sha256 "$MIHOMO_PYTHON"; do
-    command -v "$tool" >/dev/null 2>&1 || die "missing $tool; build on FreeBSD 15 / OPNsense"
+for tool in pkg tar xz sha256 uname freebsd-version "$MIHOMO_PYTHON"; do
+    command -v "$tool" >/dev/null 2>&1 || die "missing $tool; build on native FreeBSD / OPNsense"
 done
-[ "$("$MIHOMO_PYTHON" -B -c 'import sys; print("%s.%s" % sys.version_info[:2])')" = '3.13' ] || die 'the build interpreter must be Python 3.13, matching python313'
-[ "$(pkg config ABI)" = 'FreeBSD:15:amd64' ] || die 'only FreeBSD:15:amd64 is supported'
-[ "${ABI:-FreeBSD:15:amd64}" = 'FreeBSD:15:amd64' ] || die 'only FreeBSD:15:amd64 is supported'
-"$MIHOMO_PYTHON" -B -c 'import yaml' || die 'PyYAML for Python 3.13 is required'
+TARGET_CONFIG="$("$MIHOMO_PYTHON" -B "$SCRIPT_DIR/packaging/target.py" --check-build "$SCRIPT_DIR")"
+export TARGET_CONFIG
+TARGET_ABI="$("$MIHOMO_PYTHON" -B -c 'import json,os; print(json.loads(os.environ["TARGET_CONFIG"])["target"]["abi"])')"
+TARGET_SERIES="$("$MIHOMO_PYTHON" -B -c 'import json,os; print(json.loads(os.environ["TARGET_CONFIG"])["target"]["product_abi"])')"
+TARGET_REPOSITORY="$("$MIHOMO_PYTHON" -B -c 'import json,os; print(json.loads(os.environ["TARGET_CONFIG"])["target"]["repository"])')"
+WORKDIR="$SCRIPT_DIR/work/freebsd-pkg/$TARGET_ABI/$TARGET_SERIES"
+STAGEDIR="$WORKDIR/stage"
+METADIR="$WORKDIR/meta"
+DISTDIR="$DISTDIR/$TARGET_ABI"
+case "$TARGET_REPOSITORY" in */"$TARGET_SERIES") DISTDIR="$DISTDIR/$TARGET_SERIES" ;; esac
 [ -f "$ASSET" ] || die 'the bundled FreeBSD binary archive is missing'
 
 rm -rf "$WORKDIR"
@@ -44,34 +47,36 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
+import importlib.util
 stage = Path(os.environ['STAGEDIR'])
 source = Path(os.environ['SCRIPT_DIR'])
+spec = importlib.util.spec_from_file_location('build_target', source / 'packaging/target.py')
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+build = json.loads(os.environ['TARGET_CONFIG'])
+target = build['target']
+version = os.environ['VERSION']
 if any(p.name == '__pycache__' or p.suffix in {'.pyc', '.pyo'} for p in stage.rglob('*')):
     raise SystemExit('Python bytecode must not be staged')
+for path, content in helper.staged_files(source, target, version).items():
+    destination = stage / path.lstrip('/')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
 files = { '/' + str(p.relative_to(stage)): '1$' + hashlib.sha256(p.read_bytes()).hexdigest()
           for p in sorted(stage.rglob('*')) if p.is_file() }
-deps = {}
-for name in ['curl', 'python313', 'py313-pyyaml']:
-    value = subprocess.check_output(['pkg', 'query', '%o %v', name], text=True).strip().split()
-    if len(value) != 2:
-        raise SystemExit('missing build dependency: ' + name)
-    deps[name] = {'origin': value[0], 'version': value[1]}
-python_version = deps['python313']['version'].split('_', 1)[0].split(',', 1)[0]
-if python_version != '.'.join(map(str, sys.version_info[:3])):
-    raise SystemExit('The build interpreter version differs from the python313 package dependency')
 manifest = {
-    'name': 'os-mihomo', 'origin': 'opnsense/os-mihomo', 'version': os.environ['VERSION'],
+    'name': 'os-mihomo', 'origin': 'opnsense/os-mihomo', 'version': version,
     'comment': 'Mihomo proxy integration with explicit transparent routing',
     'maintainer': 'https://github.com/KKazuhaK/', 'www': 'https://github.com/KKazuhaK/OPNsense-repo',
-    'abi': 'FreeBSD:15:amd64', 'arch': 'freebsd:15:x86:64', 'prefix': '/usr/local',
+    'abi': target['abi'], 'arch': target['arch'], 'prefix': '/usr/local',
     'flatsize': sum(p.stat().st_size for p in stage.rglob('*') if p.is_file()),
-    'deps': deps, 'desc': (source / 'packaging/freebsd/pkg-descr').read_text(), 'files': files,
-    'scripts': {phase.lower().replace('_', '-').removeprefix('+'): (source / 'packaging/freebsd' / phase).read_text()
+    'deps': build['deps'], 'desc': (source / 'packaging/freebsd/pkg-descr').read_text(), 'files': files,
+    'annotations': helper.product_metadata(source, target, version),
+    'scripts': {phase.lower().replace('_', '-').removeprefix('+'): helper.transform_hook(source, phase, target)
                 for phase in ['+PRE_INSTALL', '+POST_INSTALL', '+PRE_DEINSTALL', '+POST_DEINSTALL']},
 }
 (Path(os.environ['METADIR']) / '+MANIFEST').write_text(json.dumps(manifest))
+(Path(os.environ['METADIR']) / 'build-target.json').write_text(json.dumps(build, sort_keys=True) + '\n')
 PY
 pkg create -M "$METADIR/+MANIFEST" -r "$STAGEDIR" -o "$DISTDIR"
 PACKAGE="$DISTDIR/$PKG_NAME-$VERSION.pkg"

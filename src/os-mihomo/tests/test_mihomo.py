@@ -95,8 +95,8 @@ class StateTests(unittest.TestCase):
         self.manager.dispatch('suspend')
         self.manager.initialize(upgrade=True)
         self.manager.dispatch('boot')
-        self.assertFalse(self.system.forwarded)
-        self.assertFalse(self.manager.settings()['transparent'])
+        self.assertTrue(self.system.forwarded)
+        self.assertTrue(self.manager.settings()['transparent'])
         self.assertEqual(secret, self.manager.settings()['secret'])
         self.assertEqual(secret, m.parse_yaml(self.manager.config_file.read_bytes())['secret'])
 
@@ -215,6 +215,100 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
         self.assertTrue(self.system.alive)
         self.assertTrue(self.system.forwarded)
+
+
+class UpgradeTests(unittest.TestCase):
+    setUp = StateTests.setUp
+
+    def test_explicit_consent_survives_upgrade_and_same_version_reinstall(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        before = self.manager.settings()
+        self.assertEqual(m.STATE_SCHEMA, before['state_schema'])
+        self.assertTrue(before['transparent_consent'])
+        for upgrade in (True, False):
+            self.manager.dispatch('suspend')
+            self.manager.initialize(upgrade=upgrade)
+            self.manager.dispatch('boot')
+            self.assertEqual(before, self.manager.settings())
+            self.assertTrue(self.system.alive)
+            self.assertTrue(self.system.forwarded)
+
+    def test_administrative_stop_is_preserved_by_upgrade_and_reinstall(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.manager.dispatch('stop')
+        before = self.manager.settings()
+        for upgrade in (True, False):
+            self.manager.dispatch('suspend')
+            self.manager.initialize(upgrade=upgrade)
+            self.manager.dispatch('boot')
+            self.manager.dispatch('wan-restart')
+            self.assertEqual(before, self.manager.settings())
+            self.assertFalse(self.system.alive)
+            self.assertFalse(self.system.forwarded)
+
+    def test_unmarked_legacy_flags_are_reset_once_without_losing_credentials(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.manager.dispatch('suspend')
+        settings = self.manager.settings()
+        for key in ('state_schema', 'transparent_consent'):
+            settings.pop(key)
+        settings['service_enabled'] = False
+        self.manager.write_settings(settings)
+        self.manager.initialize(upgrade=True)
+        migrated = self.manager.settings()
+        self.assertFalse(migrated['transparent'])
+        self.assertFalse(migrated['transparent_consent'])
+        self.assertTrue(migrated['service_enabled'])
+        self.assertEqual(settings['secret'], migrated['secret'])
+        self.assertEqual(SUBSCRIPTION, self.manager.source_file.read_bytes())
+        self.manager.dispatch('boot')
+        self.manager.dispatch('enable-transparent')
+        self.manager.dispatch('suspend')
+        self.manager.initialize(upgrade=True)
+        self.manager.dispatch('boot')
+        self.assertTrue(self.system.forwarded)
+
+    def test_unknown_or_incomplete_schema_cannot_bless_legacy_tun_flags(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.manager.dispatch('suspend')
+        for schema, consent in ((0, True), (999, True), (True, True), (m.STATE_SCHEMA, 'yes')):
+            settings = self.manager.settings()
+            settings.update(transparent=True, state_schema=schema, transparent_consent=consent)
+            self.manager.write_settings(settings)
+            self.manager.initialize(upgrade=True)
+            self.assertFalse(self.manager.settings()['transparent'])
+            self.assertFalse(self.manager.settings()['transparent_consent'])
+        settings = self.manager.settings()
+        settings.update(transparent=True, transparent_consent=False)
+        self.manager.write_settings(settings)
+        self.manager.initialize(upgrade=True)
+        self.assertFalse(self.manager.settings()['transparent'])
+
+    def test_activation_failure_does_not_persist_consent(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.system.fail_start = 1
+        with self.assertRaises(m.Error):
+            self.manager.dispatch('enable-transparent')
+        self.assertFalse(self.manager.settings()['transparent'])
+        self.assertFalse(self.manager.settings()['transparent_consent'])
+        self.assertTrue(self.system.alive)
+
+    def test_disable_and_genuine_removal_revoke_transparent_consent(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.manager.dispatch('disable-transparent')
+        self.assertFalse(self.manager.settings()['transparent_consent'])
+        self.manager.dispatch('enable-transparent')
+        self.manager.dispatch('remove')
+        self.manager.initialize(upgrade=False)
+        self.manager.dispatch('boot')
+        self.assertFalse(self.manager.settings()['transparent'])
+        self.assertFalse(self.manager.settings()['transparent_consent'])
+        self.assertFalse(self.system.alive)
 
 
 class ConcurrentUpdateTests(unittest.TestCase):

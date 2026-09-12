@@ -46,5 +46,8 @@ handoff.md
 /src/os-mihomo/dist/
 /src/os-mihomo/work/
 /src/os-sing-box/dist/
+/src/os-kazuha-repo/dist/
+/src/os-kazuha-repo/dist-*/
 __pycache__/
 *.pyc
+*.pyo

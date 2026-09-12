@@ -21,6 +21,7 @@ import time
 import yaml
 
 MAX_CONFIG = 16 * 1024 * 1024
+STATE_SCHEMA = 1
 SCRIPT = "/usr/local/opnsense/scripts/mihomo/mihomo.py"
 HELPER = "/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
 STATE = "/var/db/os-mihomo"
@@ -563,8 +564,15 @@ class Manager:
             if existing:
                 atomic_write(self.source_file, source.read_bytes())
             self.write_settings(settings)
-        # Every installation or upgrade requires an explicit new TUN activation.
-        settings.update(transparent=False, service_enabled=True)
+        recognized = (type(settings.get('state_schema')) is int
+                      and settings['state_schema'] == STATE_SCHEMA
+                      and isinstance(settings.get('transparent_consent'), bool))
+        # Unmarked legacy policies are never evidence of explicit TUN consent.
+        if not recognized:
+            settings.update(transparent=False, service_enabled=True,
+                            state_schema=STATE_SCHEMA, transparent_consent=False)
+        elif settings['transparent'] and not settings['transparent_consent']:
+            settings['transparent'] = False
         self.write_settings(settings)
         if not self.merge_file.exists():
             preset = self.path(SHARE + '/presets/full.yaml')
@@ -731,6 +739,8 @@ class Manager:
     def set_policy(self, enabled):
         settings = self.settings()
         settings["transparent"] = enabled
+        settings['state_schema'] = STATE_SCHEMA
+        settings['transparent_consent'] = enabled
         if enabled and not self.source_file.exists():
             raise Error("Fetch and validate a subscription before enabling transparent routing.")
         if enabled and not self.system.running():
@@ -867,6 +877,7 @@ class Manager:
                 settings["service_enabled"] = False
                 if action == "remove":
                     settings["transparent"] = False
+                    settings['transparent_consent'] = False
                     self.system.remove()
                 self.write_settings(settings)
                 self.publish_status(settings)

@@ -1,0 +1,5 @@
+Signed Kazuha repository configuration for OPNsense.
+
+Registers a firmware repository hook and pins its public signing key. The hook
+selects a repository for the running OPNsense series without modifying other
+repositories. The package contains no native executable or Python runtime.

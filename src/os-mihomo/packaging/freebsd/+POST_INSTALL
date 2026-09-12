@@ -25,5 +25,8 @@ if [ -f /var/db/os-mihomo/migrate/actions_mihomolocal.conf ]; then
     rm -f /usr/local/etc/mihomo/update-sub.sh /usr/local/etc/mihomo/repair-after-upgrade.sh
 fi
 service configd restart
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-mihomo
+fi
 # A fresh installation runs proxy ports only. Upgrade retains the explicit policy.
 /usr/local/bin/python3 "$control" boot

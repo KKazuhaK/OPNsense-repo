@@ -17,6 +17,9 @@ REPO = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('verify_repo', REPO / 'verify-repo.py')
 verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
+spec = importlib.util.spec_from_file_location('build_target', REPO / 'src/os-mihomo/packaging/target.py')
+target_helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(target_helper)
 
 
 class BuildTests(unittest.TestCase):
@@ -27,19 +30,34 @@ class BuildTests(unittest.TestCase):
         self.project = self.root / 'project'
         self.project.mkdir()
         shutil.copyfile(REPO / 'src/os-mihomo/build.sh', self.project / 'build.sh')
+        (self.project / 'packaging').mkdir()
+        for name in ('targets.json', 'target.py'):
+            shutil.copyfile(REPO / 'src/os-mihomo/packaging' / name, self.project / 'packaging' / name)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.created = self.root / 'pkg-created'
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
-                        FAKE_PKG_CREATED=str(self.created))
+                        FAKE_PKG_CREATED=str(self.created), FAKE_NATIVE_RELEASE='15.1-RELEASE',
+                        FAKE_NATIVE_MAJOR='15', FAKE_PKG_ABI='FreeBSD:15:amd64')
+        for name in ('TARGET_PROFILE', 'TARGET_ABI', 'TARGET_PRODUCT_ABI', 'TARGET_PYTHON', 'ABI', 'DISTDIR'):
+            self.env.pop(name, None)
+        self.command('uname', '''import os,sys
+args=sys.argv[1:]
+print({'-s':'FreeBSD','-m':'amd64','-K':str(int(os.environ['FAKE_NATIVE_MAJOR'])*100000+1000)}[args[0]])
+''')
+        self.command('freebsd-version', "import os\nprint(os.environ['FAKE_NATIVE_RELEASE'])\n")
         self.command('pkg', '''import io,json,os,sys,tarfile
 from pathlib import Path
 args=sys.argv[1:]
 if args[:2]==['config','ABI']:
-    print('FreeBSD:15:amd64')
+    print(os.environ['FAKE_PKG_ABI'])
 elif args[0]=='query':
-    values={'curl':('ftp/curl','8.20.0'), 'python313':('lang/python313',os.environ['FAKE_PKG_PYTHON_VERSION']), 'py313-pyyaml':('devel/py-pyyaml','6.0.3_1')}
-    print(' '.join(values[args[-1]]))
+    name=args[-1]
+    if name=='curl':origin,version='ftp/curl','8.20.0'
+    elif name.startswith('python3'):origin,version='lang/'+name,os.environ['FAKE_PKG_PYTHON_VERSION']
+    elif name.endswith('-pyyaml'):origin,version='devel/py-pyyaml',os.environ['FAKE_PKG_YAML_VERSION']
+    else:raise SystemExit('Unexpected dependency')
+    print(origin,version,os.environ.get('FAKE_DEP_ABI',os.environ['FAKE_PKG_ABI']))
 elif args[0]=='create':
     manifest=Path(args[args.index('-M')+1]);stage=Path(args[args.index('-r')+1]);output=Path(args[args.index('-o')+1])
     data=json.loads(manifest.read_text())
@@ -62,13 +80,17 @@ elif args[0]!='info':
                      'usr/local/opnsense/scripts/mihomo/setup_unbound.php'):
             path = self.project / 'src' / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text('fixture\n')
+            path.write_text('exec /usr/local/bin/python3 fixture\n')
+        product = self.project / 'src/usr/local/opnsense/version/mihomo'
+        product.parent.mkdir(parents=True)
+        product.write_text(json.dumps({'product_id': 'os-mihomo', 'product_name': 'mihomo',
+                                      'product_abi': '26.7', 'product_version': '1.1.1'}))
         asset = self.project / 'src/usr/local/bin/clash-meta-freebsd-amd64.xz'
         asset.write_bytes(lzma.compress(b'core fixture'))
         packaging = self.project / 'packaging/freebsd'
         packaging.mkdir(parents=True)
         for name in ('pkg-descr', '+PRE_INSTALL', '+POST_INSTALL', '+PRE_DEINSTALL', '+POST_DEINSTALL'):
-            (packaging / name).write_text('fixture\n')
+            (packaging / name).write_text('exec /usr/local/bin/python3 fixture\n')
 
     def command(self, name, content):
         path = self.bin / name
@@ -84,15 +106,42 @@ elif args[0]!='info':
         self.env['MIHOMO_PYTHON'] = interpreter
         self.env['FAKE_PKG_PYTHON_VERSION'] = subprocess.check_output(
             [interpreter, '-B', '-c', 'import sys;print("%s.%s.%s" % sys.version_info[:3])'], text=True).strip()
+        self.env['FAKE_PKG_YAML_VERSION'] = subprocess.check_output(
+            [interpreter, '-B', '-c', 'import yaml; print(yaml.__version__)'], text=True).strip() + '_1'
+
+    def current_interpreter(self):
+        self.env.update(MIHOMO_PYTHON=sys.executable,
+                        TARGET_PYTHON='.'.join(map(str, sys.version_info[:2])),
+                        TARGET_PRODUCT_ABI='27.1',
+                        FAKE_PKG_PYTHON_VERSION='.'.join(map(str, sys.version_info[:3])))
+        self.env['FAKE_PKG_YAML_VERSION'] = subprocess.check_output(
+            [sys.executable, '-B', '-c', 'import yaml; print(yaml.__version__)'], text=True).strip() + '_1'
+        # Native target fixtures must not read the actual test host's firmware series.
+        self.command('opnsense-version', "print('27.1')\n")
+
+    def package_path(self, abi='FreeBSD:15:amd64', series=None):
+        directory = self.project / 'dist' / abi
+        if series:
+            directory /= series
+        return directory / 'os-mihomo-1.1.2.pkg'
+
+    def manifest(self, package):
+        with tarfile.open(package) as archive:
+            return json.load(archive.extractfile('+MANIFEST'))
 
     def build(self):
         return subprocess.run(['sh', str(self.project / 'build.sh')], env=self.env,
                               capture_output=True, text=True, timeout=30)
 
     def test_python_314_is_rejected_before_staging(self):
+        self.command('wrong-python', '''import runpy,sys
+args=sys.argv[1:]
+if args[0]=='-B':args.pop(0)
+sys.argv=args
+sys.version_info=(3,14,0)
+runpy.run_path(args[0],run_name='__main__')
+''')
         wrong = self.bin / 'wrong-python'
-        wrong.write_text('#!/bin/sh\nprintf "3.14\\n"\n')
-        wrong.chmod(0o755)
         self.env['MIHOMO_PYTHON'] = str(wrong)
         result = self.build()
         self.assertNotEqual(0, result.returncode)
@@ -109,10 +158,19 @@ elif args[0]!='info':
         (cache.parent / 'legacy.pyo').write_bytes(b'ignored optimized bytecode')
         result = self.build()
         self.assertEqual(0, result.returncode, result.stderr)
-        with tarfile.open(self.project / 'dist/os-mihomo-1.1.1.pkg') as archive:
+        with tarfile.open(self.package_path()) as archive:
             self.assertFalse(any('__pycache__' in name or name.endswith(('.pyc', '.pyo')) for name in archive.getnames()))
             manifest = json.load(archive.extractfile('+MANIFEST'))
         self.assertEqual(self.env['FAKE_PKG_PYTHON_VERSION'], manifest['deps']['python313']['version'])
+        self.assertEqual('26.7', manifest['annotations']['product_abi'])
+        self.assertEqual('1.1.2', manifest['annotations']['product_version'])
+        self.assertEqual('FreeBSD:15:amd64', manifest['abi'])
+        self.assertEqual('freebsd:15:x86:64', manifest['arch'])
+        with tarfile.open(self.package_path()) as archive:
+            product = json.load(archive.extractfile('usr/local/opnsense/version/mihomo'))
+            self.assertEqual(manifest['annotations'], product)
+            self.assertIn(b'/usr/local/bin/python3.13', archive.extractfile('usr/bin/mihomo_sub').read())
+        self.assertIn('/usr/local/bin/python3.13', manifest['scripts']['pre-install'])
 
     def test_dependency_patch_mismatch_prevents_package_creation(self):
         self.interpreter()
@@ -129,6 +187,124 @@ elif args[0]!='info':
         self.assertTrue(self.created.exists())
         self.assertNotEqual(0, result.returncode)
         self.assertIn('Python bytecode must not be packaged', result.stderr)
+
+    def test_explicit_native_future_abi_changes_manifest_and_preserves_outputs(self):
+        self.current_interpreter()
+        first = self.build()
+        self.assertEqual(0, first.returncode, first.stderr)
+        earlier = self.package_path(series='27.1').read_bytes()
+        self.env.update(TARGET_ABI='FreeBSD:16:amd64', FAKE_PKG_ABI='FreeBSD:16:amd64',
+                        FAKE_NATIVE_MAJOR='16', FAKE_NATIVE_RELEASE='16.0-RELEASE')
+        second = self.build()
+        self.assertEqual(0, second.returncode, second.stderr)
+        manifest = self.manifest(self.package_path(abi='FreeBSD:16:amd64', series='27.1'))
+        self.assertEqual('FreeBSD:16:amd64', manifest['abi'])
+        self.assertEqual('freebsd:16:x86:64', manifest['arch'])
+        self.assertEqual('27.1', manifest['annotations']['product_abi'])
+        package_name = 'python' + self.env['TARGET_PYTHON'].replace('.', '')
+        self.assertEqual(self.env['FAKE_PKG_PYTHON_VERSION'], manifest['deps'][package_name]['version'])
+        self.assertEqual(earlier, self.package_path(series='27.1').read_bytes())
+
+    def test_relabeling_pkg_abi_without_native_base_is_rejected(self):
+        self.current_interpreter()
+        self.env.update(TARGET_ABI='FreeBSD:16:amd64', FAKE_PKG_ABI='FreeBSD:16:amd64')
+        result = self.build()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('Target, native FreeBSD and pkg ABI must match', result.stderr)
+        self.assertFalse(self.created.exists())
+
+    def test_foreign_dependency_and_kernel_are_rejected(self):
+        self.current_interpreter()
+        self.env['FAKE_DEP_ABI'] = 'FreeBSD:14:amd64'
+        result = self.build()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('incompatible native build dependency', result.stderr)
+        self.assertFalse(self.created.exists())
+        self.env.pop('FAKE_DEP_ABI')
+        self.env['FAKE_NATIVE_MAJOR'] = '16'
+        result = self.build()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('Build kernel and userland', result.stderr)
+        self.assertFalse(self.created.exists())
+
+    def test_staging_profile_and_invalid_target_are_rejected(self):
+        self.current_interpreter()
+        self.env['TARGET_PROFILE'] = '27.1'
+        result = self.build()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('not ready for building', result.stderr)
+        self.env.pop('TARGET_PROFILE')
+        self.env['TARGET_ABI'] = 'FreeBSD:16:arm64'
+        result = self.build()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('Target ABI must', result.stderr)
+        self.assertFalse(self.created.exists())
+
+    def test_wrong_native_opnsense_series_is_rejected_before_staging(self):
+        self.current_interpreter()
+        self.command('opnsense-version', "print('26.7')\n")
+        result = self.build()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('Native OPNsense product ABI differs', result.stderr)
+        self.assertFalse((self.project / 'work').exists())
+        self.assertFalse(self.created.exists())
+
+    def test_native_opnsense_series_is_recorded_in_build_metadata(self):
+        self.current_interpreter()
+        result = self.build()
+        self.assertEqual(0, result.returncode, result.stderr)
+        metadata = self.project / 'work/freebsd-pkg/FreeBSD:15:amd64/27.1/meta/build-target.json'
+        self.assertEqual('27.1', json.loads(metadata.read_text())['native_product_abi'])
+
+
+class TargetTests(unittest.TestCase):
+    def test_matrix_includes_only_committed_complete_enabled_target(self):
+        project = REPO / 'src/os-mihomo'
+        result = target_helper.enabled_targets(project)
+        self.assertEqual(['26.7'], [target['profile'] for target in result])
+        self.assertEqual('repo/FreeBSD:15:amd64', result[0]['repository'])
+        output = subprocess.check_output([sys.executable, '-B', str(project / 'packaging/target.py'), '--matrix'], text=True)
+        self.assertEqual({'include': result}, json.loads(output))
+
+    def test_explicit_target_does_not_enter_committed_matrix(self):
+        project = REPO / 'src/os-mihomo'
+        target = target_helper.resolve_target(project, {'TARGET_ABI': 'FreeBSD:16:amd64',
+            'TARGET_PRODUCT_ABI': '27.1', 'TARGET_PYTHON': '3.14'})
+        self.assertEqual('explicit', target['profile'])
+        self.assertEqual('repo/FreeBSD:16:amd64/27.1', target['repository'])
+        self.assertEqual('python314', target['python_package'])
+        self.assertNotIn(target, target_helper.enabled_targets(project))
+        with self.assertRaisesRegex(ValueError, 'explicit TARGET_PRODUCT_ABI'):
+            target_helper.resolve_target(project, {'TARGET_ABI': 'FreeBSD:16:amd64'})
+
+    def test_enabled_target_with_missing_native_release_does_not_enter_matrix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / 'packaging').mkdir()
+            config = target_helper.recipes(REPO / 'src/os-mihomo')
+            config['targets']['27.1']['enabled'] = True
+            (project / 'packaging/targets.json').write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, 'no native release or repository'):
+                target_helper.enabled_targets(project)
+
+    def test_repository_cannot_escape_target_or_use_another_series(self):
+        for repository in ('repo/FreeBSD:15:amd64/../27.1', 'repo/FreeBSD:14:amd64',
+                           'repo/FreeBSD:15:amd64/26.1', '/repo/FreeBSD:15:amd64'):
+            with self.assertRaisesRegex(ValueError, 'Target repository'):
+                target_helper.target_values('FreeBSD:15:amd64', '26.7', '3.13', repository=repository)
+
+    def test_business_or_other_product_series_are_not_implicit_ce_targets(self):
+        for series in ('26.4', '26.10', '26.2', '26.07'):
+            with self.assertRaisesRegex(ValueError, 'OPNsense CE series'):
+                target_helper.target_values('FreeBSD:15:amd64', series, '3.13')
+
+    def test_python_transform_covers_versioned_paths_without_corrupting_binary(self):
+        target = target_helper.target_values('FreeBSD:16:amd64', '27.1', '3.14')
+        data = b'#!/usr/local/bin/python3\nexec /usr/local/bin/python3.13 x\n'
+        self.assertEqual(b'#!/usr/local/bin/python3.14\nexec /usr/local/bin/python3.14 x\n',
+                         target_helper.transform_content(data, target))
+        binary = b'\xff/usr/local/bin/python3\x00'
+        self.assertEqual(binary, target_helper.transform_content(binary, target))
 
 
 class ArchiveTests(unittest.TestCase):

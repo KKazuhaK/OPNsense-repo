@@ -41,13 +41,17 @@ jobs:
         run: |
           python -m unittest discover -s source/src/os-mihomo/tests -v
           python -m unittest discover -s source/src/os-sing-box/tests -v
+          python -m unittest discover -s source/src/os-kazuha-repo/tests -v
+          python -m unittest discover -s source/tests -v
           find source/src/os-mihomo/src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
           shellcheck source/build-repo.sh source/publish-repo.sh source/src/os-mihomo/build.sh source/src/os-mihomo/packaging/freebsd/+PRE_INSTALL source/src/os-mihomo/packaging/freebsd/+POST_INSTALL source/src/os-mihomo/packaging/freebsd/+PRE_DEINSTALL source/src/os-mihomo/packaging/freebsd/+POST_DEINSTALL source/src/os-mihomo/tests/jail/run.sh source/src/os-mihomo/tests/jail/prepare.sh source/src/os-sing-box/build.sh source/src/os-sing-box/src/usr/local/etc/sing-box/sub/sub.sh
           python3 source/verify-repo.py . --source source
+          shellcheck source/client.sh source/src/os-kazuha-repo/build.sh source/src/os-kazuha-repo/src/usr/local/opnsense/scripts/firmware/repos/kazuha.sh source/src/os-kazuha-repo/packaging/freebsd/+POST_INSTALL source/src/os-kazuha-repo/packaging/freebsd/+POST_DEINSTALL
       - name: Prepare static site
         run: |
           mkdir -p _site
           cp index.html kazuha.pub kazuha.conf SHA256SUMS.txt release.json release.sig _site/
+          cp client.sh check-upgrade.py verify-repo.py _site/
           cp -RL repo _site/
           touch _site/.nojekyll
       - uses: actions/configure-pages@v5

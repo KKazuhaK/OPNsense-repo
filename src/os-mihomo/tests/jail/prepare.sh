@@ -7,19 +7,23 @@ mkdir -p "$jail_root" "$jail_root/usr/local/bin" "$jail_root/usr/local/sbin" "$j
 chmod 1777 "$jail_root/tmp"
 for source in /bin /sbin /lib /libexec; do [ -d "$jail_root$source" ] || cp -a "$source" "$jail_root/"; done
 mkdir -p "$jail_root/usr/bin" "$jail_root/usr/lib"
-for name in awk sed date pkill pgrep env install tar touch find basename id setfib; do source="$(command -v "$name")"; mkdir -p "$jail_root$(dirname "$source")"; cp -L "$source" "$jail_root$source"; done
-for name in python3 python3.13 php curl; do cp -L "/usr/local/bin/$name" "$jail_root/usr/local/bin/$name"; done
+target_python="${TARGET_PYTHON:-python3.13}"
+python_version="${target_python#python}"
+for name in awk sed date pkill pgrep env install tar touch find basename id setfib freebsd-version uname; do source="$(command -v "$name")"; mkdir -p "$jail_root$(dirname "$source")"; cp -L "$source" "$jail_root$source"; done
+cp -L "/usr/local/bin/$target_python" "$jail_root/usr/local/bin/$target_python"
+cp -L "/usr/local/bin/$target_python" "$jail_root/usr/local/bin/python3"
+for name in php curl; do cp -L "/usr/local/bin/$name" "$jail_root/usr/local/bin/$name"; done
 mkdir -p "$jail_root/usr/sbin"
 cp -L /usr/sbin/daemon "$jail_root/usr/sbin/"
 cp -a /etc/rc.subr "$jail_root/etc/"
 cp -L /usr/local/sbin/pkg-static "$jail_root/usr/local/sbin/pkg"
 cp -L /usr/local/sbin/unbound "$jail_root/usr/local/sbin/"
 cp -L /usr/local/sbin/unbound-checkconf "$jail_root/usr/local/sbin/"
-cp -a /usr/local/lib/python3.13 "$jail_root/usr/local/lib/"
+cp -a "/usr/local/lib/python$python_version" "$jail_root/usr/local/lib/"
 cp -a /usr/local/lib/php "$jail_root/usr/local/lib/"
 cp -a /usr/local/etc/php.ini "$jail_root/usr/local/etc/"
 cp -a /usr/local/etc/php "$jail_root/usr/local/etc/"
-for binary in /usr/local/bin/python3.13 /usr/local/bin/php /usr/local/bin/curl /usr/local/sbin/unbound /usr/local/sbin/unbound-checkconf /usr/bin/awk /usr/bin/sed /usr/bin/date /usr/bin/pkill /usr/bin/pgrep /usr/bin/install /usr/bin/tar /usr/local/lib/php/*/*.so /usr/local/lib/python3.13/lib-dynload/*.so; do
+for binary in "/usr/local/bin/$target_python" /usr/local/bin/php /usr/local/bin/curl /usr/local/sbin/unbound /usr/local/sbin/unbound-checkconf /usr/bin/awk /usr/bin/sed /usr/bin/date /usr/bin/pkill /usr/bin/pgrep /usr/bin/install /usr/bin/tar /usr/local/lib/php/*/*.so /usr/local/lib/python"$python_version"/lib-dynload/*.so; do
   [ -f "$binary" ] || continue
   ldd -f '%p\n' "$binary" 2>/dev/null | while read -r library; do
     case "$library" in /*) mkdir -p "$jail_root$(dirname "$library")"; [ -f "$jail_root$library" ] || cp -L "$library" "$jail_root$library" ;; esac

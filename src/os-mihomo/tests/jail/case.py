@@ -75,7 +75,7 @@ for name, value in dict(new_manifest['deps'], jq={'origin': 'textproc/jq', 'vers
     command(['/usr/local/sbin/pkg', 'create', '-M', '/root/deps/+MANIFEST', '-r', '/root/empty', '-o', '/root/deps'])
     command(['/usr/local/sbin/pkg', 'add', '-f', '/root/deps/' + name + '-' + value['version'] + '.pkg'])
 Path('/root/repo/All').mkdir(parents=True, exist_ok=True)
-shutil.copyfile('/root/new.pkg', '/root/repo/All/os-mihomo-1.1.1.pkg')
+shutil.copyfile('/root/new.pkg', '/root/repo/All/os-mihomo-' + new_manifest['version'] + '.pkg')
 command(['/usr/local/sbin/pkg', 'repo', '/root/repo'])
 Path('/root/repos').mkdir(exist_ok=True)
 Path('/root/repos/test.conf').write_text('test: {url: "file:///root/repo", signature_type: "none", enabled: yes}')
@@ -84,6 +84,8 @@ installed = command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', '-o', 'REP
 print(installed.stdout.decode(errors='replace') + installed.stderr.decode(errors='replace'), flush=True)
 settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
 assert settings['transparent'] is False
+assert settings['state_schema'] == 1
+assert settings['transparent_consent'] is False
 assert settings['secret'] == 'legacy-secret'
 assert Path('/var/db/os-mihomo/subscription.yaml').read_bytes() == source
 assert running()
@@ -127,6 +129,27 @@ passed('Explicit activation creates the actual TUN and owned DNS/interface/firew
 route = command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
 assert b'tun_mihomo' in route, route
 passed('VNET traffic route is captured only after explicit activation')
+# Reinstall through the native solver so upgrade suspension and hooks run again.
+before_settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
+assert before_settings['transparent_consent'] is True
+command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', '-o', 'REPOS_DIR=/root/repos', 'install', '-y', '-f', 'os-mihomo'])
+assert json.loads(Path('/var/db/os-mihomo/settings.json').read_text()) == before_settings
+assert running()
+assert action('status')['result']['dns_active']
+assert b'tun_mihomo' in command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
+passed('Actual same-version reinstall preserves explicit TUN consent and restores its route/DNS policy')
+action('stop')
+before_settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
+assert before_settings['service_enabled'] is False
+command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', '-o', 'REPOS_DIR=/root/repos', 'install', '-y', '-f', 'os-mihomo'])
+assert json.loads(Path('/var/db/os-mihomo/settings.json').read_text()) == before_settings
+action('boot')
+action('wan-restart')
+assert not running()
+assert not action('status')['result']['dns_active']
+assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode != 0
+passed('Actual same-version reinstall preserves administrative Stop without WAN or boot resurrection')
+action('start')
 # Test crash handling with actual PID, daemon and split routes.
 pid = int(Path('/var/run/mihomo-child.pid').read_text())
 os.kill(pid, signal.SIGKILL)

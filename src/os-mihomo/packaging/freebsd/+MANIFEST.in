@@ -10,9 +10,10 @@ prefix: "@PREFIX@"
 flatsize: @FLATSIZE@
 deps: {
     curl: { origin: "ftp/curl", version: "@CURL_VERSION@" },
-    python313: { origin: "lang/python313", version: "@PYTHON_VERSION@" },
-    py313-pyyaml: { origin: "devel/py-pyyaml", version: "@PYYAML_VERSION@" }
+    @PYTHON_PACKAGE@: { origin: "lang/@PYTHON_PACKAGE@", version: "@PYTHON_VERSION@" },
+    @PYYAML_PACKAGE@: { origin: "devel/py-pyyaml", version: "@PYYAML_VERSION@" }
 }
+annotations: @PRODUCT_METADATA@
 desc: <<EOD
 @DESC@
 EOD

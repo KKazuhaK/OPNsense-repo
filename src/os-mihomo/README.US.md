@@ -52,7 +52,7 @@ pkg add -f os-mihomo.pkg
 After installation, refresh the OPNsense WebGUI and go to:
 
 ```text
-Services > Mihomo
+VPN > Proxy Suite > Mihomo
 ```
 
 ## Uninstall

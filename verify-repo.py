@@ -261,7 +261,7 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
     for path, content in expected.items():
         if actual[path] != '1$' + hashlib.sha256(content).hexdigest():
             raise ValueError('Package content differs from source: ' + path)
-        archived = subprocess.check_output(['tar', '-xOf', str(package), archive_paths[path]])
+        archived = subprocess.check_output(['tar', '-xOf', str(package), '-P', archive_paths[path]])
         if archived != content:
             raise ValueError('Package archive differs from its manifest: ' + path)
     for phase in ('pre-install', 'post-install', 'pre-deinstall', 'post-deinstall'):

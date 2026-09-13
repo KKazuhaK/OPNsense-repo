@@ -1,7 +1,9 @@
 <menu>
     <System>
         <Diagnostics>
-            <Pftop VisibleName="pfTop" order="80" url="/diag_pftop.php" cssClass="fa fa-area-chart fa-fw"/>
+            <Pftop VisibleName="pfTop" order="80" url="/ui/pftop" cssClass="fa fa-area-chart fa-fw">
+                <item url="/ui/pftop/*" visibility="hidden"/>
+            </Pftop>
         </Diagnostics>
     </System>
 </menu>

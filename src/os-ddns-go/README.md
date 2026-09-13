@@ -9,7 +9,7 @@
 - `src/usr/local/etc/rc.d/os-ddns-go` 使用 `daemon(8)` 管理 DDNS-Go 服务。
 - `src/usr/local/opnsense/service/conf/actions.d/actions_ddnsgo.conf` 注册 `configctl ddnsgo` 动作。
 - `src/usr/local/opnsense/mvc/app/models/OPNsense/Ddnsgo/` 注册菜单和 ACL。
-- `src/usr/local/www/services_ddnsgo.php` 提供 OPNsense WebGUI 管理页面。
+- `/ui/ddnsgo` 提供 OPNsense WebGUI 管理页面。
 - `packaging/freebsd/` 保存 FreeBSD/pkg 打包元数据和安装、卸载 hook。
 
 ## 编译

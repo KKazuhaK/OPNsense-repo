@@ -1,5 +1,5 @@
 PKG_NAME?= os-speedtest
-VERSION?= 1.0.2
+VERSION?= 1.1.0
 TARGET_ABI?= native
 
 .PHONY: package install clean

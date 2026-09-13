@@ -93,8 +93,16 @@ pkg add -f os-sing-box-1.0.3.pkg
 Refresh the OPNsense WebGUI and go to:
 
 ```text
-Services > Sing-Box
+VPN > Proxy Suite > Sing-Box
 ```
+
+The MVC page at `/ui/singbox` groups configuration, subscriptions and logs.
+The API omits the subscription URL and redacts credentials in the configuration
+editor. Keep the entire placeholder beginning with `__SING_BOX_KEEP_STORED_VALUE__`
+unchanged to retain a stored value. Reload an old editor snapshot after a
+subscription update before saving it.
+The package ships settings as samples and retains existing JSON, subscription
+environment files, templates and enable choices during upgrades.
 
 ## Uninstall
 
@@ -123,7 +131,7 @@ Renew sing-box Subscription
 Build on a FreeBSD host. Required commands:
 
 ```sh
-pkg, tar, make, xz, curl or fetch
+pkg, tar, make, xz, python3, curl or fetch
 ```
 
 Run:

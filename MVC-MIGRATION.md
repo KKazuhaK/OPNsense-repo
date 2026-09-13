@@ -1,9 +1,14 @@
 # Converting the remaining plugins to the MVC conventions
 
-`os-mihomo` has been converted and is the worked example. The other twelve
-packages still serve legacy `.php` pages from `/usr/local/www/`. This describes
-what to do, what went wrong doing it the first time, and what to check before
-calling a conversion finished.
+`os-mihomo` is the worked example. The nine legacy plugins listed in §9 now
+have MVC pages, API controllers and configd backends. Existing plugin state
+remains in its original store. `os-unboundcustom` was already MVC and received
+only response decoding and request/read-only fixes.
+
+Implementation, native package/API checks and all nine dark-theme browser pages
+have been verified; see [the test report](MVC-MIGRATION-TESTS.md) for the actual
+checks and the router's SSH authentication limit.
+The guidance below records the migration conventions and the earlier failures.
 
 **Do not convert `os-mihomo`.** It is done, and work on it continues in
 parallel.
@@ -99,12 +104,16 @@ that was eight PHP files replaced by three controllers and one view.
 
 ## 4. The two mistakes that cost the most time
 
-**`OPNsense\Mvc\Request` is not Phalcon's request object.** It has exactly:
+**`OPNsense\Mvc\Request` is not Phalcon's request object.** Use the native
+methods verified on the target router:
 
 ```
 getClientAddress  getHeader  getJsonRawBody  getMethod
 getPost  getQuery  getRawBody  getScheme  getURI
 ```
+
+The tested 26.7.3 runtime also exposes `isGet()` and `isPost()`, but the migrated
+controllers use `getMethod()` consistently.
 
 `getHttpHost()`, which every Phalcon example uses, raises
 `Call to undefined method`. The framework reports that to the browser as
@@ -143,10 +152,11 @@ correctly. Clear the caches after changing menu or ACL:
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 ```
 
-## 6. Themes — currently broken everywhere but `os-mihomo`
+## 6. Themes — remove the legacy colour overrides
 
 Three themes ship, including `opnsense-dark`. A page that hardcodes colours
-renders as a white panel inside a dark one. Every remaining plugin does it:
+renders as a white panel inside a dark one. Before migration, these plugins
+contained the following overrides; the new Volt views declare no literal colours:
 
 | Package | Hardcoded colours |
 | --- | --- |
@@ -186,9 +196,13 @@ Two related traps:
 - Labels lead with
   `<a id="help_for_X" class="showhelp"><i class="fa fa-info-circle"></i></a>`
   and the text goes in `<div class="hidden" data-for="help_for_X">`.
-- The full-help toggle needs an `id` containing `show_all_help`. In a legacy
-  page the shared handler scopes it with `closest('form[id^="frm"]')`, so the
-  form needs an id starting with `frm` or the toggle does nothing.
+- Show the visible `full help` label beside a `fa-toggle-off text-danger`
+  icon with an `id` containing `show_all_help`. Keep this toggle inside a form
+  whose id starts with `frm`: the shared `opnsense_ui.js` handler scopes help
+  with `closest('form[id^="frm"]')` in MVC pages too. It expands/collapses all
+  `data-for="help_for_..."` descriptions in that form and supplies the native
+  help shortcut. Keep labels in their own spans when translating them with
+  `.text()`, so translation does not replace nested help controls.
 - Dropdowns use `class="selectpicker" data-style="btn-default"`. A plain
   `form-control` select sized with `width:auto` draws its caret over the text.
 - Ids must be unique across the whole page. Merging two pages into one is where
@@ -227,3 +241,35 @@ closely enough that the converted version is a direct template.
 (`src/usr/local/opnsense/scripts/speedtest/speedtest.py` writing
 `progress.json`); its poll becomes an API action rather than an `?ajax=` query
 on the page.
+
+
+## 10. Implemented routes and native validation
+
+| Package | MVC page | Backend state |
+| --- | --- | --- |
+| `os-staticarp` | `/ui/staticarp` | Existing rc configuration and ARP helper |
+| `os-pftop` | `/ui/pftop` | Live pfTop snapshot |
+| `os-lucky` | `/ui/lucky` | Existing rc configuration |
+| `os-easytier` | `/ui/easytier` | Existing TOML configuration |
+| `os-ddns-go` | `/ui/ddnsgo` | Existing YAML configuration |
+| `os-lang` | `/ui/langtool` | Existing language files and update worker |
+| `os-ttyd` | `/ui/ttyd` | Existing rc configuration and SSH target |
+| `os-speedtest` | `/ui/speedtest` | Existing settings, result and progress JSON |
+| `os-sing-box` | `/ui/singbox` | Existing JSON configuration and subscription environment |
+
+All nine package versions are `1.1.0`. Menu and ACL entries cover their page
+and API routes. Mutations require POST and `throwReadOnly()` before any backend
+operation. Credential-bearing requests use private mode-0600 temporary files
+that controllers remove even when configd fails. Editors preserve masked
+credentials and reject stale or relocated masks. Subscription URLs are omitted
+from responses.
+
+Live configuration and rc files ship as `.sample` files. Incoming upgrade hooks
+protect state where the old package owned live files. The native package checks
+verify archive file hashes and decoded installation scripts, in addition to
+build success. Sing-box's inline manifest generation escapes `%` before
+libpkg parses scripts; builders using separate `+POST_INSTALL` metadata files
+let pkg perform that encoding.
+
+See [MVC-MIGRATION-TESTS.md](MVC-MIGRATION-TESTS.md) for the actual router
+environment, checks, results and verification details.

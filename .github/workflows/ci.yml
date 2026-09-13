@@ -1,4 +1,4 @@
-name: Validate Mihomo source
+name: Validate plugin source
 on:
   push:
     branches-ignore: [gh-pages]
@@ -22,10 +22,29 @@ jobs:
           python -m unittest discover -s src/os-sing-box/tests -v
           python -m unittest discover -s src/os-kazuha-repo/tests -v
           python -m unittest discover -s tests -v
+      - name: Verify migrated MVC plugin backends
+        run: |
+          python -B -m unittest discover -s src/os-speedtest/tests -v
+          python -B -m unittest discover -s src/os-lucky/tests -v
+          python -B -m unittest discover -s src/os-ddns-go/tests -v
+          python -B -m unittest discover -s src/os-easytier/tests/native -v
+          python -B -m unittest discover -s src/os-ttyd/tests/native -v
+          python -B -m unittest discover -s src/os-lang/tests/native -p test_archive.py -v
+          php src/os-speedtest/tests/native/test-api.php
+          php src/os-sing-box/tests/native/test-api-contract.php
+          php tests/native/test-utility-api-contract.php
+          php tests/native/test-small-api-contract.php
       - name: Check PHP syntax
-        run: find src/os-mihomo/src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
+        run: find src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
       - name: Check shell scripts
         run: |
+          for plugin in staticarp pftop lucky easytier ddns-go lang ttyd speedtest sing-box; do
+            sh -n "src/os-$plugin/build.sh"
+            for phase in PRE_INSTALL POST_INSTALL PRE_DEINSTALL POST_DEINSTALL; do
+              hook="src/os-$plugin/packaging/freebsd/+$phase"
+              if [ -f "$hook" ]; then sh -n "$hook"; fi
+            done
+          done
           shellcheck src/os-mihomo/packaging/prepare-builder.sh
           shellcheck build-repo.sh publish-repo.sh src/os-mihomo/build.sh src/os-mihomo/packaging/freebsd/+PRE_INSTALL src/os-mihomo/packaging/freebsd/+POST_INSTALL src/os-mihomo/packaging/freebsd/+PRE_DEINSTALL src/os-mihomo/packaging/freebsd/+POST_DEINSTALL src/os-mihomo/tests/jail/run.sh src/os-mihomo/tests/jail/prepare.sh src/os-sing-box/build.sh src/os-sing-box/src/usr/local/etc/sing-box/sub/sub.sh
           sh -n src/os-mihomo/src/usr/local/etc/rc.d/mihomo

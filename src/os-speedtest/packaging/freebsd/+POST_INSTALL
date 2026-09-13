@@ -10,9 +10,11 @@ esac
 mkdir -p /var/db/speedtest
 chmod 0700 /var/db/speedtest
 chmod 0755 /usr/local/bin/opnsense-speedtest
-chmod 0644 /usr/local/www/diagnostics_speedtest.php \
+chmod 0644 \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Menu/Menu.xml \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/ACL/ACL.xml
+rm -f /usr/local/www/diagnostics_speedtest.php
+service configd restart >/dev/null 2>&1 || true
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 echo "Speedtest installed. Open Diagnostics > Speedtest."

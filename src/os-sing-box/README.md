@@ -84,8 +84,10 @@ pkg add -f os-sing-box-1.0.3.pkg
 ```
 刷新 OPNsense WebGUI，进入：
 ```text
-VPN > Sing-Box
+VPN > Proxy Suite > Sing-Box
 ```
+界面地址为 `/ui/singbox`，配置、订阅和日志集中在同一页面。API 不返回订阅 URL 或配置中的凭据；保留以 `__SING_BOX_KEEP_STORED_VALUE__` 开头的完整占位符即可保留已有敏感值。订阅更新后，旧配置编辑快照必须重新加载才能保存。
+安装包仅提供设置样本，升级保留现有 JSON 配置、订阅环境文件、模板和启用状态。
 ## 卸载命令
 ```sh
 pkg delete os-sing-box
@@ -104,7 +106,7 @@ Renew sing-box Subscription
 ## 编译 pkg
 在 FreeBSD 主机上构建。需要以下命令：
 ```sh
-pkg、tar、make、xz、curl 或 fetch
+pkg、tar、make、xz、python3、curl 或 fetch
 ```
 运行：
 

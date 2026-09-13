@@ -84,10 +84,12 @@ case "${1:-apply}" in
 			reset_interface_modes
 			/usr/sbin/arp -d -a >/dev/null 2>&1 || true
 		fi
+		printf 'OK\n'
 		;;
 	reset)
 		reset_interface_modes
 		/usr/sbin/arp -d -a >/dev/null 2>&1 || true
+		printf 'OK\n'
 		;;
 	status)
 		printf 'enabled=%s\n' "$(get_setting enabled NO)"

@@ -39,7 +39,7 @@ src/usr/local/opnsense/service/conf/actions.d/           configd 服务动作
 src/usr/local/opnsense/mvc/app/models/OPNsense/EasyTier/ 菜单和 ACL 模型
 src/usr/local/sbin/easytier-core                         EasyTier 核心程序
 src/usr/local/sbin/easytier-cli                          EasyTier 命令行工具
-src/usr/local/www/easytier.php                           WebGUI 页面
+src/usr/local/opnsense/mvc/app/views/OPNsense/EasyTier/index.volt                           WebGUI 页面
 images/                                                  README 页面截图
 ```
 

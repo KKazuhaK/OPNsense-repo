@@ -9,10 +9,11 @@ class ServiceController extends ApiControllerBase
 {
     public function applyAction()
     {
-        if (!$this->request->isPost()) {
+        if ($this->request->getMethod() !== 'POST') {
             return ['status' => 'failed', 'message' => gettext('POST required')];
         }
 
+        $this->throwReadOnly();
         $backend = new Backend();
         $response = trim($backend->configdRun('unboundcustom apply'));
         $decoded = json_decode($response, true);

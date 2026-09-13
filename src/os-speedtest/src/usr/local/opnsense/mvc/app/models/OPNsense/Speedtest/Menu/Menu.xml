@@ -1,7 +1,9 @@
 <menu>
     <System>
         <Diagnostics>
-            <Speedtest VisibleName="Speedtest" order="95" url="/diagnostics_speedtest.php" cssClass="fa fa-tachometer fa-fw"/>
+            <Speedtest VisibleName="Speedtest" order="95" url="/ui/speedtest" cssClass="fa fa-tachometer fa-fw">
+                <item url="/ui/speedtest/*" visibility="hidden"/>
+            </Speedtest>
         </Diagnostics>
     </System>
 </menu>

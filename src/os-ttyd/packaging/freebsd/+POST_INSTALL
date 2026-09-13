@@ -1,4 +1,29 @@
 #!/bin/sh
+set -eu
+
+mkdir -p /etc/rc.conf.d
+if [ ! -f /etc/rc.conf.d/ttyd ]; then
+    if [ -f /var/db/os-ttyd/rc.conf.upgrade ]; then
+        cp -p /var/db/os-ttyd/rc.conf.upgrade /etc/rc.conf.d/ttyd
+    else
+        install -m 0644 /etc/rc.conf.d/ttyd.sample /etc/rc.conf.d/ttyd
+    fi
+fi
+rm -f /var/db/os-ttyd/rc.conf.upgrade
+
+for name in ttyd.crt ttyd.key; do
+    backup="/var/db/os-ttyd/$name.upgrade"
+    if [ -f "$backup" ]; then
+        mkdir -p /usr/local/etc
+        if [ ! -e "/usr/local/etc/$name" ]; then
+            cp -p "$backup" "/usr/local/etc/$name"
+        fi
+        rm -f "$backup"
+    fi
+done
+
+# Remove the retired entry point when upgrading from the legacy page.
+rm -f /usr/local/www/diag_ttyd.php
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -12,12 +37,11 @@ log() {
 log "$GREEN" "====== ttyd for OPNsense package setup ======"
 
 log "$YELLOW" "Setting file permissions..."
-chmod 0644 /etc/rc.conf.d/ttyd 2>/dev/null || true
 chmod 0755 /usr/local/etc/rc.d/os-ttyd 2>/dev/null || true
 chmod 0755 /usr/local/os-ttyd/bin/ttyd 2>/dev/null || true
 chmod 0644 \
 	/usr/local/etc/lighttpd_webgui/conf.d/ttyd.conf \
-	/usr/local/www/diag_ttyd.php \
+	/usr/local/opnsense/mvc/app/views/OPNsense/Ttyd/index.volt \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/Menu/Menu.xml \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/ACL/ACL.xml \
 	/usr/local/opnsense/service/conf/actions.d/actions_ttyd.conf 2>/dev/null || true
@@ -32,7 +56,7 @@ service configd restart >/dev/null 2>&1 || true
 configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 
 log "$YELLOW" "Starting ttyd service..."
-service os-ttyd onerestart >/dev/null 2>&1 || service os-ttyd onestart >/dev/null 2>&1 || true
+service os-ttyd restart >/dev/null 2>&1 || true
 
 if service os-ttyd onestatus >/dev/null 2>&1; then
 	log "$GREEN" "Installation complete. Refresh the browser and open System > Diagnostics > ttyd."

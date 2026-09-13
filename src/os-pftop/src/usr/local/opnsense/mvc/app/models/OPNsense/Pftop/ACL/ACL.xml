@@ -2,7 +2,8 @@
     <page-system-diagnostics-pftop>
         <name>System: Diagnostics: pfTop</name>
         <patterns>
-            <pattern>diag_pftop.php*</pattern>
+            <pattern>ui/pftop/*</pattern>
+            <pattern>api/pftop/*</pattern>
         </patterns>
     </page-system-diagnostics-pftop>
 </acl>

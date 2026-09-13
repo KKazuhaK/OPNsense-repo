@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+# Preserve settings before pkg removes the outgoing package's owned files.
+upgrade_state=/var/db/os-lucky
+upgrade_rc=/etc/rc.conf.d/lucky
+if [ -f "$upgrade_rc" ]; then
+    install -d -m 0700 "$upgrade_state"
+    cp -p "$upgrade_rc" "$upgrade_state/rc.conf.upgrade"
+fi

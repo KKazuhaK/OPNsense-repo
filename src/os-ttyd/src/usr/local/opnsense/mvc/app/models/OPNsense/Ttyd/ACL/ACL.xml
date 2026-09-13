@@ -2,7 +2,8 @@
     <page-system-diagnostics-ttyd>
         <name>System: Diagnostics: ttyd</name>
         <patterns>
-            <pattern>diag_ttyd.php*</pattern>
+            <pattern>ui/ttyd/*</pattern>
+            <pattern>api/ttyd/*</pattern>
         </patterns>
     </page-system-diagnostics-ttyd>
 </acl>

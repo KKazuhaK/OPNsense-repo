@@ -31,13 +31,13 @@ The installer targets OPNsense on FreeBSD 14 amd64. It first uses the bundled Fr
 
 ## Files
 
-- `src/usr/local/www/diag_ttyd.php`: OPNsense web page.
+- `src/usr/local/opnsense/mvc/app/views/OPNsense/Ttyd/index.volt`: OPNsense web page.
 - `src/usr/local/etc/lighttpd_webgui/conf.d/ttyd.conf`: same-origin reverse proxy for the embedded terminal.
 - `src/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/Menu/Menu.xml`: OPNsense menu entry.
 - `src/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/ACL/ACL.xml`: OPNsense page ACL entry.
 - `src/usr/local/opnsense/service/conf/actions.d/actions_ttyd.conf`: configd service actions.
 - `src/usr/local/etc/rc.d/os-ttyd`: rc.d service script.
-- `src/etc/rc.conf.d/ttyd`: default service configuration.
+- `src/etc/rc.conf.d/ttyd.sample`: default service configuration.
 - `vendor/freebsd14-amd64/*.pkg`: bundled FreeBSD 14 amd64 ttyd runtime packages.
 - `build.sh`: builds `dist/os-ttyd.pkg` on FreeBSD/OPNsense. The package uses a private runtime under `/usr/local/os-ttyd`.
 
@@ -58,9 +58,9 @@ pkg delete os-ttyd
 ```
 ## Requirements
 
-1. Enable Secure Shell under `System > Settings > Administration`.
-2. Allow the management workstation to reach the ttyd HTTPS/WebSocket port. The default port is `7681`.
-3. Bind ttyd to a trusted management/LAN address when possible. Do not expose it to WAN.
+1. Enable Secure Shell under `System > Settings > Administration`. The default terminal command needs SSH password or keyboard-interactive authentication.
+2. Allow the management workstation to reach the OPNsense WebGUI HTTPS port. HTTP and WebSocket traffic use the same `/ttyd/` proxy path.
+3. Keep the backend listener on its default loopback address.
 
 ## Usage
 
@@ -70,17 +70,17 @@ Open `System > Diagnostics > ttyd`. The page embeds the terminal through the OPN
 https://<OPNsense-address>/ttyd/
 ```
 
-The terminal first displays `login:`. Enter the OPNsense SSH username, then enter the SSH password or key passphrase when prompted.
+The terminal first displays `login:`. Enter the OPNsense SSH username, then enter the SSH password when prompted. With public-key-only SSH authentication, configure a custom `ttyd_command` using an available key; the default command disables public-key authentication.
 
 ## Configuration
 
-The SSH target is fixed to:
+The default command follows the configured OPNsense SSH port (22 when unset):
 
 ```text
-127.0.0.1:22
+127.0.0.1:<configured-SSH-port>
 ```
 
-The default ttyd listen address is `127.0.0.1`, and the default backend port is `7681`. OPNsense lighttpd proxies `/ttyd/` to that local backend. Edit `src/etc/rc.conf.d/ttyd` before installation, or `/etc/rc.conf.d/ttyd` after installation, then restart the service:
+The default ttyd listen address is `127.0.0.1`, and the default backend port is `7681`. OPNsense lighttpd proxies `/ttyd/` to that local backend. Edit `src/etc/rc.conf.d/ttyd.sample` before installation, or `/etc/rc.conf.d/ttyd` after installation, then restart the service:
 
 ```sh
 service os-ttyd restart

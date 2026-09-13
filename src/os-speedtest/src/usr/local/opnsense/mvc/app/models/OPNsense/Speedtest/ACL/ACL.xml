@@ -2,7 +2,8 @@
     <page-system-diagnostics-speedtest>
         <name>System: Diagnostics: Speedtest</name>
         <patterns>
-            <pattern>diagnostics_speedtest.php*</pattern>
+            <pattern>ui/speedtest/*</pattern>
+            <pattern>api/speedtest/*</pattern>
         </patterns>
     </page-system-diagnostics-speedtest>
 </acl>

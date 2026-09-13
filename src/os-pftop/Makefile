@@ -1,6 +1,6 @@
 PKG_NAME?=	os-pftop
 OUTPUT_NAME?=	os-pftop.pkg
-VERSION?=	1.0
+VERSION?=	1.1.0
 ABI?=		FreeBSD:*:amd64
 
 .PHONY: package clean

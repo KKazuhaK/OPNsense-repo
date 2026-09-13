@@ -1,5 +1,7 @@
 <menu>
     <Services>
-        <Ddnsgo VisibleName="DDNS-Go" url="/services_ddnsgo.php" cssClass="fa fa-tags fa-fw"/>
+        <Ddnsgo VisibleName="DDNS-Go" url="/ui/ddnsgo" cssClass="fa fa-tags fa-fw">
+            <item url="/ui/ddnsgo/*" visibility="hidden"/>
+        </Ddnsgo>
     </Services>
 </menu>

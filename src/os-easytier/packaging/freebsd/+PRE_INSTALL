@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+# pkg runs this before deleting the old version's package-owned rc file.
+state=/var/db/os-easytier
+live=/etc/rc.conf.d/easytier
+backup="$state/rc.conf.upgrade"
+if [ -f "$live" ]; then
+    install -d -m 0700 "$state"
+    temporary="$(mktemp "$state/rc.conf.XXXXXXXX")"
+    trap 'rm -f "$temporary"' EXIT HUP INT TERM
+    cp -p "$live" "$temporary"
+    mv -f "$temporary" "$backup"
+    trap - EXIT HUP INT TERM
+fi

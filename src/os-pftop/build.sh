@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-pftop}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.1.0}"
 ORIGIN="${ORIGIN:-opnsense/os-pftop}"
 COMMENT="${COMMENT:-pfTop diagnostics page for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -31,7 +31,11 @@ need_file() {
 command -v pkg >/dev/null 2>&1 || die "pkg command not found. Run this script on FreeBSD/OPNsense."
 command -v tar >/dev/null 2>&1 || die "tar command not found."
 
-need_file "src/usr/local/www/diag_pftop.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Pftop/IndexController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Pftop/Api/ServiceController.php"
+need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Pftop/index.volt"
+need_file "src/usr/local/opnsense/scripts/pftop/snapshot.py"
+need_file "src/usr/local/opnsense/service/conf/actions.d/actions_pftop.conf"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Pftop/Menu/Menu.xml"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Pftop/ACL/ACL.xml"
 need_file "packaging/freebsd/+MANIFEST.in"
@@ -42,7 +46,7 @@ need_file "packaging/freebsd/pkg-descr"
 
 case "$TARGET_ABI" in
 	native)
-		PKG_ABI="$(pkg config ABI)"
+		PKG_ABI="$(env -u ABI pkg config ABI)"
 		;;
 	FreeBSD:*:amd64)
 		PKG_ABI="$TARGET_ABI"
@@ -69,14 +73,14 @@ copy_tree() {
 	src="$1"
 	dst="$2"
 	mkdir -p "$dst"
-	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' -cf - .) | (cd "$dst" && tar -xf -)
+	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' -cf - .) | (cd "$dst" && tar -xf -)
 }
 
 echo "==> Staging OPNsense integration files"
 copy_tree "$SCRIPT_DIR/src/usr" "$STAGEDIR/usr"
 
 chmod 0644 \
-	"$STAGEDIR/usr/local/www/diag_pftop.php" \
+	"$STAGEDIR/usr/local/opnsense/mvc/app/controllers/OPNsense/Pftop/IndexController.php" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Pftop/Menu/Menu.xml" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Pftop/ACL/ACL.xml"
 
@@ -114,7 +118,7 @@ install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_DEINSTALL" "$METADIR/+PRE_DE
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_DEINSTALL" "$METADIR/+POST_DEINSTALL"
 
 echo "==> Creating package for $PKG_ABI"
-pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+env -u ABI pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 
 CREATED="$DISTDIR/$PKG_NAME-$VERSION.pkg"
 if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
@@ -122,7 +126,7 @@ if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
 fi
 
 echo "==> Package: $DISTDIR/$OUTPUT_NAME"
-pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
+env -u ABI pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
 echo "==> Verified package metadata"
 if command -v sha256 >/dev/null 2>&1; then
 	sha256 "$DISTDIR/$OUTPUT_NAME"

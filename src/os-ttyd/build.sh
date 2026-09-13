@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ttyd}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.1.0}"
 ORIGIN="${ORIGIN:-opnsense/os-ttyd}"
 COMMENT="${COMMENT:-ttyd terminal for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -32,14 +32,18 @@ need_file() {
 command -v pkg >/dev/null 2>&1 || die "pkg command not found. Run this script on FreeBSD/OPNsense."
 command -v tar >/dev/null 2>&1 || die "tar command not found."
 
-need_file "src/etc/rc.conf.d/ttyd"
+need_file "src/etc/rc.conf.d/ttyd.sample"
 need_file "src/usr/local/etc/rc.d/os-ttyd"
 need_file "src/usr/local/etc/lighttpd_webgui/conf.d/ttyd.conf"
-need_file "src/usr/local/www/diag_ttyd.php"
+need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Ttyd/index.volt"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/Menu/Menu.xml"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/ACL/ACL.xml"
 need_file "src/usr/local/opnsense/service/conf/actions.d/actions_ttyd.conf"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Ttyd/IndexController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Ttyd/Api/ServiceController.php"
+need_file "src/usr/local/opnsense/scripts/ttyd/manage.py"
 need_file "packaging/freebsd/+MANIFEST.in"
+need_file "packaging/freebsd/+PRE_INSTALL"
 need_file "packaging/freebsd/+POST_INSTALL"
 need_file "packaging/freebsd/+PRE_DEINSTALL"
 need_file "packaging/freebsd/+POST_DEINSTALL"
@@ -47,7 +51,7 @@ need_file "packaging/freebsd/pkg-descr"
 
 case "$TARGET_ABI" in
 	native)
-		PKG_ABI="$(pkg config ABI)"
+		PKG_ABI="$(env -u ABI pkg config ABI)"
 		;;
 	FreeBSD:*:amd64)
 		PKG_ABI="$TARGET_ABI"
@@ -79,7 +83,7 @@ copy_tree() {
 	src="$1"
 	dst="$2"
 	mkdir -p "$dst"
-	(cd "$src" && tar --exclude '.DS_Store' -cf - .) | (cd "$dst" && tar -xf -)
+	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' --no-xattrs -cf - .) | (cd "$dst" && tar -xf -)
 }
 
 copy_from_runtime() {
@@ -118,12 +122,12 @@ echo "==> Staging OPNsense integration files"
 copy_tree "$SCRIPT_DIR/src/etc" "$STAGEDIR/etc"
 copy_tree "$SCRIPT_DIR/src/usr" "$STAGEDIR/usr"
 
-chmod 0644 "$STAGEDIR/etc/rc.conf.d/ttyd"
+chmod 0644 "$STAGEDIR/etc/rc.conf.d/ttyd.sample"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-ttyd"
 chmod 0755 "$STAGEDIR/usr/local/os-ttyd/bin/ttyd"
 chmod 0644 \
 	"$STAGEDIR/usr/local/etc/lighttpd_webgui/conf.d/ttyd.conf" \
-	"$STAGEDIR/usr/local/www/diag_ttyd.php" \
+	"$STAGEDIR/usr/local/opnsense/mvc/app/views/OPNsense/Ttyd/index.volt" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/Menu/Menu.xml" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/ACL/ACL.xml" \
 	"$STAGEDIR/usr/local/opnsense/service/conf/actions.d/actions_ttyd.conf"
@@ -157,12 +161,13 @@ sed \
 	-e "/@DESC@/d" \
 	"$SCRIPT_DIR/packaging/freebsd/+MANIFEST.in" > "$METADIR/+MANIFEST"
 
+install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_INSTALL" "$METADIR/+PRE_INSTALL"
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_INSTALL" "$METADIR/+POST_INSTALL"
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_DEINSTALL" "$METADIR/+PRE_DEINSTALL"
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_DEINSTALL" "$METADIR/+POST_DEINSTALL"
 
 echo "==> Creating package for $PKG_ABI"
-pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+env -u ABI pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 
 CREATED="$DISTDIR/$PKG_NAME-$VERSION.pkg"
 if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
@@ -170,5 +175,5 @@ if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
 fi
 
 echo "==> Package: $DISTDIR/$OUTPUT_NAME"
-pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
+env -u ABI pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
 echo "==> Verified package metadata"

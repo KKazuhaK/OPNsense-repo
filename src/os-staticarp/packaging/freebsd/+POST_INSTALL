@@ -1,4 +1,24 @@
 #!/bin/sh
+set -eu
+
+# Begin upgrade state restore.
+mkdir -p /etc/rc.conf.d
+if [ ! -f /etc/rc.conf.d/staticarp ]; then
+    if [ -f /var/db/os-staticarp/rc.conf.upgrade ]; then
+        cp -p /var/db/os-staticarp/rc.conf.upgrade /etc/rc.conf.d/staticarp
+    else
+        install -m 0644 /etc/rc.conf.d/staticarp.sample /etc/rc.conf.d/staticarp
+    fi
+fi
+rm -f /var/db/os-staticarp/rc.conf.upgrade
+if [ -d /var/db/os-staticarp/state.upgrade ]; then
+    if [ ! -e /usr/local/etc/staticarp ]; then
+        mkdir -p /usr/local/etc
+        cp -pR /var/db/os-staticarp/state.upgrade /usr/local/etc/staticarp
+    fi
+    rm -rf /var/db/os-staticarp/state.upgrade
+fi
+# End upgrade state restore.
 
 ABI="$(pkg config ABI 2>/dev/null || pkg -vv 2>/dev/null | awk -F'"' '/ABI =/ {print $2; exit}')"
 
@@ -17,7 +37,7 @@ echo "===> Preparing Static Binding runtime"
 mkdir -p /etc/rc.conf.d /usr/local/etc/staticarp
 chmod 0755 /usr/local/sbin/staticarpctl /usr/local/etc/rc.d/os-staticarp 2>/dev/null || true
 chmod 0644 \
-	/usr/local/www/services_staticarp.php \
+	/usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp/IndexController.php \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Staticarp/Menu/Menu.xml \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Staticarp/ACL/ACL.xml \
 	/usr/local/opnsense/service/conf/actions.d/actions_staticarp.conf 2>/dev/null || true
@@ -27,6 +47,11 @@ chmod 0644 \
 [ -f /usr/local/etc/staticarp/interfaces.conf ] || : > /usr/local/etc/staticarp/interfaces.conf
 chmod 0644 /usr/local/etc/staticarp/settings.conf /usr/local/etc/staticarp/entries.conf /usr/local/etc/staticarp/interfaces.conf 2>/dev/null || true
 
+find /usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp /usr/local/opnsense/mvc/app/views/OPNsense/Staticarp /usr/local/opnsense/scripts/staticarp -type f -exec chmod 0644 {} \; 2>/dev/null || true
+
+# Remove the retired page when upgrading from a legacy package.
+rm -f /usr/local/www/services_staticarp.php
+
 echo "===> Clearing OPNsense menu and ACL cache"
 rm -f \
 	/var/lib/php/tmp/opnsense_menu_cache.xml \
@@ -34,6 +59,10 @@ rm -f \
 
 echo "===> Reloading OPNsense menu, ACL and configd actions"
 service configd restart >/dev/null 2>&1 || true
+# The outgoing package resets interface modes and ARP entries during removal.
+if grep -q '^enabled=YES$' /usr/local/etc/staticarp/settings.conf; then
+    configctl staticarp apply >/dev/null 2>&1 || true
+fi
 configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 
 echo "===> Static Binding for OPNsense installed. Refresh the browser and open Services > Static Binding."

@@ -15,7 +15,18 @@ load_rc_config "$name"
 : "${ttyd_port:=7681}"
 : "${ttyd_interface:=127.0.0.1}"
 : "${ttyd_base_path:=/ttyd}"
-: "${ttyd_command:=printf \"login: \"; read -r ttyd_login; if [ -z \"\$ttyd_login\" ]; then echo \"login is required\"; exit 1; fi; exec /usr/local/bin/ssh -tt -p 22 -o PreferredAuthentications=keyboard-interactive,password -o PubkeyAuthentication=no -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new \"\$ttyd_login@127.0.0.1\"}"
+
+
+# Resolve only the current SSH port; user commands remain authoritative.
+ttyd_ssh_port="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/ttyd/manage.py ssh-port 2>/dev/null)"
+case "$ttyd_ssh_port" in
+    ''|*[!0-9]*) ttyd_ssh_port=22 ;;
+esac
+ttyd_default_command='printf "login: "; read -r ttyd_login; if [ -z "$ttyd_login" ]; then echo "login is required"; exit 1; fi; exec /usr/local/bin/ssh -tt -p __TTYD_SSH_PORT__ -o PreferredAuthentications=keyboard-interactive,password -o PubkeyAuthentication=no -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new "$ttyd_login@127.0.0.1"'
+ttyd_legacy_command="$(printf '%s' "$ttyd_default_command" | sed 's/__TTYD_SSH_PORT__/22/g')"
+if [ -z "${ttyd_command:-}" ] || [ "$ttyd_command" = "$ttyd_legacy_command" ]; then
+    ttyd_command="$(printf '%s' "$ttyd_default_command" | sed "s/__TTYD_SSH_PORT__/${ttyd_ssh_port}/g")"
+fi
 
 pidfile="/var/run/${name}.pid"
 logfile="/var/log/${name}.log"

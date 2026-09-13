@@ -127,8 +127,24 @@ def main(argv):
     except OSError:
         print('a speed test is already running', file=sys.stderr)
         return 1
-    command = [BINARY, '--unix'] + argv[1:]
+    background = len(argv) > 1 and argv[1] == '--background'
+    arguments = argv[2:] if background else argv[1:]
     publish('running')
+    if os.path.exists(RESULT):
+        os.unlink(RESULT)
+    if background:
+        # The child inherits the acquired lock; HTTP returns only after acceptance.
+        child = os.fork()
+        if child:
+            print(json.dumps({'status': 'ok'}))
+            return 0
+        os.setsid()
+        sink = os.open(os.devnull, os.O_RDWR)
+        for descriptor in (0, 1, 2):
+            os.dup2(sink, descriptor)
+        if sink > 2:
+            os.close(sink)
+    command = ['/bin/timeout', str(TIMEOUT), BINARY, '--unix'] + arguments
     collected = ''
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE,

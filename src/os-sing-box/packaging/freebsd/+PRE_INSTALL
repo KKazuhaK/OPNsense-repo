@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+# Pkg runs the incoming pre-install before deleting old package-owned files.
+# Preserve only this plugin's live files while moving ownership to samples.
+[ -n "${PKG_UPGRADE+x}" ] || exit 0
+BACKUP_DIR="/var/db/os-sing-box-upgrade"
+[ ! -L "$BACKUP_DIR" ] || exit 1
+umask 077
+mkdir -p "$BACKUP_DIR"
+chmod 0700 "$BACKUP_DIR"
+for relative in config.json sub/env sub/template.json; do
+    source="/usr/local/etc/sing-box/$relative"
+    destination="$BACKUP_DIR/$relative"
+    if [ -f "$source" ]; then
+        mkdir -p "$(dirname "$destination")"
+        install -m 0600 "$source" "$destination"
+    fi
+done
+if [ -f /etc/rc.conf.d/sing_box ]; then
+    install -m 0600 /etc/rc.conf.d/sing_box "$BACKUP_DIR/sing_box"
+fi
+rm -f "$BACKUP_DIR/running"
+if service sing-box status >/dev/null 2>&1; then
+    touch "$BACKUP_DIR/running"
+fi

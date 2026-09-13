@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-speedtest}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.1.0}"
 ORIGIN="${ORIGIN:-opnsense/os-speedtest}"
 COMMENT="${COMMENT:-Internet speed test integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -13,7 +13,7 @@ TARGET_ABI="${TARGET_ABI:-${ABI:-native}}"
 OUTPUT_NAME="${OUTPUT_NAME:-${PKG_NAME}.pkg}"
 ASSET="speedtest-go_1.7.10_Freebsd_x86_64.tar.gz"
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 WORKDIR="${WORKDIR:-$SCRIPT_DIR/work/freebsd-pkg}"
 STAGEDIR="$WORKDIR/stage"
 METADIR="$WORKDIR/meta"
@@ -26,7 +26,13 @@ need_file() { [ -e "$SCRIPT_DIR/$1" ] || die "missing required file: $1"; }
 command -v pkg >/dev/null 2>&1 || die "pkg command not found; build on FreeBSD or OPNsense"
 command -v tar >/dev/null 2>&1 || die "tar command not found"
 need_file "src/usr/local/bin/$ASSET"
-need_file "src/usr/local/www/diagnostics_speedtest.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/IndexController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/Api/SettingsController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/Api/ServiceController.php"
+need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Speedtest/index.volt"
+need_file "src/usr/local/opnsense/scripts/speedtest/api.php"
+need_file "src/usr/local/opnsense/scripts/speedtest/speedtest.py"
+need_file "src/usr/local/opnsense/service/conf/actions.d/actions_speedtest.conf"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Menu/Menu.xml"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/ACL/ACL.xml"
 need_file "packaging/freebsd/+MANIFEST.in"
@@ -36,7 +42,7 @@ need_file "packaging/freebsd/+POST_DEINSTALL"
 need_file "packaging/freebsd/pkg-descr"
 
 case "$TARGET_ABI" in
-	native) PKG_ABI="$(pkg config ABI 2>/dev/null || pkg -vv | awk -F'"' '/ABI =/ {print $2; exit}')" ;;
+	native) PKG_ABI="$(env -u ABI pkg config ABI 2>/dev/null || env -u ABI pkg -vv | awk -F'"' '/ABI =/ {print $2; exit}')" ;;
 	FreeBSD:*:amd64) PKG_ABI="$TARGET_ABI" ;;
 	*) die "unsupported ABI: $TARGET_ABI" ;;
 esac
@@ -49,13 +55,13 @@ rm -rf "$WORKDIR"
 mkdir -p "$STAGEDIR" "$METADIR" "$DISTDIR"
 
 echo "==> Staging files"
-(cd "$SCRIPT_DIR/src" && tar --exclude '.DS_Store' --exclude "$ASSET" -cf - .) | (cd "$STAGEDIR" && tar -xf -)
+(cd "$SCRIPT_DIR/src" && tar --exclude '.DS_Store' --exclude '__pycache__' --exclude '*.pyc' --exclude '*.pyo' --exclude "$ASSET" -cf - .) | (cd "$STAGEDIR" && tar -xf -)
 mkdir -p "$STAGEDIR/usr/local/bin"
 tar -xzf "$SCRIPT_DIR/src/usr/local/bin/$ASSET" -C "$WORKDIR"
 ENGINE="$(find "$WORKDIR" -type f -name speedtest-go | head -1)"
 [ -n "$ENGINE" ] || die "speedtest-go was not found in $ASSET"
 install -m 0755 "$ENGINE" "$STAGEDIR/usr/local/bin/opnsense-speedtest"
-chmod 0644 "$STAGEDIR/usr/local/www/diagnostics_speedtest.php" \
+chmod 0644 \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Menu/Menu.xml" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/ACL/ACL.xml" \
 	"$STAGEDIR/usr/local/opnsense/version/speedtest"
@@ -80,9 +86,9 @@ install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_DEINSTALL" "$METADIR/+PRE_DE
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_DEINSTALL" "$METADIR/+POST_DEINSTALL"
 
 echo "==> Creating package for $PKG_ABI"
-pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+env -u ABI pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 CREATED="$DISTDIR/$PKG_NAME-$VERSION.pkg"
 [ ! -f "$CREATED" ] || [ "$(basename "$CREATED")" = "$OUTPUT_NAME" ] || mv -f "$CREATED" "$DISTDIR/$OUTPUT_NAME"
-pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
+env -u ABI pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
 echo "==> Package: $DISTDIR/$OUTPUT_NAME"
 sha256 "$DISTDIR/$OUTPUT_NAME" 2>/dev/null || true

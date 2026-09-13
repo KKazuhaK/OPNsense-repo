@@ -1,0 +1,37 @@
+#!/bin/sh
+# Stop both daemons with a bounded wait.  rc.subr's process wait can hold a
+# package operation open for a long time when a daemon is slow to terminate.
+# Deliberately not set -e: a failure here must never block the removal.
+state=/var/db/os-frp
+upgrade=""
+if [ -n "${PKG_UPGRADE+x}" ]; then
+    upgrade=yes
+fi
+
+for side in frps frpc; do
+    pidfile="/var/run/$side.pid"
+    pid=""
+    [ -r "${pidfile}" ] && pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    case "${pid}" in
+        ''|*[!0-9]*) pid="" ;;
+    esac
+    if [ -n "${pid}" ] && /bin/ps -p "${pid}" -o command= 2>/dev/null | /usr/bin/grep -q "^/usr/local/sbin/${side}"; then
+        # Record the running side so an upgrade can bring the tunnel back.
+        if [ -n "${upgrade}" ]; then
+            install -d -m 0700 "${state}" 2>/dev/null || true
+            : > "${state}/${side}.restart" 2>/dev/null || true
+            chmod 0600 "${state}/${side}.restart" 2>/dev/null || true
+        fi
+        /bin/kill -TERM "${pid}" >/dev/null 2>&1 || true
+        count=0
+        while /bin/kill -0 "${pid}" >/dev/null 2>&1 && [ "${count}" -lt 5 ]; do
+            /bin/sleep 1
+            count=$((count + 1))
+        done
+        /bin/kill -KILL "${pid}" >/dev/null 2>&1 || true
+    fi
+    # An upgrade keeps the pidfile: its own post-install owns the restart.
+    [ -n "${upgrade}" ] || rm -f "${pidfile}"
+done
+
+exit 0

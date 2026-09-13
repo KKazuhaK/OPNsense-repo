@@ -1,0 +1,93 @@
+#!/bin/sh
+# PROVIDE: frps
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# frp server.  The client has its own script, /usr/local/etc/rc.d/frpc, so the
+# two daemons start, stop and fail independently; neither may depend on the
+# other, and they need not even run on the same host.
+
+. /etc/rc.subr
+
+name="frps"
+rcvar="frps_enable"
+desc="frp reverse proxy server"
+
+load_rc_config "${name}"
+
+: "${frps_enable:=NO}"
+: "${frps_config:=/usr/local/etc/frp/frps.toml}"
+: "${frps_logfile:=/var/log/frps.log}"
+
+# daemon(8) supervises the child only to clean up after it: no -r, because
+# --strict_config turns a single misspelled key into a permanent exit(1) and a
+# restarting supervisor would make that an invisible loop.  The child pid, not
+# the wrapper's, lands in pidfile, so rc.subr and Services: Overview both
+# report frps itself.
+command="/usr/sbin/daemon"
+procname="/usr/local/sbin/frps"
+pidfile="/var/run/frps.pid"
+command_args="-f -p ${pidfile} -t ${name} -o ${frps_logfile} ${procname} -c ${frps_config}"
+
+# Every frps setting lives in the TOML file.  rc.subr would splice
+# ${name}_flags in ahead of command_args, that is into daemon(8)'s own
+# argument list, so refuse to carry a value that could only break the
+# invocation.
+frps_flags=""
+
+start_precmd="frps_prestart"
+stop_postcmd="frps_poststop"
+
+# Ask the daemon itself whether the file parses.  It is the only check that
+# cannot drift from what frps accepts, and it reports the offending key of a
+# --strict_config failure instead of leaving an empty log behind.
+frps_verify_config()
+{
+    if frps_verify_output=$("${procname}" verify -c "${frps_config}" --strict_config=true 2>&1); then
+        return 0
+    fi
+    case "${frps_verify_output}" in
+    *"unknown command"*|*"unknown flag"*|*"unknown shorthand flag"*)
+        # A build without the verify subcommand: leave the check to the daemon.
+        return 0
+        ;;
+    esac
+    echo "${frps_verify_output}"
+    return 1
+}
+
+frps_prestart()
+{
+    if [ ! -x "${procname}" ]; then
+        echo "frps is not installed: ${procname}"
+        return 1
+    fi
+    if [ ! -s "${frps_config}" ]; then
+        echo "frps configuration is missing or empty: ${frps_config}"
+        return 1
+    fi
+    # The shipped sample writes CHANGE_ME wherever a field has no safe default:
+    # auth.token and webServer.password.  Starting with either still in place
+    # publishes an frps that authenticates anybody and an admin API that can
+    # delete proxies, so treat the placeholder as a hard stop.  Only uncommented
+    # lines count; the sample's own comments name the placeholder.
+    if /usr/bin/grep -v '^[[:space:]]*#' "${frps_config}" | /usr/bin/grep -q '"CHANGE_ME"'; then
+        echo "frps configuration still holds CHANGE_ME placeholders: ${frps_config}"
+        echo "Set the authentication token and the dashboard password in Services > frp > Server (frps) first."
+        return 1
+    fi
+    frps_verify_config || return 1
+
+    install -d -m 0700 /usr/local/etc/frp
+    chmod 0600 "${frps_config}"
+    touch "${frps_logfile}"
+    chmod 0600 "${frps_logfile}"
+    rm -f "${pidfile}"
+}
+
+frps_poststop()
+{
+    rm -f "${pidfile}"
+}
+
+run_rc_command "$1"

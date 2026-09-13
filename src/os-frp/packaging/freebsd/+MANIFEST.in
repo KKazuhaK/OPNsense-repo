@@ -1,0 +1,15 @@
+name: "@PKG_NAME@"
+origin: "@ORIGIN@"
+version: "@VERSION@"
+comment: "@COMMENT@"
+maintainer: "@MAINTAINER@"
+www: "@WWW@"
+abi: "@ABI@"
+arch: "@ARCH@"
+prefix: "@PREFIX@"
+flatsize: @FLATSIZE@
+licenselogic: single
+licenses: ["Apache-2.0"]
+desc: <<EOD
+@DESC@
+EOD

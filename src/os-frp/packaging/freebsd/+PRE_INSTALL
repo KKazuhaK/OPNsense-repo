@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+# pkg runs this before deleting the files the outgoing version owns.  Both
+# rc.conf.d fragments are administrator state, so stash them and let the new
+# post-install decide whether to put them back.
+state=/var/db/os-frp
+for side in frps frpc; do
+    live="/etc/rc.conf.d/$side"
+    [ -f "$live" ] || continue
+    install -d -m 0700 "$state"
+    temporary="$(mktemp "$state/$side.rc.conf.XXXXXXXX")"
+    trap 'rm -f "$temporary"' EXIT HUP INT TERM
+    cp -p "$live" "$temporary"
+    mv -f "$temporary" "$state/$side.rc.conf.upgrade"
+    trap - EXIT HUP INT TERM
+done

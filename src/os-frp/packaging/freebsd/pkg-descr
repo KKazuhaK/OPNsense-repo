@@ -1,0 +1,7 @@
+frp 0.71.0 reverse proxy integration for OPNsense, covering both daemons.
+
+The package installs the frps server and the frpc client, an rc.d service and
+configd actions for each side, and a VPN page that edits the TOML documents the
+daemons actually read.  Neither daemon is started by the installer: frps needs
+an authentication token, a dashboard user and password, and an allowed remote
+port range before it is safe to accept clients.

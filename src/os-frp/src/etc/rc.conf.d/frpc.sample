@@ -1,0 +1,16 @@
+# rc.conf(5) fragment for the frp client (frpc).
+#
+# The web UI flips frpc_enable with sysrc(8) when the service is started or
+# stopped, so this file also decides whether frpc comes up at boot.  It ships
+# disabled because the shipped frpc.toml still carries CHANGE_ME placeholders
+# for the server address and the shared token.
+frpc_enable="NO"
+
+# Optional overrides.  The pidfile is deliberately not configurable: the
+# Services: Overview entry in plugins.inc.d/frp.inc hardcodes /var/run/frpc.pid
+# and would stop reporting the daemon if the two ever disagreed.
+#frpc_config="/usr/local/etc/frp/frpc.toml"
+#frpc_logfile="/var/log/frpc.log"
+
+# There is no frpc_flags: every frpc setting lives in the TOML file, and a
+# stray value here would be inserted into the daemon(8) argument list.

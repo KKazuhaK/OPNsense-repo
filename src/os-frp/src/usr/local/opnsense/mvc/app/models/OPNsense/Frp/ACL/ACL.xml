@@ -1,0 +1,16 @@
+<acl>
+    <page-vpn-frp>
+        <name>VPN: frp</name>
+        <patterns>
+            <!-- The two daemon pages, and the bare /ui/frp the old single page
+                 used to answer on. That one only redirects to the server page
+                 now, but a pattern ending in /* does not match the parent path
+                 itself, so without this line an operator holding this privilege
+                 and nothing else would be refused at their own old bookmark
+                 instead of being sent on to the page it became. -->
+            <pattern>ui/frp</pattern>
+            <pattern>ui/frp/*</pattern>
+            <pattern>api/frp/*</pattern>
+        </patterns>
+    </page-vpn-frp>
+</acl>

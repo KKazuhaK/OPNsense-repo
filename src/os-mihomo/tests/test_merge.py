@@ -448,3 +448,34 @@ class DnsServerFieldTests(unittest.TestCase):
         self.assertEqual([], m.switch_overrides({'dns': {}}))
         self.assertEqual(['dns_nameserver'],
                          m.switch_overrides({'dns': {'nameserver': 'not-a-list'}}))
+
+
+class FakeIpRange6Tests(unittest.TestCase):
+    """Enabling IPv6 under fake-ip must also give AAAA answers a pool to draw from."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+        # An installed overlay has had the switch-owned keys absorbed out of it.
+        m.absorb_switches(self.preset, self.settings)
+
+    def generated(self, overlay=None, **settings):
+        base = m.merge_yaml(copy.deepcopy(self.preset), overlay or {})
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings}, overlay=base))
+
+    def test_ipv6_under_fake_ip_gets_a_range(self):
+        self.assertNotIn('fake-ip-range6', self.generated()['dns'])
+        self.assertEqual(m.FAKE_IP_RANGE6_DEFAULT,
+                         self.generated(ipv6=True)['dns']['fake-ip-range6'])
+
+    def test_a_stated_range_is_kept_and_a_routable_one_refused(self):
+        kept = self.generated({'dns': {'fake-ip-range6': 'fd00::/64'}}, ipv6=True)
+        self.assertEqual('fd00::/64', kept['dns']['fake-ip-range6'])
+        for bad in ('2606:4700::/64', '198.18.0.0/16', 'nonsense'):
+            with self.assertRaises(m.Error, msg=bad):
+                self.generated({'dns': {'fake-ip-range6': bad}}, ipv6=True)
+
+    def test_other_dns_modes_need_no_pool(self):
+        self.assertNotIn('fake-ip-range6', self.generated(ipv6=True, dns_mode='normal')['dns'])

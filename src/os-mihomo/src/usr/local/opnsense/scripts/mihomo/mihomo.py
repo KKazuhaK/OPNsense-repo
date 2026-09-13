@@ -159,6 +159,11 @@ def advertises_ipv6(content):
 
 DNS_MODES = ('fake-ip', 'redir-host', 'normal')
 DNS_MODE_DEFAULT = 'fake-ip'
+# Mihomo defaults fake-ip-range but not its IPv6 counterpart, and builds no IPv6
+# pool without one: AAAA answers then have no fake address to return, silently,
+# because a valid IPv4 pool is enough to pass its own validation. The default
+# mirrors the IPv4 side by using the benchmarking range reserved for this.
+FAKE_IP_RANGE6_DEFAULT = '2001:2::/64'
 HIJACK_TARGETS = ['any:53', 'tcp://any:53']
 # Rule databases, as verified reachable sets. A category that one source does not
 # publish makes every rule naming it fail, so the sets are never mixed.
@@ -453,6 +458,14 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
             raise Error("The fake-IP range is invalid.") from None
         if network.version != 4 or not network.subnet_of(ipaddress.ip_network("198.18.0.0/15")):
             raise Error("The fake-IP range must stay within 198.18.0.0/15.")
+        if dns.get('ipv6') is True:
+            dns.setdefault('fake-ip-range6', FAKE_IP_RANGE6_DEFAULT)
+            try:
+                network6 = ipaddress.ip_network(dns['fake-ip-range6'], strict=False)
+            except ValueError:
+                raise Error("The IPv6 fake-IP range is invalid.") from None
+            if network6.version != 6 or network6.is_global:
+                raise Error("The IPv6 fake-IP range must not be globally routable.")
     result["dns"] = dns
     result['tun'] = tun
     result.update({

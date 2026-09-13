@@ -24,6 +24,19 @@
  # POSSIBILITY OF SUCH DAMAGE.
  #}
 
+<style>
+    /* A log line is arbitrarily long; let the box scroll rather than the page. */
+    .mihomo-log {
+        max-height: 340px;
+        overflow: auto;
+        font-size: 12px;
+        margin-bottom: 12px;
+        max-width: 100%;
+        white-space: pre;
+        word-break: normal;
+    }
+</style>
+
 <script>
 $(function () {
     const api = {
@@ -104,8 +117,8 @@ $(function () {
             $('#mihomo-disable').toggle(!!state.transparent);
             $('#mihomo-warning').toggle(!!state.error).text(state.error || '');
         });
-        ajaxGet(api.log, {}, function (d) { $('#mihomo-log').text((d || {}).log || ''); });
-        ajaxGet(api.subLog, {}, function (d) { $('#mihomo-sub-log').text((d || {}).log || ''); });
+        ajaxGet(api.log, {}, function (d) { $('#mihomo-log').text(htmlDecode((d || {}).log || '')); });
+        ajaxGet(api.subLog, {}, function (d) { $('#mihomo-sub-log').text(htmlDecode((d || {}).log || '')); });
         ajaxGet(api.update, {}, function (d) { $('#mihomo-update-status').text((d || {}).message || ''); });
     }
 
@@ -174,6 +187,7 @@ $(function () {
     <li><a data-toggle="tab" href="#routing">{{ lang._('Routing') }}</a></li>
     <li><a data-toggle="tab" href="#dns">{{ lang._('DNS') }}</a></li>
     <li><a data-toggle="tab" href="#advanced">{{ lang._('Advanced') }}</a></li>
+    <li><a data-toggle="tab" href="#log">{{ lang._('Log') }}</a></li>
 </ul>
 <div class="tab-content content-box">
 
@@ -222,15 +236,6 @@ $(function () {
                         </div>
                     </td>
                 </tr>
-            </tbody>
-        </table>
-        <table class="table table-striped opnsense_standard_table_form">
-            <thead><tr><td style="width:22%"><strong>{{ lang._('Log viewer') }}</strong></td><td style="width:78%"></td></tr></thead>
-            <tbody>
-                <tr><td></td><td>
-                    <pre id="mihomo-log" style="max-height:340px;overflow:auto;font-size:12px;margin-bottom:12px"></pre>
-                    <button type="button" class="btn btn-default mihomo-action" data-action="clearLog" data-done="{{ lang._('Log cleared.') }}">{{ lang._('Clear log') }}</button>
-                </td></tr>
             </tbody>
         </table>
     </div>
@@ -293,7 +298,7 @@ $(function () {
                     </td>
                 </tr>
                 <tr><td></td><td>
-                    <pre id="mihomo-sub-log" style="max-height:340px;overflow:auto;font-size:12px;margin-bottom:12px"></pre>
+                    <pre id="mihomo-sub-log" class="mihomo-log"></pre>
                     <button type="button" class="btn btn-default mihomo-action" data-action="clearSubLog" data-done="{{ lang._('Subscription log cleared.') }}">{{ lang._('Clear log') }}</button>
                 </td></tr>
             </tbody>
@@ -473,6 +478,19 @@ $(function () {
                         </div>
                     </td>
                 </tr>
+            </tbody>
+        </table>
+    </div>
+
+
+    <div id="log" class="tab-pane fade in">
+        <table class="table table-striped opnsense_standard_table_form">
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Log viewer') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <tbody>
+                <tr><td></td><td>
+                    <pre id="mihomo-log" class="mihomo-log"></pre>
+                    <button type="button" class="btn btn-default mihomo-action" data-action="clearLog" data-done="{{ lang._('Log cleared.') }}">{{ lang._('Clear log') }}</button>
+                </td></tr>
             </tbody>
         </table>
     </div>

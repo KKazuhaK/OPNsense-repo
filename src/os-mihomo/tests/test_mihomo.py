@@ -428,6 +428,28 @@ class IntegrationHelperTests(unittest.TestCase):
         return subprocess.run([self.php, str(SCRIPT.with_name('setup_unbound.php')), action, fallback],
                               env=dict(os.environ, OS_MIHOMO_ROOT=str(self.root)), capture_output=True, text=True)
 
+    def zone(self):
+        return self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
+
+    def test_a_validating_resolver_gets_no_forward_zone(self):
+        # Mihomo answers fake-ip records, which carry no signature, so every
+        # signed zone would fail validation. The only configuration that makes
+        # Unbound accept them is the one that stops it starting.
+        self.config.write_text(self.config.read_text().replace(
+            '<forwarding>', '<general><dnssec>1</dnssec></general><forwarding>'))
+        self.assertEqual(0, self.helper('enable').returncode)
+        self.assertFalse(self.zone().exists())
+
+    def test_the_legacy_forward_zone_name_is_cleared(self):
+        # It sorted ahead of the generated dot.conf and never won the root
+        # zone, so a copy left behind is dead weight.
+        legacy = self.root / 'usr/local/etc/unbound.opnsense.d/00-mihomo.conf'
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text('forward-zone:\n  name: "."\n  forward-addr: 127.0.0.1@1053\n')
+        self.assertEqual(0, self.helper('enable').returncode)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(self.zone().exists())
+
     def test_enable_disable_remove_leaves_owner_dots_alone_and_only_removes_owned_interface(self):
         import xml.etree.ElementTree as ET
         self.assertEqual(0, self.helper('enable').returncode)
@@ -439,7 +461,7 @@ class IntegrationHelperTests(unittest.TestCase):
         self.assertEqual('1', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled'))
         self.assertEqual('1', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="private-dot"]/enabled'))
         self.assertIsNone(root.find('./OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]'))
-        zone = self.root / 'usr/local/etc/unbound.opnsense.d/00-mihomo.conf'
+        zone = self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
         self.assertTrue(zone.exists(), 'the forward zone must be written under the test root')
         self.assertIn('127.0.0.1@1053', zone.read_text())
         self.assertEqual(0, self.helper('enable').returncode)

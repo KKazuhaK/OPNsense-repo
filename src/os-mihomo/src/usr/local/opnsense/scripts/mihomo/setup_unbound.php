@@ -6,8 +6,12 @@ const FORWARD_UUID = 'b126bf65-a985-49ca-a9d2-16f156aac198';
 const RULE_UUID = '5a73c3dc-69b1-4e15-89cb-b542aa2c1154';
 const FAKE_IP_CIDR = '198.18.0.0/15';
 /* Unbound's drop-in directory: OPNsense copies every .conf placed here into
-   the chroot on reconfigure. */
-const FORWARD_PATH = '/usr/local/etc/unbound.opnsense.d/00-mihomo.conf';
+   the chroot on reconfigure. Unbound keeps the LAST forward zone it reads for
+   a name, so the name has to sort behind the generated dot.conf to win the
+   root; an earlier version used a name that sorted ahead of it and was
+   silently ignored. */
+const FORWARD_PATH = '/usr/local/etc/unbound.opnsense.d/zz-mihomo.conf';
+const FORWARD_LEGACY_PATH = '/usr/local/etc/unbound.opnsense.d/00-mihomo.conf';
 
 function mihomoForwardFile(): string
 {
@@ -16,6 +20,11 @@ function mihomoForwardFile(): string
        still create and delete the real forward zone on the machine running
        the tests -- and on a router that is the file the resolver reads. */
     return rtrim(getenv('OS_MIHOMO_ROOT') ?: '', '/') . FORWARD_PATH;
+}
+
+function mihomoForwardLegacyFile(): string
+{
+    return rtrim(getenv('OS_MIHOMO_ROOT') ?: '', '/') . FORWARD_LEGACY_PATH;
 }
 
 function mihomoChild(DOMDocument $doc, DOMElement $parent, string $name, string $value = ''): DOMElement
@@ -34,9 +43,25 @@ function mihomoChild(DOMDocument $doc, DOMElement $parent, string $name, string 
     return $node;
 }
 
-function mihomoForwardZone(bool $enabled, bool $fallback): bool
+function mihomoForwardZone(bool $enabled, bool $fallback, bool $validating = false): bool
 {
     $path = mihomoForwardFile();
+    $changed = false;
+    /* The name this file used to carry never won the root zone, so a leftover
+       copy is dead weight at best and a second root zone at worst. */
+    $legacy = mihomoForwardLegacyFile();
+    if (file_exists($legacy) && unlink($legacy)) {
+        $changed = true;
+    }
+    /* A validating resolver cannot accept what Mihomo answers: fake-ip records
+       carry no signature, so every signed zone fails validation. Telling
+       Unbound to skip validation for the root is the one thing that would make
+       it work and is exactly the configuration that stops the resolver
+       starting, so the forward zone is simply not written while validation is
+       on. Domain based routing still comes from the sniffer. */
+    if ($validating) {
+        $enabled = false;
+    }
     /* The forward zone is a file rather than an entry in the operator's Unbound
        configuration. An entry carrying the root as its domain makes OPNsense
        generate domain-insecure: "." alongside it -- a negative trust anchor for
@@ -45,7 +70,7 @@ function mihomoForwardZone(bool $enabled, bool $fallback): bool
        initialise, and the resolver does not start at all. */
     if (!$enabled) {
         if (!file_exists($path)) {
-            return false;
+            return $changed;
         }
         if (!unlink($path)) {
             throw new RuntimeException('Unable to remove the Mihomo forward zone.');
@@ -60,7 +85,7 @@ function mihomoForwardZone(bool $enabled, bool $fallback): bool
     }
     $body = implode("\n", $lines) . "\n";
     if (@file_get_contents($path) === $body) {
-        return false;
+        return $changed;
     }
     if (!is_dir(dirname($path)) && !mkdir(dirname($path), 0755, true)) {
         throw new RuntimeException('The Unbound drop-in directory is missing.');
@@ -303,7 +328,8 @@ try {
             if ($forwarder instanceof DOMElement) {
                 $dots->removeChild($forwarder);
             }
-            $zoneChanged = mihomoForwardZone(true, $fallback);
+            $validating = trim($xpath->evaluate('string(./general/dnssec)', $unbound)) === '1';
+            $zoneChanged = mihomoForwardZone(true, $fallback, $validating);
         } else {
             if ($forwarder instanceof DOMElement) {
                 $dots->removeChild($forwarder);

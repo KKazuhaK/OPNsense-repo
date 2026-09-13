@@ -131,11 +131,21 @@ passed('Explicit activation creates the actual TUN and owned DNS/interface/firew
 # domain-insecure: "." beside it -- a negative trust anchor for a zone that
 # already has one from auto-trust-anchor-file -- and Unbound then reports the
 # anchor for '.' presented twice and refuses to start at all.
-zone = Path('/usr/local/etc/unbound.opnsense.d/00-mihomo.conf')
-assert zone.exists(), 'the forward zone drop-in must be written'
-assert '127.0.0.1@1053' in zone.read_text()
-assert sorted(p.name for p in zone.parent.glob('*.conf'))[0] == zone.name, \
-    'Unbound keeps the first forward zone it reads for a name, so ours must sort first'
+zone = Path('/usr/local/etc/unbound.opnsense.d/zz-mihomo.conf')
+validating = ET.parse('/conf/config.xml').findtext(
+    './OPNsense/unboundplus/general/dnssec') == '1'
+if validating:
+    # Mihomo answers fake-ip records, which carry no signature. Handing those
+    # to a validating resolver only works if the root is marked insecure, and
+    # that is the configuration that stops Unbound starting.
+    assert not zone.exists(), 'no forward zone belongs next to a validating resolver'
+else:
+    assert zone.exists(), 'the forward zone drop-in must be written'
+    assert '127.0.0.1@1053' in zone.read_text()
+    assert sorted(f.name for f in zone.parent.glob('*.conf'))[-1] == zone.name, \
+        'Unbound keeps the last forward zone it reads for a name, so ours must sort last'
+assert not (zone.parent / '00-mihomo.conf').exists(), \
+    'the legacy name never won the root zone and must not be left behind'
 assert ET.parse('/conf/config.xml').find(
     './OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]') is None, \
     'the plugin must own no entry in the operator Unbound configuration'

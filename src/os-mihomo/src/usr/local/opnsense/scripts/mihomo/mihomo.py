@@ -403,6 +403,22 @@ def adopt_switches(rendered, settings):
     return settings
 
 
+def orphan_policy_keys(base, overlay):
+    """Merge YAML policy keys that match nothing the subscription states.
+
+    nameserver-policy is a mapping, so an overlay entry replaces a provider one
+    only when the key matches character for character. A provider that renames
+    its key, or a typo in ours, turns the override into a new entry beside the
+    one it was meant to replace: both stay in force, and nothing reports it.
+    """
+    def policy(mapping):
+        dns = mapping.get('dns') if isinstance(mapping.get('dns'), dict) else {}
+        value = dns.get('nameserver-policy') if isinstance(dns, dict) else None
+        return value if isinstance(value, dict) else {}
+    existing = policy(base)
+    return [key for key in policy(overlay) if key not in existing]
+
+
 def switch_overrides(overlay):
     """Switch keys a hand-written overlay still dictates after absorption."""
     probe = copy.deepcopy(overlay) if isinstance(overlay, dict) else {}
@@ -740,6 +756,7 @@ class Manager:
         self.source_file = self.state / "subscription.yaml"
         self.config_file = self.state / "config.yaml"
         self.merge_file = self.state / 'merge.yaml'
+        self.warnings_file = self.state / 'warnings.json'
         self.status_file = self.path("/var/run/mihomo-status.json")
 
     def path(self, path):
@@ -926,6 +943,13 @@ class Manager:
                 and (node.findtext('enabled') == '1' or snapshot.get('roots', {}).get(node.get('uuid')) == '1'))
         return upstreams, advertises_ipv6(config)
 
+    def record_warnings(self, data, overlay=None):
+        """Publish what the applied configuration silently did not do."""
+        if overlay is None:
+            overlay = parse_yaml(self.merge_file.read_bytes()) if self.merge_file.exists() else {}
+        orphans = orphan_policy_keys(merge_yaml(baseline(data), data), overlay)
+        atomic_write(self.warnings_file, json.dumps({'policy_orphans': orphans}).encode(), 0o644)
+
     def candidate(self, data, settings, overlay=None):
         upstreams, ipv6 = self.router_context(settings)
         content = render(data, settings, overlay=overlay if overlay is not None else parse_yaml(self.merge_file.read_bytes()), upstreams=upstreams, ipv6_advertised=ipv6)
@@ -964,6 +988,7 @@ class Manager:
             atomic_write(self.config_file, candidate.read_bytes())
         finally:
             candidate.unlink(missing_ok=True)
+        self.record_warnings(data)
         tun = bool(generated.get('tun', {}).get('enable'))
         dns_active = bool(tun and generated.get('dns', {}).get('enable') and generated['dns'].get('listen') == '127.0.0.1:1053' and not settings.get('router_dns'))
         self.system.dns(False, settings)
@@ -1012,6 +1037,7 @@ class Manager:
                 self.write_settings(settings)
                 if overlay is not None:
                     atomic_write(self.merge_file, yaml.safe_dump(overlay, sort_keys=False, allow_unicode=True).encode())
+                self.record_warnings(data, overlay)
                 if running:
                     self.start(settings)
                 else:

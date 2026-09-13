@@ -80,6 +80,15 @@ function mihomo_effective_dns(): array
     return $wanted;
 }
 
+function mihomo_policy_orphans(): array
+{
+    /* Per-domain overrides that matched no provider entry, so they were added
+       beside the entry they were meant to replace instead of replacing it. */
+    $raw = @file_get_contents('/var/db/os-mihomo/warnings.json');
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    return is_array($data) && is_array($data['policy_orphans'] ?? null) ? $data['policy_orphans'] : [];
+}
+
 function mihomo_override_badge(array $overrides, string $key): string
 {
     /* The merge YAML states this key by hand, so the switch beside it is inert. */

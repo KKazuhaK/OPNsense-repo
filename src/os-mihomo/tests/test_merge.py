@@ -479,3 +479,36 @@ class FakeIpRange6Tests(unittest.TestCase):
 
     def test_other_dns_modes_need_no_pool(self):
         self.assertNotIn('fake-ip-range6', self.generated(ipv6=True, dns_mode='normal')['dns'])
+
+
+class OrphanPolicyTests(unittest.TestCase):
+    """An override that lands on no provider key is reported, not silently added."""
+
+    def test_a_matching_key_is_not_an_orphan(self):
+        base = {'dns': {'nameserver-policy': {'geosite:cn': ['1.1.1.1'], 'geosite:private': ['system']}}}
+        overlay = {'dns': {'nameserver-policy': {'geosite:cn': ['tls://dot.test']}}}
+        self.assertEqual([], m.orphan_policy_keys(base, overlay))
+
+    def test_a_renamed_provider_key_leaves_the_override_dangling(self):
+        base = {'dns': {'nameserver-policy': {'geosite:cn,steam@cn': ['1.1.1.1']}}}
+        overlay = {'dns': {'nameserver-policy': {'geosite:cn': ['tls://dot.test']}}}
+        self.assertEqual(['geosite:cn'], m.orphan_policy_keys(base, overlay))
+
+    def test_a_typo_is_caught_the_same_way(self):
+        base = {'dns': {'nameserver-policy': {'geosite:geolocation-!cn': ['1.1.1.1']}}}
+        overlay = {'dns': {'nameserver-policy': {'geosite:geolocation!cn': ['tls://dot.test']}}}
+        self.assertEqual(['geosite:geolocation!cn'], m.orphan_policy_keys(base, overlay))
+
+    def test_absent_or_malformed_sections_report_nothing(self):
+        for base, overlay in (({}, {}), ({'dns': 'x'}, {'dns': {'nameserver-policy': 'y'}}),
+                              ({'dns': {}}, {'dns': {}}), ({'dns': {'nameserver-policy': {}}}, {})):
+            self.assertEqual([], m.orphan_policy_keys(base, overlay))
+
+    def test_a_subscription_without_dns_is_compared_against_the_baseline(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data.pop('dns')
+        base = m.merge_yaml(m.baseline(data), data)
+        # The baseline supplies geosite:private, so overriding it is not an orphan.
+        self.assertEqual([], m.orphan_policy_keys(base, {'dns': {'nameserver-policy': {'geosite:private': ['system']}}}))
+        self.assertEqual(['geosite:nowhere'],
+                         m.orphan_policy_keys(base, {'dns': {'nameserver-policy': {'geosite:nowhere': ['1.1.1.1']}}}))

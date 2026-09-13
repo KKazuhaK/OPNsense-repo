@@ -80,6 +80,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $settings = mihomo_settings();
 $overrides = mihomo_overrides();
 $effective = mihomo_effective_dns();
+$orphans = mihomo_policy_orphans();
 include('head.inc');
 include('fbegin.inc');
 ?>
@@ -189,6 +190,21 @@ include('fbegin.inc');
               </div>
             </td>
           </tr>
+          <?php if (!empty($orphans)): ?>
+          <tr>
+            <td><i class="fa fa-exclamation-triangle text-warning"></i> <?=gettext('Unmatched DNS policy')?></td>
+            <td>
+              <div class="alert alert-warning" style="margin-bottom:0">
+                <?=gettext('These per-domain rules in the merge YAML match no entry the subscription states, so each was added beside the one it was meant to replace rather than replacing it. Both stay in force. Either the subscription renamed its key or this one is misspelled:')?>
+                <ul style="margin:6px 0 0 0">
+                  <?php foreach ($orphans as $orphan): ?>
+                    <li><code><?=mihomo_escape($orphan)?></code></li>
+                  <?php endforeach; ?>
+                </ul>
+              </div>
+            </td>
+          </tr>
+          <?php endif; ?>
           <tr>
             <td><a id="help_for_dns_default" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Bootstrap servers')?></td>
             <td>

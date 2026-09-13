@@ -91,6 +91,30 @@ def check_manifest_shape(package, manifest):
         raise ValueError('Catalog manifest does not carry the package identity.')
 
 
+ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
+
+
+def python_members(package):
+    """What Python's own tar reader sees in the archive.
+
+    tarfile learned zstd in 3.14 and the signing host runs 3.13, while tzst is
+    what libpkg writes unless a build asks for something else. Decompressing
+    with the base system's zstd keeps this reader independent of libarchive,
+    which is the whole point of consulting it: the container format is not what
+    the comparison is about, the member list is.
+    """
+    try:
+        with tarfile.open(package) as archive:
+            return archive.getmembers()
+    except tarfile.ReadError:
+        with open(package, 'rb') as stream:
+            if stream.read(len(ZSTD_MAGIC)) != ZSTD_MAGIC:
+                raise
+    plain = subprocess.run(['zstd', '-dc', '--', str(package)], check=True, stdout=subprocess.PIPE).stdout
+    with tarfile.open(fileobj=io.BytesIO(plain)) as archive:
+        return archive.getmembers()
+
+
 def archive_members(package):
     """Read the archive twice and refuse anything but plain files.
 
@@ -101,8 +125,7 @@ def archive_members(package):
     committed source has no way to ask for.
     """
     listed = subprocess.check_output(['tar', '-tf', str(package)], text=True).splitlines()
-    with tarfile.open(package) as archive:
-        items = archive.getmembers()
+    items = python_members(package)
     if [item.name for item in items] != listed:
         raise ValueError('Package archive does not read the same way twice.')
     paths = {}

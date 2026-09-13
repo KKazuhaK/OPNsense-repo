@@ -5,10 +5,18 @@
 const FORWARD_UUID = 'b126bf65-a985-49ca-a9d2-16f156aac198';
 const RULE_UUID = '5a73c3dc-69b1-4e15-89cb-b542aa2c1154';
 const FAKE_IP_CIDR = '198.18.0.0/15';
-/* Unbound's drop-in directory: OPNsense copies every .conf here into the
-   chroot on reconfigure, and reads them in name order, so a name sorting ahead
-   of the generated dot.conf wins the root zone. */
-const FORWARD_FILE = '/usr/local/etc/unbound.opnsense.d/00-mihomo.conf';
+/* Unbound's drop-in directory: OPNsense copies every .conf placed here into
+   the chroot on reconfigure. */
+const FORWARD_PATH = '/usr/local/etc/unbound.opnsense.d/00-mihomo.conf';
+
+function mihomoForwardFile(): string
+{
+    /* Rooted like every other path this helper writes. Without it the test
+       harness, which points OS_MIHOMO_ROOT at a temporary directory, would
+       still create and delete the real forward zone on the machine running
+       the tests -- and on a router that is the file the resolver reads. */
+    return rtrim(getenv('OS_MIHOMO_ROOT') ?: '', '/') . FORWARD_PATH;
+}
 
 function mihomoChild(DOMDocument $doc, DOMElement $parent, string $name, string $value = ''): DOMElement
 {
@@ -28,6 +36,7 @@ function mihomoChild(DOMDocument $doc, DOMElement $parent, string $name, string 
 
 function mihomoForwardZone(bool $enabled, bool $fallback): bool
 {
+    $path = mihomoForwardFile();
     /* The forward zone is a file rather than an entry in the operator's Unbound
        configuration. An entry carrying the root as its domain makes OPNsense
        generate domain-insecure: "." alongside it -- a negative trust anchor for
@@ -35,10 +44,10 @@ function mihomoForwardZone(bool $enabled, bool $fallback): bool
        finds the anchor for '.' presented twice, the validator fails to
        initialise, and the resolver does not start at all. */
     if (!$enabled) {
-        if (!file_exists(FORWARD_FILE)) {
+        if (!file_exists($path)) {
             return false;
         }
-        if (!unlink(FORWARD_FILE)) {
+        if (!unlink($path)) {
             throw new RuntimeException('Unable to remove the Mihomo forward zone.');
         }
         return true;
@@ -50,15 +59,15 @@ function mihomoForwardZone(bool $enabled, bool $fallback): bool
         $lines[] = '  forward-first: yes';
     }
     $body = implode("\n", $lines) . "\n";
-    if (@file_get_contents(FORWARD_FILE) === $body) {
+    if (@file_get_contents($path) === $body) {
         return false;
     }
-    if (!is_dir(dirname(FORWARD_FILE)) && !mkdir(dirname(FORWARD_FILE), 0755, true)) {
+    if (!is_dir(dirname($path)) && !mkdir(dirname($path), 0755, true)) {
         throw new RuntimeException('The Unbound drop-in directory is missing.');
     }
-    $temporary = tempnam(dirname(FORWARD_FILE), '.mihomo-zone-');
+    $temporary = tempnam(dirname($path), '.mihomo-zone-');
     if ($temporary === false || file_put_contents($temporary, $body) === false
-        || !chmod($temporary, 0644) || !rename($temporary, FORWARD_FILE)) {
+        || !chmod($temporary, 0644) || !rename($temporary, $path)) {
         if ($temporary !== false) {
             @unlink($temporary);
         }

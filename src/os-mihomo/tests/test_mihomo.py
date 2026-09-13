@@ -428,19 +428,26 @@ class IntegrationHelperTests(unittest.TestCase):
         return subprocess.run([self.php, str(SCRIPT.with_name('setup_unbound.php')), action, fallback],
                               env=dict(os.environ, OS_MIHOMO_ROOT=str(self.root)), capture_output=True, text=True)
 
-    def test_enable_disable_remove_restores_owner_dot_and_only_removes_owned_interface(self):
+    def test_enable_disable_remove_leaves_owner_dots_alone_and_only_removes_owned_interface(self):
         import xml.etree.ElementTree as ET
         self.assertEqual(0, self.helper('enable').returncode)
         root = ET.parse(self.config).getroot()
-        self.assertEqual('0', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled'))
+        # The operator's own upstreams are not ours to switch off, and the
+        # plugin no longer owns an entry here at all: an entry naming the root
+        # as its domain makes OPNsense generate domain-insecure: "." beside it,
+        # which stops the resolver starting. The forward zone is a drop-in file.
+        self.assertEqual('1', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled'))
         self.assertEqual('1', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="private-dot"]/enabled'))
-        own = root.find('./OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]')
-        self.assertEqual('1', own.findtext('forward_first'))
+        self.assertIsNone(root.find('./OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]'))
+        zone = self.root / 'usr/local/etc/unbound.opnsense.d/00-mihomo.conf'
+        self.assertTrue(zone.exists(), 'the forward zone must be written under the test root')
+        self.assertIn('127.0.0.1@1053', zone.read_text())
         self.assertEqual(0, self.helper('enable').returncode)
         root = ET.parse(self.config).getroot()
         self.assertEqual(1, len(root.findall('./filter/rule')))
         self.assertEqual(0, self.helper('disable').returncode)
         self.assertEqual('1', ET.parse(self.config).getroot().findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled'))
+        self.assertFalse(zone.exists(), 'a forward zone left behind points at a core that is gone')
         self.assertEqual(0, self.helper('remove').returncode)
         self.assertEqual(self.original, self.xml())
         self.assertEqual('OWNER DNS OVER TLS CONFIGURATION', self.dot.read_text())

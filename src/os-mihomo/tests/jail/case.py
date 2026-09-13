@@ -139,7 +139,8 @@ assert sorted(p.name for p in zone.parent.glob('*.conf'))[0] == zone.name, \
 assert ET.parse('/conf/config.xml').find(
     './OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]') is None, \
     'the plugin must own no entry in the operator Unbound configuration'
-assert 'domain-insecure: "."' not in Path('/var/unbound/private_domains.conf').read_text()
+insecure = Path('/var/unbound/private_domains.conf')
+assert 'domain-insecure: "."' not in (insecure.read_text() if insecure.exists() else '')
 passed('Transparent DNS adds no trust anchor for the root of its own')
 route = command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
 assert b'tun_mihomo' in route, route

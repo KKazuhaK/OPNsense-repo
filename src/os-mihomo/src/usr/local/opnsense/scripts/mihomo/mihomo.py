@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from xml.etree import ElementTree
 import time
 
 import yaml
@@ -212,6 +213,140 @@ def device_networks(entries):
     if len(networks) > DEVICE_LIMIT:
         raise Error('At most %d device entries may be listed.' % DEVICE_LIMIT)
     return networks
+
+
+# Where each DHCP backend OPNsense can run keeps its reservations. A device
+# with one holds its address across leases, which is what makes an address
+# worth writing into a rule at all.
+RESERVATIONS = (('./dnsmasq/hosts', 'hwaddr', 'ip'),
+                ('./dhcpd/*/staticmap', 'mac', 'ipaddr'),
+                ('./OPNsense/Kea/dhcp4/reservations/reservation', 'hw_address', 'ip_address'))
+DHCP_LEASES = ('/var/db/dnsmasq.leases',)
+
+
+def randomised_mac(mac):
+    """Whether the address is locally administered rather than a real one.
+
+    Phones and laptops present a different address per network by default, and
+    rotate it. Such an address identifies nothing for long, so a reservation
+    made against it stops matching without warning.
+    """
+    try:
+        return bool(int(mac.split(':')[0], 16) & 0x02)
+    except (ValueError, AttributeError, IndexError):
+        return False
+
+
+def read_leases(root=Path('/')):
+    """Hostnames the DHCP server has handed out, keyed by address."""
+    found = {}
+    for name in DHCP_LEASES:
+        path = root / name.lstrip('/')
+        try:
+            text = path.read_text(errors='replace')
+        except OSError:
+            continue
+        for line in text.splitlines():
+            fields = line.split()
+            # <expiry> <mac> <address> <hostname> <client-id>; the file also
+            # carries a DUID line that parses as none of that.
+            if len(fields) < 4 or fields[1].count(':') != 5:
+                continue
+            try:
+                ipaddress.ip_address(fields[2])
+            except ValueError:
+                continue
+            found[fields[2]] = {'mac': fields[1].lower(),
+                                'hostname': '' if fields[3] == '*' else fields[3]}
+    return found
+
+
+def read_reservations(root=Path('/')):
+    """Addresses pinned to a device, whichever DHCP server is in use."""
+    pinned = set()
+    try:
+        tree = ElementTree.parse(str(root / 'conf/config.xml'))
+    except (OSError, ElementTree.ParseError):
+        return pinned
+    for path, _, address in RESERVATIONS:
+        for node in tree.getroot().findall(path):
+            value = (node.findtext(address) or '').strip()
+            if value:
+                pinned.add(value)
+    return pinned
+
+
+def uplink_interface(run):
+    """The interface the default route leaves by, whose neighbours are not ours."""
+    result = run(['/sbin/route', '-n', 'get', 'default'], check=False)
+    if result.returncode != 0:
+        return ''
+    found = re.search(r'interface:\s*(\S+)', result.stdout.decode(errors='replace'))
+    return found.group(1) if found else ''
+
+
+def local_addresses(run):
+    """The router's own addresses, which are never a device to steer."""
+    result = run(['/sbin/ifconfig', '-a'], check=False)
+    if result.returncode != 0:
+        return set()
+    text = result.stdout.decode(errors='replace')
+    return set(re.findall(r'\binet6?\s+([0-9a-fA-F.:]+)', text))
+
+
+def read_neighbours(run):
+    """Devices the router has spoken to on a link of its own.
+
+    Neighbours on the uplink are the ISP's, not the household's, and a
+    link-local address names an interface rather than a device: neither can
+    stand in a rule, and offering them would only invite a policy that matches
+    nothing or the wrong thing.
+    """
+    skip = uplink_interface(run)
+    found = {}
+    for args, pattern in ((['/usr/sbin/arp', '-an'],
+                           r'\((\S+?)\) at ([0-9a-fA-F:]{17}) on (\S+)'),
+                          (['/usr/sbin/ndp', '-an'],
+                           r'^(\S+?)\s+([0-9a-fA-F:]{17})\s+(\S+)')):
+        result = run(args, check=False)
+        if result.returncode != 0:
+            continue
+        for address, mac, interface in re.findall(pattern, result.stdout.decode(errors='replace'), re.M):
+            if interface == skip or '%' in address:
+                continue
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if parsed.is_link_local or parsed.is_loopback or parsed.is_multicast:
+                continue
+            found.setdefault(address, mac.lower())
+    return found
+
+
+def known_devices(run, root=Path('/')):
+    """What the router knows about the devices on it, for the policy picker.
+
+    Only the address ever reaches a rule: Mihomo matches source addresses, and
+    by the time a packet reaches it the link-layer address is long gone. The
+    hardware address is carried here so a device can be recognised, and so the
+    two ways an address stops identifying it can be pointed out.
+    """
+    leases = read_leases(root)
+    reserved = read_reservations(root)
+    neighbours = read_neighbours(run)
+    ours = local_addresses(run)
+    devices = []
+    for address in (set(leases) | set(neighbours)) - ours:
+        lease = leases.get(address, {})
+        mac = lease.get('mac') or neighbours.get(address, '')
+        devices.append({'address': address, 'mac': mac,
+                        'hostname': lease.get('hostname', ''),
+                        'reserved': address in reserved,
+                        'randomised_mac': randomised_mac(mac)})
+    devices.sort(key=lambda d: (ipaddress.ip_address(d['address']).version,
+                                ipaddress.ip_address(d['address'])))
+    return devices
 
 
 def device_rules(settings):
@@ -1389,6 +1524,9 @@ class Manager:
             return {"cleared": True}
         if action == "init":
             return self.initialize(argument == "upgrade")
+        if action == 'devices':
+            return {'devices': known_devices(self.system.run, self.root),
+                    'rules': device_rules(self.settings())}
         if action == "queue-update":
             return self.queue_update()
         if action == "sub-update":

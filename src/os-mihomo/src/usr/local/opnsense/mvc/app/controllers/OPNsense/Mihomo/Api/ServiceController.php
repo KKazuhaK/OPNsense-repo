@@ -91,6 +91,18 @@ class ServiceController extends ApiControllerBase
         return is_array($state) ? $state : [];
     }
 
+    public function devicesAction(): array
+    {
+        /* Read only, and a read the page makes on every load, so it stays a
+           GET like the other status endpoints rather than joining PLAIN. */
+        $answer = $this->run('devices');
+        $found = ($answer['status'] ?? '') === 'ok' && is_array($answer['result'] ?? null)
+            ? $answer['result'] : [];
+        /* Flattened, because a page that cannot list devices still has to draw
+           the rest of the tab rather than render an error in place of it. */
+        return ['devices' => $found['devices'] ?? [], 'rules' => $found['rules'] ?? []];
+    }
+
     public function logAction(): array
     {
         return ['log' => $this->tail('/var/log/mihomo.log')];

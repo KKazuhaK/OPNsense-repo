@@ -48,7 +48,8 @@ $(function () {
         status: '/api/mihomo/service/status',
         update: '/api/mihomo/service/updateStatus',
         log: '/api/mihomo/service/log',
-        subLog: '/api/mihomo/service/subLog'
+        subLog: '/api/mihomo/service/subLog',
+        devices: '/api/mihomo/service/devices'
     };
 
     function report(state, text) {
@@ -146,6 +147,67 @@ $(function () {
         });
     }
 
+    /* The list below is what gets stored; the table is a way of editing it.
+       Keeping one source of truth means the hand-written entries, the ones for
+       devices that are switched off, cannot be lost by using the picker. */
+    function listed() {
+        return $('#device_list').val().split('\n').map(function (line) { return line.trim(); })
+                 .filter(function (line) { return line !== ''; });
+    }
+
+    function setListed(entries) {
+        $('#device_list').val(entries.join('\n'));
+    }
+
+    function renderDevices(found) {
+        const chosen = listed();
+        const rows = $('#mihomo-device-rows').empty();
+        (found.devices || []).forEach(function (device) {
+            const box = $('<input type="checkbox">').val(device.address)
+                .prop('checked', chosen.indexOf(device.address) !== -1);
+            const flags = $('<td>');
+            if (device.randomised_mac) {
+                flags.append($('<span class="label label-warning">')
+                    .text('{{ lang._('Rotating hardware address') }}')
+                    .attr('title', '{{ lang._('This device presents a different hardware address per network and changes it over time, so even a reservation cannot hold its address. Turn off the private address for this network on the device first.') }}'));
+            }
+            if (!device.reserved) {
+                flags.append(' ').append($('<span class="label label-default">')
+                    .text('{{ lang._('No DHCP reservation') }}')
+                    .attr('title', '{{ lang._('Its address comes from the pool, so it can change and this rule would then apply to whatever took the address. Give it a reservation to make the address its identity.') }}'));
+            }
+            rows.append($('<tr>')
+                .append($('<td>').append(box))
+                .append($('<td>').text(device.hostname || '{{ lang._('unnamed') }}'))
+                .append($('<td><code></code></td>').find('code').text(device.address).end())
+                .append($('<td>').append($('<small class="text-muted">').text(device.mac || '')))
+                .append(flags));
+        });
+        $('#mihomo-device-empty').toggle(!(found.devices || []).length);
+        const rules = found.rules || [];
+        $('#mihomo-device-rules').text(rules.length ? rules.join('\n')
+            : '{{ lang._('Saved settings produce no device rules.') }}');
+    }
+
+    function loadDevices() {
+        get(api.devices, renderDevices);
+    }
+
+    $('#mihomo-device-rows').on('change', 'input[type=checkbox]', function () {
+        const address = $(this).val();
+        const entries = listed().filter(function (entry) { return entry !== address; });
+        if ($(this).is(':checked')) { entries.push(address); }
+        setListed(entries);
+    });
+
+    $('#mihomo-refresh-devices').on('click', loadDevices);
+    $('#device_list').on('input', function () {
+        const chosen = listed();
+        $('#mihomo-device-rows input[type=checkbox]').each(function () {
+            $(this).prop('checked', chosen.indexOf($(this).val()) !== -1);
+        });
+    });
+
     function refresh() {
         get(api.status, function (state) {
             state = state || {};
@@ -177,6 +239,7 @@ $(function () {
             if (data.status === 'ok') {
                 report('success', done);
                 load();
+                loadDevices();
             } else {
                 report('danger', data.error || '{{ lang._('The operation failed. The log tab may say why.') }}');
             }
@@ -227,6 +290,7 @@ $(function () {
 
     load();
     refresh();
+    loadDevices();
     setInterval(refresh, 10000);
 });
 </script>
@@ -447,11 +511,44 @@ $(function () {
                     </td>
                 </tr>
                 <tr>
-                    <td><a id="help_for_devlist" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Devices') }}</td>
+                    <td><a id="help_for_devpick" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Devices on this network') }}</td>
+                    <td>
+                        <div class="table-responsive" style="max-height:280px;overflow:auto">
+                            <table class="table table-condensed table-hover" style="margin-bottom:0">
+                                <thead><tr>
+                                    <th style="width:34px"></th>
+                                    <th>{{ lang._('Device') }}</th>
+                                    <th>{{ lang._('Address') }}</th>
+                                    <th>{{ lang._('Hardware address') }}</th>
+                                    <th></th>
+                                </tr></thead>
+                                <tbody id="mihomo-device-rows"></tbody>
+                            </table>
+                        </div>
+                        <p class="text-muted" id="mihomo-device-empty" style="display:none;margin-top:6px">
+                            {{ lang._('Nothing has spoken to the router yet. Add addresses by hand below.') }}</p>
+                        <button type="button" class="btn btn-default btn-sm" id="mihomo-refresh-devices" style="margin-top:6px">
+                            <i class="fa fa-refresh"></i> {{ lang._('Refresh') }}</button>
+                        <div class="hidden" data-for="help_for_devpick">
+                            {{ lang._('Everything the router has a DHCP lease or a neighbour entry for, minus its own addresses and whatever is on the uplink. Ticking a device writes its address into the list below, because an address is the only thing a rule can match: by the time a packet reaches Mihomo the hardware address is gone. The hardware address is shown so the device can be recognised, and so the two ways its address can stop identifying it are visible.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_devlist" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Addresses and networks') }}</td>
                     <td>
                         <textarea id="device_list" rows="4" class="form-control" spellcheck="false" style="font-family:monospace;font-size:12px" placeholder="192.168.10.50&#10;192.168.20.0/24"></textarea>
                         <div class="hidden" data-for="help_for_devlist">
-                            {{ lang._('One address or network per line; a bare address means that host alone. Both IPv4 and IPv6 are accepted. An empty list leaves every device on the subscription rules whatever the mode says, so a half-finished list cannot cut the network off.') }}
+                            {{ lang._('One address or network per line; a bare address means that host alone. Both IPv4 and IPv6 are accepted. A device that is switched off has no entry above, so it is written here by hand. An empty list leaves every device on the subscription rules whatever the mode says, so a half-finished list cannot cut the network off.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_devrules" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Rules this produces') }}</td>
+                    <td>
+                        <pre id="mihomo-device-rules" class="mihomo-log" style="max-height:120px">{{ lang._('Saved settings produce no device rules.') }}</pre>
+                        <div class="hidden" data-for="help_for_devrules">
+                            {{ lang._('What the saved settings put in front of the subscription rules, generated by the same code that writes the configuration. Matching stops at the first rule that matches, so a whitelist cannot be written as a match on the listed devices; it is written as a match on everything else, which is why it reads inverted.') }}
                         </div>
                     </td>
                 </tr>

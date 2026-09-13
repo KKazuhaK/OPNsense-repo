@@ -330,6 +330,65 @@ class ControllerTests(unittest.TestCase):
             manager.check_settings(dict(self.settings, controller=m.ANY_CONTROLLER, secret=''))
 
 
+class DeviceDiscoveryTests(unittest.TestCase):
+    """What the picker offers, and what it must refuse to offer."""
+
+    ARP = (b'? (192.168.10.90) at d2:f3:58:35:50:e2 on vtnet0 expires in 1181 seconds [ethernet]\n'
+           b'? (192.168.10.39) at 28:c5:d2:d4:0c:4c on vtnet0 expires in 595 seconds [ethernet]\n'
+           b'? (50.98.231.1) at 20:e0:9c:03:e1:95 on vtnet1 expires in 900 seconds [ethernet]\n'
+           b'? (192.168.8.1) at bc:24:11:a2:3e:42 on vtnet0 permanent [ethernet]\n')
+    NDP = b'fe80::be24:11ff:fea2:3e42%vtnet0 bc:24:11:a2:3e:42 vtnet0 23h59m58s R\n'
+    IFCONFIG = b'vtnet0: flags=8843\n\tinet 192.168.8.1 netmask 0xffffff00\n'
+    ROUTE = b'   route to: default\n  interface: vtnet1\n'
+
+    def runner(self, args, **kwargs):
+        name = ' '.join(args)
+        payload = (self.ARP if 'arp' in name else self.NDP if 'ndp' in name
+                   else self.IFCONFIG if 'ifconfig' in name else self.ROUTE)
+        return subprocess.CompletedProcess(args, 0, payload, b'')
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'var/db').mkdir(parents=True)
+        (self.root / 'conf').mkdir()
+        (self.root / 'var/db/dnsmasq.leases').write_text(
+            '1789000000 d2:f3:58:35:50:e2 192.168.10.90 iPhone 01:d2:f3:58:35:50:e2\n'
+            '1789000000 28:c5:d2:d4:0c:4c 192.168.10.39 * *\n'
+            '00:01:00:01:32:37:be:ee:bc:24:11:a2:3e:42\n')
+        (self.root / 'conf/config.xml').write_text(
+            '<opnsense><dnsmasq><hosts><hwaddr>28:C5:D2:D4:0C:4C</hwaddr>'
+            '<ip>192.168.10.39</ip></hosts></dnsmasq></opnsense>')
+
+    def found(self):
+        return {d['address']: d for d in m.known_devices(self.runner, self.root)}
+
+    def test_only_devices_on_our_own_links_are_offered(self):
+        found = self.found()
+        # The uplink's neighbours are the ISP's, a link-local address names an
+        # interface rather than a device, and the router is not a device to steer.
+        self.assertEqual(['192.168.10.39', '192.168.10.90'], sorted(found))
+
+    def test_a_lease_names_the_device_and_a_reservation_pins_it(self):
+        found = self.found()
+        self.assertEqual('iPhone', found['192.168.10.90']['hostname'])
+        self.assertEqual('', found['192.168.10.39']['hostname'], 'the * placeholder is not a name')
+        self.assertIs(True, found['192.168.10.39']['reserved'])
+        self.assertIs(False, found['192.168.10.90']['reserved'])
+
+    def test_a_rotating_hardware_address_is_pointed_out(self):
+        # Phones present a different address per network and change it over
+        # time, so a rule written against whatever address it holds today is a
+        # rule that stops matching without saying so.
+        found = self.found()
+        self.assertIs(True, found['192.168.10.90']['randomised_mac'])
+        self.assertIs(False, found['192.168.10.39']['randomised_mac'])
+
+    def test_the_lease_file_survives_lines_that_are_not_leases(self):
+        self.assertEqual(2, len(m.read_leases(self.root)), 'the DUID line is not a lease')
+
+
 class ServiceSwitchTests(unittest.TestCase):
     """The proxy ports, LAN binding and TUN parameters as first-class settings."""
 

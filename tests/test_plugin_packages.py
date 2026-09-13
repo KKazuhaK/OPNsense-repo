@@ -356,6 +356,31 @@ class StagingRecordTests(SourceTree):
         with self.assertRaisesRegex(ValueError, 'installs no product version file'):
             verify.verify_source_package(build_package(self.dist, REPO, 'os-lang'), source, plugin='os-lang')
 
+    def test_product_metadata_must_be_the_json_opnsense_registers(self):
+        """Metadata OPNsense skips leaves the plugin out of the plugin list.
+
+        register.php json_decodes every file under /usr/local/opnsense/version and
+        ignores one that does not decode or has no product_id. The package still
+        installs; it is simply never registered, never reinstalled by a firmware
+        sync, and never shown in the web interface. os-speedtest shipped exactly
+        that for three releases, so this is pinned rather than assumed.
+        """
+        for plugin, record in sorted(verify.plugin_records(REPO).items()):
+            if record['staging'] == 'unsupported':
+                continue
+            with self.subTest(plugin=plugin):
+                self.assertEqual('json', record['version_file']['format'])
+                staged = staged_files(REPO, plugin, build_version(plugin))
+                metadata = json.loads(staged[record['version_file']['path']])
+                self.assertEqual(plugin, metadata['product_id'])
+                self.assertEqual(build_version(plugin), metadata['product_version'])
+        # And the format is not a free-text field the next record can widen.
+        record = self.record('os-lang')
+        record['version_file'] = dict(record['version_file'], format='text')
+        source = self.source({'os-lang': record})
+        with self.assertRaisesRegex(ValueError, 'Unsupported product version format'):
+            verify.verify_source_package(build_package(self.dist, REPO, 'os-lang'), source, plugin='os-lang')
+
     def test_an_abi_independent_package_may_not_ship_a_native_binary(self):
         record = self.record('os-easytier')
         record['abi'] = 'independent'

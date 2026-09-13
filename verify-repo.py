@@ -401,22 +401,33 @@ def record_files(root, record, manifest, plugin):
 
 
 def check_version_file(expected, record, manifest, plugin):
-    """The product metadata a package installs must describe the package."""
+    """The product metadata a package installs must describe the package.
+
+    It must also be the JSON object OPNsense reads. register.php json_decodes
+    every file under /usr/local/opnsense/version and skips any that does not
+    decode or carries no product_id, printing "Ignoring invalid metadata" and
+    leaving the plugin out of the configuration's plugin list for good: it is
+    then never reinstalled by a firmware sync and never offered in the web
+    interface. A package that ships anything else installs and then quietly does
+    not exist, so json is the only format this accepts.
+    """
     item = record.get('version_file')
     if not isinstance(item, dict) or set(item) != {'path', 'format'}:
         raise ValueError('The staging record names no product version file.')
     content = expected.get(install_path(item['path']))
     if content is None:
         raise ValueError('The package installs no product version file: ' + item['path'])
-    if item['format'] == 'json':
-        value = json.loads(content)
-        if value.get('product_version') != manifest['version'] or value.get('product_id') != plugin:
-            raise ValueError('Product version metadata differs from the package: ' + item['path'])
-    elif item['format'] == 'text':
-        if content.decode().strip() != manifest['version']:
-            raise ValueError('Product version metadata differs from the package: ' + item['path'])
-    else:
+    if item['format'] != 'json':
         raise ValueError('Unsupported product version format: ' + str(item['format']))
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise ValueError('Product version metadata is not the JSON OPNsense registers: '
+                         + item['path']) from error
+    if not isinstance(value, dict):
+        raise ValueError('Product version metadata is not the JSON OPNsense registers: ' + item['path'])
+    if value.get('product_version') != manifest['version'] or value.get('product_id') != plugin:
+        raise ValueError('Product version metadata differs from the package: ' + item['path'])
 
 
 def repository_files(expected, manifest, record):

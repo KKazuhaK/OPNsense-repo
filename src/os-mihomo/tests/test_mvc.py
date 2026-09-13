@@ -152,6 +152,19 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(1, len(set(depths)),
                          'panes sit at differing depths: %s' % depths)
 
+    def test_every_tab_can_show_its_help(self):
+        # The framework scopes the whole-page toggle to the nearest ancestor
+        # form whose id starts with frm. With no such form it toggles nothing,
+        # silently, and a toggle rendered on one tab reaches no other.
+        view = VIEW.read_text()
+        panes = re.findall(r'<div id="([a-z]+)" class="tab-pane', view)
+        for pane in panes:
+            self.assertIn('<form id="frm%s">' % pane, view, pane)
+            self.assertIn('id="show_all_help_%s"' % pane, view, pane)
+        self.assertEqual(len(panes), view.count('</form>'))
+        # They post nowhere, so Enter in a field must not reload the page.
+        self.assertIn("$('form[id^=\"frm\"]').on('submit'", view)
+
     def test_ids_are_unique(self):
         ids = re.findall(r'id="([^"{]+)"', VIEW.read_text())
         self.assertEqual([], sorted({i for i in ids if ids.count(i) > 1}))

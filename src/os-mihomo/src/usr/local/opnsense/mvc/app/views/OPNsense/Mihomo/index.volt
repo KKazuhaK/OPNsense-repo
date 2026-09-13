@@ -375,6 +375,11 @@ $(function () {
         call(api.preset, {preset: $('#preset').val()}, '{{ lang._('Preset loaded and applied. It replaced the merge YAML.') }}', $(this));
     });
 
+    /* These forms exist only so the framework's whole-page help toggle can
+       find a scope; they post nowhere, and Enter in a field would otherwise
+       reload the page and lose what was typed. */
+    $('form[id^="frm"]').on('submit', function (event) { event.preventDefault(); });
+
     load();
     refresh();
     loadDevices();
@@ -397,12 +402,13 @@ $(function () {
 <div class="tab-content content-box">
 
     <div id="status" class="tab-pane fade in active">
+        <form id="frmstatus">
         <table class="table table-striped opnsense_standard_table_form">
             <thead>
                 <tr><td style="width:22%"><strong>{{ lang._('Service and transparent routing') }}</strong></td>
                     <td style="width:78%; text-align:right">
                         <small>{{ lang._('full help') }} </small>
-                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_page"></i>
+                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_status"></i>
                         &nbsp;&nbsp;
                     </td></tr>
             </thead>
@@ -443,11 +449,17 @@ $(function () {
                 </tr>
             </tbody>
         </table>
+        </form>
     </div>
 
     <div id="subscription" class="tab-pane fade in">
+        <form id="frmsubscription">
         <table class="table table-striped opnsense_standard_table_form">
-            <thead><tr><td style="width:22%"><strong>{{ lang._('Subscription') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Subscription') }}</strong></td><td style="width:78%; text-align:right">
+                        <small>{{ lang._('full help') }} </small>
+                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_subscription"></i>
+                        &nbsp;&nbsp;
+                    </td></tr></thead>
             <tbody>
                 <tr>
                     <td><a id="help_for_url" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Subscription URL') }}</td>
@@ -508,11 +520,17 @@ $(function () {
                 </td></tr>
             </tbody>
         </table>
+        </form>
     </div>
 
     <div id="routing" class="tab-pane fade in">
+        <form id="frmrouting">
         <table class="table table-striped opnsense_standard_table_form">
-            <thead><tr><td style="width:22%"><strong>{{ lang._('Local proxy') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Local proxy') }}</strong></td><td style="width:78%; text-align:right">
+                        <small>{{ lang._('full help') }} </small>
+                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_routing"></i>
+                        &nbsp;&nbsp;
+                    </td></tr></thead>
             <tbody>
                 <tr>
                     <td><a id="help_for_mixedport" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Mixed port') }}</td>
@@ -582,11 +600,17 @@ $(function () {
                 <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-tun">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
+        </form>
     </div>
 
     <div id="devices" class="tab-pane fade in">
+        <form id="frmdevices">
         <table class="table table-striped opnsense_standard_table_form">
-            <thead><tr><td style="width:22%"><strong>{{ lang._('Device policy') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Device policy') }}</strong></td><td style="width:78%; text-align:right">
+                        <small>{{ lang._('full help') }} </small>
+                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_devices"></i>
+                        &nbsp;&nbsp;
+                    </td></tr></thead>
             <tbody>
                 <tr>
                     <td><a id="help_for_devmode" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Mode') }}</td>
@@ -654,11 +678,17 @@ $(function () {
                 <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-devices">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
+        </form>
     </div>
 
     <div id="dns" class="tab-pane fade in">
+        <form id="frmdns">
         <table class="table table-striped opnsense_standard_table_form">
-            <thead><tr><td style="width:22%"><strong>{{ lang._('DNS policy') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <thead><tr><td style="width:22%"><strong>{{ lang._('DNS policy') }}</strong></td><td style="width:78%; text-align:right">
+                        <small>{{ lang._('full help') }} </small>
+                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_dns"></i>
+                        &nbsp;&nbsp;
+                    </td></tr></thead>
             <tbody>
                 <tr id="mihomo-orphans" style="display:none">
                     <td><i class="fa fa-exclamation-triangle text-warning"></i> {{ lang._('Unmatched DNS policy') }}</td>
@@ -757,11 +787,17 @@ $(function () {
                 <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-dns">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
+        </form>
     </div>
 
     <div id="advanced" class="tab-pane fade in">
+        <form id="frmadvanced">
         <table class="table table-striped opnsense_standard_table_form">
-            <thead><tr><td style="width:22%"><strong>{{ lang._('Local merge YAML') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Local merge YAML') }}</strong></td><td style="width:78%; text-align:right">
+                        <small>{{ lang._('full help') }} </small>
+                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_advanced"></i>
+                        &nbsp;&nbsp;
+                    </td></tr></thead>
             <tbody>
                 <tr>
                     <td><a id="help_for_merge" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Merge YAML') }}</td>
@@ -800,12 +836,18 @@ $(function () {
                 </tr>
             </tbody>
         </table>
+        </form>
     </div>
 
 
     <div id="log" class="tab-pane fade in">
+        <form id="frmlog">
         <table class="table table-striped opnsense_standard_table_form">
-            <thead><tr><td style="width:22%"><strong>{{ lang._('Log viewer') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Log viewer') }}</strong></td><td style="width:78%; text-align:right">
+                        <small>{{ lang._('full help') }} </small>
+                        <i class="fa fa-toggle-off text-danger" style="cursor:pointer" id="show_all_help_log"></i>
+                        &nbsp;&nbsp;
+                    </td></tr></thead>
             <tbody>
                 <tr><td></td><td>
                     <pre id="mihomo-log" class="mihomo-log"></pre>
@@ -813,6 +855,7 @@ $(function () {
                 </td></tr>
             </tbody>
         </table>
+        </form>
     </div>
 
 </div>

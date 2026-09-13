@@ -655,6 +655,14 @@ class ConfigctlContractTests(unittest.TestCase):
                           return_value=subprocess.CompletedProcess([], 0, b'ERR\n', b'')):
             system.run(['/usr/local/sbin/unbound-checkconf', '/dev/null'])
 
+    def test_the_resolver_is_validated_by_its_own_start_script(self):
+        # OPNsense pairs unbound-checkconf with the repair its failure calls
+        # for: a corrupt root.key is deleted and re-fetched. Running the check
+        # here copies it without the repair, against a trust anchor file the
+        # running resolver rewrites on its own schedule.
+        source = (Path(m.__file__)).read_text()
+        self.assertNotIn('unbound-checkconf', source.split('# unbound-checkconf')[0])
+
     def test_the_unbound_templates_are_reloaded_by_their_container(self):
         # The templates live in sub-containers; the bare name matches nothing,
         # generates no file, and answers ERR.
@@ -675,3 +683,141 @@ class ConfigctlContractTests(unittest.TestCase):
         reloads = [args for args in calls if 'template' in args]
         self.assertEqual(1, len(reloads), calls)
         self.assertEqual('OPNsense/Unbound/*', reloads[0][-1])
+
+
+class AnchorOrderingTests(unittest.TestCase):
+    """The anchor must be read before the restart that can destroy it."""
+
+    MANAGED = b'; autotrust trust anchor file\n;;id: . 1\n'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.anchor = root / 'root.key'
+        self.anchor.write_bytes(self.MANAGED)
+        (root / 'state').mkdir()
+        (root / 'dot.conf').write_text('forward-addr: 8.8.8.8@853\n')
+        for entry in (patch.object(m, 'ROOT_ANCHOR', str(self.anchor)),
+                      patch.object(m, 'STATE', str(root / 'state')),
+                      patch.object(m, 'UNBOUND_GENERATED', str(root / 'dot.conf')),
+                      patch.object(m.os, 'chown')):
+            entry.start()
+            self.addCleanup(entry.stop)
+        self.system = m.System()
+
+    def test_the_anchor_read_precedes_the_restart(self):
+        # The start script deletes root.key whenever it cannot check the
+        # configuration, so a snapshot taken afterwards captures the damage
+        # rather than the file worth restoring.
+        seen = []
+
+        def record(args, **kwargs):
+            name = ' '.join(str(part) for part in args)
+            if 'unbound' in name and 'restart' in name:
+                seen.append(('restart', self.anchor.exists()))
+                if len([step for step, _ in seen if step == 'restart']) == 1:
+                    # The changeover fails one restart, unbound-checkconf says
+                    # so, and the start script answers by replacing the anchor
+                    # with what unbound-anchor writes when it cannot resolve.
+                    self.anchor.write_bytes(b'. IN DS 20326 8 2 E06D\n. IN DS 38696 8 2 683D\n')
+            if args[0].endswith('pgrep'):
+                # The resolver comes up only with an anchor it can read.
+                return subprocess.CompletedProcess(
+                    args, 0 if self.anchor.read_bytes().startswith(b'; autotrust') else 1, b'', b'')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+
+        real = m.System.anchor_snapshot
+
+        def watched():
+            seen.append(('read', self.anchor.exists()))
+            return real()
+
+        with patch.object(m.System, 'anchor_snapshot', staticmethod(watched)):
+            with patch.object(self.system, 'run', side_effect=record):
+                self.system.dns(True, {'dns_fallback': True})
+        self.assertEqual(['read', 'restart'], [step for step, _ in seen][:2])
+        self.assertTrue(seen[1][1], 'the restart must still have had the anchor to destroy')
+        self.assertTrue(self.anchor.exists(), 'the destroyed anchor must be restored')
+
+
+class ResolverRepairTests(unittest.TestCase):
+    """A router whose resolver refused to start has no DNS at all."""
+
+    MANAGED = b'; autotrust trust anchor file\n;;id: . 1\n. 86400 IN DNSKEY 257 3 8 AwEAAaz\n'
+    # What unbound-anchor writes when it cannot reach a resolver: the root DS
+    # records in plain form, with no autotrust header. auto-trust-anchor-file
+    # reports the anchor for '.' presented twice and the validator never
+    # initialises, so this shape is a resolver that can no longer start.
+    DAMAGED = b'. IN DS 20326 8 2 E06D\n. IN DS 38696 8 2 683D\n'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.anchor = Path(self.temp.name) / 'root.key'
+        self.anchor.write_bytes(self.MANAGED)
+        entry = patch.object(m, 'ROOT_ANCHOR', str(self.anchor))
+        entry.start()
+        self.addCleanup(entry.stop)
+        chown = patch.object(m.os, 'chown')
+        chown.start()
+        self.addCleanup(chown.stop)
+        self.system = m.System()
+
+    def runner(self, alive):
+        """alive is consulted per pgrep call, so a repair can change the answer."""
+        self.calls = []
+
+        def run(args, **kwargs):
+            self.calls.append(args)
+            if args[0].endswith('pgrep'):
+                return subprocess.CompletedProcess(args, 0 if alive.pop(0) else 1, b'', b'')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+        return run
+
+    def test_a_running_resolver_is_left_alone(self):
+        with patch.object(self.system, 'run', side_effect=self.runner([True])):
+            self.system.repair_resolver(self.MANAGED)
+        self.assertEqual(self.MANAGED, self.anchor.read_bytes())
+        self.assertEqual(1, len(self.calls))
+
+    def test_a_dead_resolver_has_its_anchor_put_back_and_is_restarted(self):
+        # The restart is what damaged it: the start script deletes the anchor
+        # whenever it cannot check the configuration, and re-fetches it with
+        # nothing able to answer.
+        self.anchor.write_bytes(self.DAMAGED)
+        with patch.object(self.system, 'run', side_effect=self.runner([False, True])):
+            self.system.repair_resolver(self.MANAGED)
+        self.assertEqual(self.MANAGED, self.anchor.read_bytes())
+        self.assertIn(['/usr/local/sbin/configctl', 'unbound', 'restart'], self.calls)
+
+    def test_the_anchor_is_never_deleted(self):
+        # Deleting it is what turns a failed restart into a resolver that can
+        # never start: the re-fetch has no resolver to ask.
+        with patch.object(self.system, 'run', side_effect=self.runner([False, True])):
+            self.system.repair_resolver(self.MANAGED)
+        self.assertTrue(self.anchor.exists())
+
+    def test_a_resolver_that_stays_down_is_reported(self):
+        # Silence here would leave the operator with a working-looking page and
+        # a network that cannot resolve anything.
+        with patch.object(self.system, 'run', side_effect=self.runner([False, False])):
+            with self.assertRaises(m.Error):
+                self.system.repair_resolver(self.MANAGED)
+
+    def test_a_managed_anchor_is_worth_snapshotting(self):
+        self.assertEqual(self.MANAGED, self.system.anchor_snapshot())
+
+    def test_an_already_damaged_anchor_is_not_snapshotted(self):
+        # Putting this shape back would only reinstate the damage.
+        self.anchor.write_bytes(self.DAMAGED)
+        self.assertIsNone(self.system.anchor_snapshot())
+
+    def test_a_missing_anchor_is_not_snapshotted(self):
+        self.anchor.unlink()
+        self.assertIsNone(self.system.anchor_snapshot())
+
+    def test_a_dead_resolver_with_no_good_anchor_is_still_restarted(self):
+        with patch.object(self.system, 'run', side_effect=self.runner([False, True])):
+            self.system.repair_resolver(None)
+        self.assertIn(['/usr/local/sbin/configctl', 'unbound', 'restart'], self.calls)

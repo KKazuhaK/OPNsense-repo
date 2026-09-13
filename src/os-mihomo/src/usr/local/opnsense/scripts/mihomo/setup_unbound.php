@@ -235,12 +235,12 @@ try {
                 mihomoPersist($dnsStatePath, $snapshot);
             }
             $forwarding->nodeValue = '0';
-            foreach ($snapshot['roots'] as $uuid => $enabled) {
-                $node = $xpath->query('./dot[@uuid="' . $uuid . '"]', $dots)->item(0);
-                if ($node instanceof DOMElement) {
-                    mihomoChild($doc, $node, 'enabled', '0');
-                }
-            }
+            /* The operator's own root upstreams are left exactly as they are.
+               Unbound keeps the first forward zone it reads for a name and logs
+               the rest as duplicates, and the entry below is not served over
+               TLS, so the template writes it ahead of any DoT entry and queries
+               reach Mihomo either way. Disabling the operator's entries would
+               buy nothing and would edit configuration that is not ours. */
             $addresses = array_filter(array_map('trim', explode(',', $private->textContent)), static fn($v) => $v !== '' && $v !== FAKE_IP_CIDR);
             $private->nodeValue = implode(',', $addresses);
             if (!$forwarder instanceof DOMElement) {

@@ -7,6 +7,7 @@ import fcntl
 import ipaddress
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import secrets
@@ -23,6 +24,7 @@ import yaml
 MAX_CONFIG = 16 * 1024 * 1024
 UNBOUND_GENERATED = '/var/unbound/etc/dot.conf'
 FORWARDER = '127.0.0.1@1053'
+ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1
 SCRIPT = "/usr/local/opnsense/scripts/mihomo/mihomo.py"
 HELPER = "/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
@@ -682,6 +684,53 @@ class System:
         if self.run(["/sbin/ifconfig", "tun_mihomo"], check=False).returncode == 0:
             self.run(["/sbin/ifconfig", "tun_mihomo", "destroy"])
 
+    def resolver_running(self):
+        return self.run(["/usr/bin/pgrep", "-q", "-x", "unbound"], check=False).returncode == 0
+
+    @staticmethod
+    def anchor_snapshot():
+        """The DNSSEC root anchor as it stands, if it is one we could put back.
+
+        Only the managed format is worth keeping: a file Unbound wrote itself,
+        carrying the key states it maintains. Anything else is already the
+        damaged shape described in restore_anchor(), and restoring it would
+        only reinstate the damage.
+        """
+        try:
+            content = Path(ROOT_ANCHOR).read_bytes()
+        except OSError:
+            return None
+        return content if content.startswith(b"; autotrust") else None
+
+    @staticmethod
+    def restore_anchor(anchor):
+        """Put the operator's DNSSEC root anchor back after a failed restart.
+
+        OPNsense's Unbound start script treats a configuration it cannot check
+        as a damaged anchor: it deletes root.key and has unbound-anchor fetch a
+        new one. That fetch needs a working resolver, which during a DNS change
+        is the one thing missing, so unbound-anchor falls back to writing the
+        two root DS records in its plain format. auto-trust-anchor-file cannot
+        read that -- it reports the anchor for '.' presented twice, the
+        validator fails to initialise, and the resolver never starts again, so
+        a restart that merely failed becomes a router with no DNS at all.
+        Writing the original file back makes the failure a transient one.
+        """
+        atomic_write(Path(ROOT_ANCHOR), anchor, mode=0o644)
+        with contextlib.suppress(OSError, KeyError):
+            entry = pwd.getpwnam("unbound")
+            os.chown(ROOT_ANCHOR, entry.pw_uid, entry.pw_gid)
+
+    def repair_resolver(self, anchor):
+        """Bring the resolver back if it refused to start, and say why it did."""
+        if self.resolver_running():
+            return
+        if anchor is not None:
+            self.restore_anchor(anchor)
+        self.run(["/usr/local/sbin/configctl", "unbound", "restart"], timeout=90)
+        if not self.resolver_running():
+            raise Error("The resolver did not come back. No DNS change was left in place.")
+
     def forwarded(self):
         """Whether the file Unbound actually reads sends queries to Mihomo."""
         try:
@@ -706,13 +755,14 @@ class System:
         # nothing: it generates no file and answers ERR. Without the wildcard the
         # configuration Unbound is about to be checked against is never rewritten.
         self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound/*"], timeout=90)
-        # Unbound resolves python-script and similar settings relative to its own
-        # directory, so a check run from anywhere else rejects a working config.
-        # OPNsense's own start.sh changes into it for the same reason.
-        self.run(["/usr/local/sbin/unbound-checkconf", "/var/unbound/unbound.conf"],
-                 timeout=30, cwd="/var/unbound")
+        # Taken before the restart, because the restart is what can destroy it:
+        # OPNsense's start script re-fetches the root anchor whenever
+        # unbound-checkconf is unhappy, and a fetch made while DNS is being
+        # changed has nothing to ask. See restore_anchor().
+        anchor = self.anchor_snapshot()
         for args in (["unbound", "restart"], ["unbound", "cache", "flush"], ["filter", "reload"]):
             self.run(["/usr/local/sbin/configctl", *args], timeout=90)
+        self.repair_resolver(anchor)
         pending.unlink(missing_ok=True)
 
     def remove(self):

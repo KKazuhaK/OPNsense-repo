@@ -21,6 +21,8 @@ import time
 import yaml
 
 MAX_CONFIG = 16 * 1024 * 1024
+UNBOUND_GENERATED = '/var/unbound/etc/dot.conf'
+FORWARDER = '127.0.0.1@1053'
 STATE_SCHEMA = 1
 SCRIPT = "/usr/local/opnsense/scripts/mihomo/mihomo.py"
 HELPER = "/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
@@ -678,13 +680,24 @@ class System:
         if self.run(["/sbin/ifconfig", "tun_mihomo"], check=False).returncode == 0:
             self.run(["/sbin/ifconfig", "tun_mihomo", "destroy"])
 
+    def forwarded(self):
+        """Whether the file Unbound actually reads sends queries to Mihomo."""
+        try:
+            return FORWARDER in Path(UNBOUND_GENERATED).read_text()
+        except OSError:
+            return False
+
     def dns(self, enabled, settings):
         pending = Path(STATE) / "dns-reload-pending"
         was_pending = pending.exists()
         atomic_write(pending, b"pending\n")
         result = self.run(["/usr/local/bin/php", HELPER, "enable" if enabled else "disable",
                   "1" if settings["dns_fallback"] else "0"], timeout=90)
-        if b"unchanged" in result.stdout and not was_pending:
+        # "unchanged" reports that the configuration already said this. It says
+        # nothing about the file Unbound reads, which is generated from that
+        # configuration separately and can still describe the previous state --
+        # a stale one pointing at a stopped core leaves the network without DNS.
+        if b"unchanged" in result.stdout and not was_pending and self.forwarded() == enabled:
             pending.unlink(missing_ok=True)
             return
         self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound"], timeout=90)

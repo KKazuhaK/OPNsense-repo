@@ -578,3 +578,55 @@ class DevicePolicyTests(unittest.TestCase):
                 manager.check_settings(dict(base, device_mode='blacklist', device_list=bad))
         with self.assertRaises(m.Error):
             manager.check_settings(dict(base, device_mode='nonsense'))
+
+
+class StaleForwarderTests(unittest.TestCase):
+    """A generated file that still points at a stopped core must be rewritten."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.generated = Path(self.temp.name) / 'dot.conf'
+        self.system = m.System()
+        self.ran = []
+
+        def record(args, **kwargs):
+            self.ran.append(args)
+            stdout = b'Mihomo integration unchanged.' if args[0].endswith('php') else b''
+            return subprocess.CompletedProcess(args, 0, stdout, b'')
+
+        self.record = record
+        state = Path(self.temp.name) / 'state'
+        state.mkdir()
+        self.patches = [patch.object(m, 'UNBOUND_GENERATED', str(self.generated)),
+                        patch.object(m, 'STATE', str(state))]
+        for entry in self.patches:
+            entry.start()
+            self.addCleanup(entry.stop)
+
+    def reloaded(self):
+        return any('template' in [str(part) for part in args] for args in self.ran)
+
+    def test_an_agreeing_file_lets_an_unchanged_answer_skip_the_reload(self):
+        self.generated.write_text('forward-addr: 8.8.8.8@853\n')
+        with patch.object(self.system, 'run', side_effect=self.record):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertFalse(self.reloaded())
+
+    def test_a_stale_file_is_rewritten_even_when_the_answer_is_unchanged(self):
+        # This is the state that took DNS down twice: the configuration had
+        # already been reverted, so the helper reported nothing to do, while the
+        # file Unbound reads still forwarded to a core that was no longer there.
+        self.generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        with patch.object(self.system, 'run', side_effect=self.record):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+
+    def test_enabling_against_a_file_without_the_forwarder_also_reloads(self):
+        self.generated.write_text('forward-addr: 8.8.8.8@853\n')
+        with patch.object(self.system, 'run', side_effect=self.record):
+            self.system.dns(True, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+
+    def test_a_missing_file_counts_as_not_forwarding(self):
+        self.assertFalse(self.system.forwarded())

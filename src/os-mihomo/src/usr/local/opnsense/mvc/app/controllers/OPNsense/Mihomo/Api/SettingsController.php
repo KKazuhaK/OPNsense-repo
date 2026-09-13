@@ -118,9 +118,20 @@ class SettingsController extends ApiControllerBase
         return $this->backend($command, (string)$this->request->getPost($field, null, ''));
     }
 
-    private function backend(string $command, string $argument): array
+    private function backend(string $command, string $payload): array
     {
-        $raw = (new Backend())->configdpRun('mihomo ' . $command, [$argument]);
+        /* The backend reads its argument as a path, not as the value: a
+           subscription is megabytes and would not survive a command line. */
+        $staged = tempnam('/tmp', 'mihomo-api-');
+        if ($staged === false || file_put_contents($staged, $payload) === false) {
+            return ['status' => 'failed', 'error' => gettext('Unable to stage the configuration.')];
+        }
+        chmod($staged, 0600);
+        try {
+            $raw = (new Backend())->configdpRun('mihomo ' . $command, [$staged]);
+        } finally {
+            @unlink($staged);
+        }
         $decoded = json_decode((string)$raw, true);
         if (!is_array($decoded)) {
             return ['status' => 'failed', 'error' => gettext('The backend did not answer.')];

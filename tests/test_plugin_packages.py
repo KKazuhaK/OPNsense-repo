@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -182,6 +183,25 @@ class PluginPackageTests(SourceTree):
             with self.subTest(plugin=plugin):
                 package = build_package(self.dist, REPO, plugin)
                 verify.verify_source_package(package, REPO, plugin=plugin)
+
+    def test_a_zstd_compressed_package_is_read_the_same_way(self):
+        # tzst is what pkg create writes unless a build asks for tgz, and the
+        # signing host's Python cannot open one: os-mihomo, os-sing-box and
+        # os-kazuha-repo all arrive in that format.
+        if not shutil.which('zstd'):
+            self.skipTest('zstd is not installed')
+        package = build_package(self.dist, REPO, 'os-staticarp')
+        compressed = self.dist / 'staticarp-tzst.pkg'
+        compressed.write_bytes(subprocess.run(['zstd', '-cq', '--', str(package)],
+                                              check=True, stdout=subprocess.PIPE).stdout)
+        self.assertEqual(verify.ZSTD_MAGIC, compressed.read_bytes()[:4])
+        verify.verify_source_package(compressed, REPO, plugin='os-staticarp')
+        # And the fallback stays a decompressor, not a way to wave a broken
+        # archive through: anything that is neither tar nor zstd still fails.
+        broken = self.dist / 'staticarp-broken.pkg'
+        broken.write_bytes(b'not an archive at all')
+        with self.assertRaises(tarfile.ReadError):
+            verify.python_members(broken)
 
     def test_one_changed_byte_in_any_file_is_rejected(self):
         for plugin in ('os-staticarp', 'os-lang', 'os-frp'):

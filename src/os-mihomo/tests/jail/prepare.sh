@@ -56,7 +56,10 @@ copy_runtime_file()
             return 1
         }
     fi
-    [ -f "$copy_source" ] && [ ! -L "$copy_source" ] || { echo "Missing package-owned runtime file: $runtime_source" >&2; return 1; }
+    if [ ! -f "$copy_source" ] || [ -L "$copy_source" ]; then
+        echo "Missing package-owned runtime file: $runtime_source" >&2
+        return 1
+    fi
     mkdir -p "$jail_root$(dirname "$runtime_source")"
     cp -p -P "$runtime_source" "$jail_root$runtime_source"
 }

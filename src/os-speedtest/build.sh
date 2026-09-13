@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-speedtest}"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 ORIGIN="${ORIGIN:-opnsense/os-speedtest}"
 COMMENT="${COMMENT:-Internet speed test integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -40,6 +40,8 @@ need_file "packaging/freebsd/+POST_INSTALL"
 need_file "packaging/freebsd/+PRE_DEINSTALL"
 need_file "packaging/freebsd/+POST_DEINSTALL"
 need_file "packaging/freebsd/pkg-descr"
+grep -q "\"product_version\":\"$VERSION\"" "$SCRIPT_DIR/src/usr/local/opnsense/version/speedtest" ||
+	die "src/usr/local/opnsense/version/speedtest does not declare product_version $VERSION"
 
 case "$TARGET_ABI" in
 	native) PKG_ABI="$(env -u ABI pkg config ABI 2>/dev/null || env -u ABI pkg -vv | awk -F'"' '/ABI =/ {print $2; exit}')" ;;

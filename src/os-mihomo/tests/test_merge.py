@@ -1,6 +1,7 @@
 """Exercise merge policy, transport pins, and real System error boundaries."""
 import copy
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -630,3 +631,47 @@ class StaleForwarderTests(unittest.TestCase):
 
     def test_a_missing_file_counts_as_not_forwarding(self):
         self.assertFalse(self.system.forwarded())
+
+
+class ConfigctlContractTests(unittest.TestCase):
+    """configctl answers in a vocabulary the caller has to read correctly."""
+
+    def test_a_bare_err_is_a_failure(self):
+        # It carries no other marker, so a check looking only for "Execute
+        # error" reads a failed reload as a success and carries on.
+        system = m.System()
+        with patch.object(m.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, b'ERR\n', b'')):
+            with self.assertRaises(m.Error):
+                system.run(['/usr/local/sbin/configctl', 'template', 'reload', 'x'])
+        with patch.object(m.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, b'OK\n', b'')):
+            system.run(['/usr/local/sbin/configctl', 'template', 'reload', 'x'])
+
+    def test_only_configctl_answers_are_read_this_way(self):
+        # Another program printing ERR is not making the same statement.
+        system = m.System()
+        with patch.object(m.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, b'ERR\n', b'')):
+            system.run(['/usr/local/sbin/unbound-checkconf', '/dev/null'])
+
+    def test_the_unbound_templates_are_reloaded_by_their_container(self):
+        # The templates live in sub-containers; the bare name matches nothing,
+        # generates no file, and answers ERR.
+        calls = []
+
+        def record(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(state), True)
+        generated = state / 'dot.conf'
+        generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        with patch.object(m, 'STATE', str(state)), patch.object(m, 'UNBOUND_GENERATED', str(generated)):
+            system = m.System()
+            with patch.object(system, 'run', side_effect=record):
+                system.dns(False, {'dns_fallback': True})
+        reloads = [args for args in calls if 'template' in args]
+        self.assertEqual(1, len(reloads), calls)
+        self.assertEqual('OPNsense/Unbound/*', reloads[0][-1])

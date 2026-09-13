@@ -582,7 +582,9 @@ class System:
         except (subprocess.TimeoutExpired, OSError):
             raise Error("A system operation failed or timed out.") from None
         output = result.stdout + result.stderr
-        failed_action = args[0] == "/usr/local/sbin/configctl" and (b"Execute error" in output or b"Error (" in output)
+        # configctl reports failure as a bare ERR, which carries no other marker.
+        failed_action = args[0] == "/usr/local/sbin/configctl" and (
+            b"Execute error" in output or b"Error (" in output or output.strip() == b"ERR")
         if check and (result.returncode or failed_action):
             raise Error("A system operation failed; the previous configuration was retained.")
         return result
@@ -700,7 +702,10 @@ class System:
         if b"unchanged" in result.stdout and not was_pending and self.forwarded() == enabled:
             pending.unlink(missing_ok=True)
             return
-        self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound"], timeout=90)
+        # The Unbound templates live in sub-containers, so the bare name matches
+        # nothing: it generates no file and answers ERR. Without the wildcard the
+        # configuration Unbound is about to be checked against is never rewritten.
+        self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound/*"], timeout=90)
         # Unbound resolves python-script and similar settings relative to its own
         # directory, so a check run from anywhere else rejects a working config.
         # OPNsense's own start.sh changes into it for the same reason.

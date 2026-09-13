@@ -58,13 +58,38 @@ class FrameworkApiTests(unittest.TestCase):
             for method in re.findall(r'\$this->request->(\w+)\(', path.read_text()):
                 self.assertIn(method, allowed, '%s in %s' % (method, path.name))
 
-    def test_text_from_the_api_is_decoded_before_display(self):
-        # Array responses are HTML-escaped by the framework as an XSS defence;
-        # htmlDecode is the matching helper on the way in.
+    def test_every_read_is_decoded_on_arrival(self):
+        # Array responses are HTML-escaped by the framework as an XSS defence,
+        # so a value is only intact once it is decoded. Decoding at each call
+        # site is what shipped a dashboard link whose "&" had become "&amp;":
+        # the panel read one parameter instead of three, fell back to loopback
+        # with no secret, and reported the backend unreachable. One wrapper on
+        # the way in cannot be forgotten the next time a field is added.
         view = VIEW.read_text()
-        for field in re.findall(r"ajaxGet\(api\.(\w*[Ll]og\w*)", view):
-            pattern = r'ajaxGet\(api\.%s.*?htmlDecode' % field
-            self.assertRegex(view, pattern, field)
+        self.assertIn('function decoded(', view)
+        self.assertEqual(1, view.count('ajaxGet('),
+                         'every read must go through the decoding wrapper')
+        self.assertIn('ajaxGet(url, {}, function (data) { done(decoded(data)); });', view)
+        self.assertIn('data = decoded(data) || {}', view)
+        self.assertEqual(1, view.count('htmlDecode('),
+                         'decoding belongs in the wrapper, not at each element')
+
+    def test_a_pressed_button_reports_that_it_is_working(self):
+        # A restart or a transparent routing change takes seconds, and without
+        # a state of its own the page looks identical throughout.
+        view = VIEW.read_text()
+        self.assertIn('fa-spinner fa-spin', view)
+        for handler in re.findall(r"call\((api\.\w+|'/api/[^']+'.*?)\);", view):
+            self.assertIn('$(this)', handler, handler)
+        self.assertNotIn('onclick=', view,
+                         'a button that forwards to another shows its spinner on the wrong one')
+
+    def test_the_reachable_dashboard_switch_is_derived_back(self):
+        # It is stored as the address the control API binds to, not as a flag,
+        # so a getter that only echoes storage renders the box unchecked
+        # however the setting stands and turning it on looks like a no-op.
+        settings = [p for p in CONTROLLERS if p.name == 'SettingsController.php'][0].read_text()
+        self.assertIn("$settings['dashboard_any']", settings)
 
 
 class ViewTests(unittest.TestCase):

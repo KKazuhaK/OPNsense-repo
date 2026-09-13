@@ -56,12 +56,48 @@ $(function () {
         $(window).scrollTop(0);
     }
 
+    /* The framework HTML-escapes every array response on the way out, so a
+       value is only intact once it is decoded on arrival. Decoding the whole
+       response in one place rather than at each element is the difference
+       between a log that reads "--&gt;" and a dashboard link whose "&" became
+       "&amp;", which sends the panel to its defaults with no secret -- and a
+       subscription whose escaped text gets written back into the file on the
+       next save. */
+    function decoded(value) {
+        if (typeof value === 'string') { return htmlDecode(value); }
+        if (Array.isArray(value)) { return value.map(decoded); }
+        if (value !== null && typeof value === 'object') {
+            const plain = {};
+            Object.keys(value).forEach(function (key) { plain[key] = decoded(value[key]); });
+            return plain;
+        }
+        return value;
+    }
+
+    function get(url, done) {
+        ajaxGet(url, {}, function (data) { done(decoded(data)); });
+    }
+
+    /* A restart or a transparent routing change takes seconds. Without a state
+       of its own the page looks identical the whole time, so the operator
+       cannot tell a slow success from a click that did nothing. */
+    function busy(button, text) {
+        if (button.data('idle-label') === undefined) { button.data('idle-label', button.html()); }
+        button.prop('disabled', true)
+              .html('<i class="fa fa-spinner fa-spin"></i> ' + button.data('idle-label'));
+        report('info', text);
+    }
+
+    function idle(button) {
+        button.prop('disabled', false).html(button.data('idle-label'));
+    }
+
     /* A save reloads nothing, so the tab has to be remembered only across a
        manual reload; the framework already puts the active tab in the hash. */
     function currentTab() { return $('#maintabs li.active a').attr('href') || '#status'; }
 
     function load() {
-        ajaxGet(api.get, {}, function (data) {
+        get(api.get, function (data) {
             if (!data || !data.settings) { return; }
             const s = data.settings;
             $('#device').val(s.device || '');
@@ -105,7 +141,7 @@ $(function () {
     }
 
     function refresh() {
-        ajaxGet(api.status, {}, function (state) {
+        get(api.status, function (state) {
             state = state || {};
             $('#mihomo-service').attr('class', 'label label-' + (state.running ? 'success' : 'default'))
                 .text(state.running ? '{{ lang._('Running') }}' : '{{ lang._('Stopped') }}');
@@ -117,19 +153,26 @@ $(function () {
             $('#mihomo-disable').toggle(!!state.transparent);
             $('#mihomo-warning').toggle(!!state.error).text(state.error || '');
         });
-        ajaxGet(api.log, {}, function (d) { $('#mihomo-log').text(htmlDecode((d || {}).log || '')); });
-        ajaxGet(api.subLog, {}, function (d) { $('#mihomo-sub-log').text(htmlDecode((d || {}).log || '')); });
-        ajaxGet(api.update, {}, function (d) { $('#mihomo-update-status').text((d || {}).message || ''); });
+        get(api.log, function (d) { $('#mihomo-log').text((d || {}).log || ''); });
+        get(api.subLog, function (d) { $('#mihomo-sub-log').text((d || {}).log || ''); });
+        get(api.update, function (d) { $('#mihomo-update-status').text((d || {}).message || ''); });
     }
 
-    function call(url, payload, done) {
+    function call(url, payload, done, button) {
+        button = button || $();
+        busy(button, '{{ lang._('Working...') }}');
+        /* ajaxCall reports through jQuery's complete, so this runs on a failed
+           request as much as a successful one and the button always comes
+           back. A failure carries no JSON body, so say plainly that it failed
+           rather than leaving the operator with a spinner and no answer. */
         ajaxCall(url, payload || {}, function (data) {
-            data = data || {};
+            idle(button);
+            data = decoded(data) || {};
             if (data.status === 'ok') {
                 report('success', done);
                 load();
             } else {
-                report('danger', data.error || '{{ lang._('Operation failed.') }}');
+                report('danger', data.error || '{{ lang._('The operation failed. The log tab may say why.') }}');
             }
             refresh();
         });
@@ -137,10 +180,10 @@ $(function () {
 
     $('.mihomo-action').on('click', function () {
         const verb = $(this).data('action');
-        call('/api/mihomo/service/' + verb, {}, $(this).data('done'));
+        call('/api/mihomo/service/' + verb, {}, $(this).data('done'), $(this));
     });
 
-    $('#mihomo-save').on('click', function () {
+    $('.mihomo-save').on('click', function () {
         const payload = {settings: {
             subscription_url: $('#subscription_url').val(),
             clear_url: $('#clear_url').is(':checked') ? 1 : 0,
@@ -157,19 +200,19 @@ $(function () {
         ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any'].forEach(function (flag) {
             payload.settings[flag] = $('#' + flag).is(':checked') ? 1 : 0;
         });
-        call(api.set, payload, '{{ lang._('Settings saved. The configuration was regenerated from the stored subscription.') }}');
+        call(api.set, payload, '{{ lang._('Settings saved. The configuration was regenerated from the stored subscription.') }}', $(this));
         $('#secret,#subscription_url').val('');
         $('#clear_url').prop('checked', false);
     });
 
     $('#mihomo-save-merge').on('click', function () {
-        call(api.merge, {merge: $('#merge_content').val()}, '{{ lang._('Merge YAML saved and applied.') }}');
+        call(api.merge, {merge: $('#merge_content').val()}, '{{ lang._('Merge YAML saved and applied.') }}', $(this));
     });
     $('#mihomo-save-subscription').on('click', function () {
-        call(api.subscription, {subscription: $('#config_content').val()}, '{{ lang._('Subscription configuration saved and applied.') }}');
+        call(api.subscription, {subscription: $('#config_content').val()}, '{{ lang._('Subscription configuration saved and applied.') }}', $(this));
     });
     $('#mihomo-load-preset').on('click', function () {
-        call(api.preset, {preset: $('#preset').val()}, '{{ lang._('Preset loaded and applied. It replaced the merge YAML.') }}');
+        call(api.preset, {preset: $('#preset').val()}, '{{ lang._('Preset loaded and applied. It replaced the merge YAML.') }}', $(this));
     });
 
     load();
@@ -281,7 +324,7 @@ $(function () {
                         </div>
                     </td>
                 </tr>
-                <tr><td></td><td><button type="button" class="btn btn-primary" id="mihomo-save">{{ lang._('Save settings') }}</button></td></tr>
+                <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
         <table class="table table-striped opnsense_standard_table_form">
@@ -331,7 +374,7 @@ $(function () {
                         </div>
                     </td>
                 </tr>
-                <tr><td></td><td><button type="button" class="btn btn-primary" id="mihomo-save-routing" onclick="$('#mihomo-save').click()">{{ lang._('Save settings') }}</button></td></tr>
+                <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-routing">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
     </div>
@@ -434,7 +477,7 @@ $(function () {
                         </div>
                     </td>
                 </tr>
-                <tr><td></td><td><button type="button" class="btn btn-primary" onclick="$('#mihomo-save').click()">{{ lang._('Save settings') }}</button></td></tr>
+                <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-dns">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
     </div>

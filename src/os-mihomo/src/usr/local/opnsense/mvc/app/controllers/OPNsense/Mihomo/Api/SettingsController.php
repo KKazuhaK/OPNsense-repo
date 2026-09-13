@@ -49,6 +49,13 @@ class SettingsController extends ApiControllerBase
     {
         $settings = $this->stored();
         unset($settings['secret'], $settings['subscription_url']);
+        /* The switch is stored as the address the control API binds to, not as
+           a flag of its own, so it has to be derived back. Without this the box
+           renders unchecked however the setting actually stands, and turning it
+           on looks like it did nothing. The test matches dashboardUrl(): any
+           address that is not loopback is reachable. */
+        $controller = (string)($settings['controller'] ?? '');
+        $settings['dashboard_any'] = $controller !== '' && strpos($controller, '127.0.0.1:') !== 0;
         return [
             'settings' => $settings,
             /* The stored URL and secret are never sent to the browser; the form

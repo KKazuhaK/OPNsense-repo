@@ -149,6 +149,10 @@ $native = null;
 $handle = null;
 try {
     if ($root === '') {
+        /* config.inc stamps each revision with the invoking user and reaches for
+           shell_safe() to do it, which lives in util.inc. Writing the
+           configuration without it fails at the moment of the write. */
+        require_once('/usr/local/etc/inc/util.inc');
         require_once('/usr/local/etc/inc/config.inc');
         $native = OPNsense\Core\Config::getInstance();
         $native->lock();

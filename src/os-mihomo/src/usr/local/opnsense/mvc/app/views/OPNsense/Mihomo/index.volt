@@ -159,54 +159,141 @@ $(function () {
         $('#device_list').val(entries.join('\n'));
     }
 
+    let lastDevices = {devices: [], rules: []};
+
+    /* One entry can cover a whole segment, and a segment keeps covering it as
+       devices come and go, which an address picked from a lease cannot. With
+       many devices that is the difference between one line and eighty, so the
+       segment is offered as a choice of its own rather than only as a heading. */
+    function segmentOf(address) {
+        if (address.indexOf(':') !== -1) {
+            const parts = address.split(':');
+            return parts.slice(0, 4).join(':') + '::/64';
+        }
+        const octets = address.split('.');
+        return octets.length === 4 ? octets.slice(0, 3).join('.') + '.0/24' : '';
+    }
+
+    function coveredBy(address, chosen) {
+        const segment = segmentOf(address);
+        return segment && chosen.indexOf(segment) !== -1 ? segment : '';
+    }
+
     function renderDevices(found) {
+        const devices = (found.devices || []).slice();
         const chosen = listed();
+        const needle = $('#mihomo-device-search').val().trim().toLowerCase();
+        const onlyChosen = $('#mihomo-device-selected-only').is(':checked');
         const rows = $('#mihomo-device-rows').empty();
-        (found.devices || []).forEach(function (device) {
-            const box = $('<input type="checkbox">').val(device.address)
-                .prop('checked', chosen.indexOf(device.address) !== -1);
-            const flags = $('<td>');
-            if (device.randomised_mac) {
-                flags.append($('<span class="label label-warning">')
-                    .text('{{ lang._('Rotating hardware address') }}')
-                    .attr('title', '{{ lang._('This device presents a different hardware address per network and changes it over time, so even a reservation cannot hold its address. Turn off the private address for this network on the device first.') }}'));
-            }
-            if (!device.reserved) {
-                flags.append(' ').append($('<span class="label label-default">')
-                    .text('{{ lang._('No DHCP reservation') }}')
-                    .attr('title', '{{ lang._('Its address comes from the pool, so it can change and this rule would then apply to whatever took the address. Give it a reservation to make the address its identity.') }}'));
-            }
-            rows.append($('<tr>')
-                .append($('<td>').append(box))
-                .append($('<td>').text(device.hostname || '{{ lang._('unnamed') }}'))
-                .append($('<td><code></code></td>').find('code').text(device.address).end())
-                .append($('<td>').append($('<small class="text-muted">').text(device.mac || '')))
-                .append(flags));
+
+        const segments = [];
+        const grouped = {};
+        devices.forEach(function (device) {
+            const segment = segmentOf(device.address) || '{{ lang._('Other') }}';
+            if (!grouped[segment]) { grouped[segment] = []; segments.push(segment); }
+            grouped[segment].push(device);
         });
-        $('#mihomo-device-empty').toggle(!(found.devices || []).length);
+
+        let shown = 0;
+        let picked = 0;
+        segments.forEach(function (segment) {
+            const wholeSegment = chosen.indexOf(segment) !== -1;
+            const members = grouped[segment].filter(function (device) {
+                const covered = wholeSegment || chosen.indexOf(device.address) !== -1;
+                if (onlyChosen && !covered) { return false; }
+                if (!needle) { return true; }
+                return (device.hostname + ' ' + device.address + ' ' + device.mac)
+                    .toLowerCase().indexOf(needle) !== -1;
+            });
+            grouped[segment].forEach(function (device) {
+                if (wholeSegment || chosen.indexOf(device.address) !== -1) { picked += 1; }
+            });
+            if (!members.length && !(wholeSegment && !needle)) { return; }
+
+            const header = $('<tr class="active">');
+            const segmentBox = $('<input type="checkbox" class="mihomo-segment">')
+                .val(segment).prop('checked', wholeSegment);
+            header.append($('<td>').append(segment.indexOf('/') !== -1 ? segmentBox : ''));
+            header.append($('<td colspan="4">').append($('<strong>').text(segment))
+                .append(' ').append($('<span class="text-muted">')
+                    .text('{{ lang._('%s devices') }}'.replace('%s', grouped[segment].length))));
+            rows.append(header);
+
+            members.forEach(function (device) {
+                shown += 1;
+                const covered = coveredBy(device.address, chosen);
+                const box = $('<input type="checkbox" class="mihomo-device">').val(device.address)
+                    .prop('checked', !!covered || chosen.indexOf(device.address) !== -1)
+                    .prop('disabled', !!covered);
+                const flags = $('<td>');
+                if (covered) {
+                    flags.append($('<span class="text-muted">')
+                        .text('{{ lang._('covered by %s') }}'.replace('%s', covered)));
+                } else {
+                    if (device.randomised_mac) {
+                        flags.append($('<span class="label label-warning">')
+                            .text('{{ lang._('Rotating hardware address') }}')
+                            .attr('title', '{{ lang._('This device presents a different hardware address per network and changes it over time, so even a reservation cannot hold its address. Turn off the private address for this network on the device first.') }}'));
+                    }
+                    if (!device.reserved) {
+                        flags.append(' ').append($('<span class="label label-default">')
+                            .text('{{ lang._('No DHCP reservation') }}')
+                            .attr('title', '{{ lang._('Its address comes from the pool, so it can change and this rule would then apply to whatever took the address. Give it a reservation to make the address its identity.') }}'));
+                    }
+                }
+                rows.append($('<tr>')
+                    .append($('<td>').append(box))
+                    .append($('<td>').text(device.hostname || '{{ lang._('unnamed') }}'))
+                    .append($('<td><code></code></td>').find('code').text(device.address).end())
+                    .append($('<td>').append($('<small class="text-muted">').text(device.mac || '')))
+                    .append(flags));
+            });
+        });
+
+        $('#mihomo-device-empty').toggle(!devices.length);
+        const entries = chosen.length;
+        $('#mihomo-device-count').text(
+            '{{ lang._('%p of %t devices, from %e entries') }}'
+                .replace('%p', picked).replace('%t', devices.length).replace('%e', entries)
+            + (shown < devices.length ? ' \u00b7 ' + '{{ lang._('%s shown') }}'.replace('%s', shown) : ''));
         const rules = found.rules || [];
         $('#mihomo-device-rules').text(rules.length ? rules.join('\n')
             : '{{ lang._('Saved settings produce no device rules.') }}');
+        lastDevices = found;
     }
 
     function loadDevices() {
         get(api.devices, renderDevices);
     }
 
-    $('#mihomo-device-rows').on('change', 'input[type=checkbox]', function () {
+    $('#mihomo-device-rows').on('change', '.mihomo-device', function () {
         const address = $(this).val();
         const entries = listed().filter(function (entry) { return entry !== address; });
         if ($(this).is(':checked')) { entries.push(address); }
         setListed(entries);
+        renderDevices(lastDevices);
+    });
+
+    $('#mihomo-device-rows').on('change', '.mihomo-segment', function () {
+        const segment = $(this).val();
+        let entries = listed().filter(function (entry) { return entry !== segment; });
+        if ($(this).is(':checked')) {
+            /* An address the segment already covers would only add a rule that
+               can never be reached, so it goes when the segment arrives. */
+            entries = entries.filter(function (entry) {
+                return entry.indexOf('/') !== -1 || segmentOf(entry) !== segment;
+            });
+            entries.push(segment);
+        }
+        setListed(entries);
+        renderDevices(lastDevices);
     });
 
     $('#mihomo-refresh-devices').on('click', loadDevices);
-    $('#device_list').on('input', function () {
-        const chosen = listed();
-        $('#mihomo-device-rows input[type=checkbox]').each(function () {
-            $(this).prop('checked', chosen.indexOf($(this).val()) !== -1);
-        });
+    $('#mihomo-device-search, #mihomo-device-selected-only').on('input change', function () {
+        renderDevices(lastDevices);
     });
+    $('#device_list').on('input', function () { renderDevices(lastDevices); });
 
     function refresh() {
         get(api.status, function (state) {
@@ -302,6 +389,7 @@ $(function () {
     <li class="active"><a data-toggle="tab" href="#status">{{ lang._('Status') }}</a></li>
     <li><a data-toggle="tab" href="#subscription">{{ lang._('Subscription') }}</a></li>
     <li><a data-toggle="tab" href="#routing">{{ lang._('Routing') }}</a></li>
+    <li><a data-toggle="tab" href="#devices">{{ lang._('Devices') }}</a></li>
     <li><a data-toggle="tab" href="#dns">{{ lang._('DNS') }}</a></li>
     <li><a data-toggle="tab" href="#advanced">{{ lang._('Advanced') }}</a></li>
     <li><a data-toggle="tab" href="#log">{{ lang._('Log') }}</a></li>
@@ -494,6 +582,11 @@ $(function () {
                 <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-tun">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
+    </div>
+
+    </div>
+
+    <div id="devices" class="tab-pane fade in">
         <table class="table table-striped opnsense_standard_table_form">
             <thead><tr><td style="width:22%"><strong>{{ lang._('Device policy') }}</strong></td><td style="width:78%"></td></tr></thead>
             <tbody>
@@ -513,7 +606,15 @@ $(function () {
                 <tr>
                     <td><a id="help_for_devpick" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Devices on this network') }}</td>
                     <td>
-                        <div class="table-responsive" style="max-height:280px;overflow:auto">
+                        <div style="margin-bottom:8px">
+                            <input type="text" id="mihomo-device-search" class="form-control input-sm"
+                                   style="width:260px;display:inline-block" spellcheck="false"
+                                   placeholder="{{ lang._('Filter by name, address or hardware address') }}">
+                            <label style="margin-left:12px;font-weight:normal">
+                                <input type="checkbox" id="mihomo-device-selected-only"> {{ lang._('Selected only') }}</label>
+                            <span class="text-muted" id="mihomo-device-count" style="margin-left:12px"></span>
+                        </div>
+                        <div class="table-responsive" style="max-height:360px;overflow:auto">
                             <table class="table table-condensed table-hover" style="margin-bottom:0">
                                 <thead><tr>
                                     <th style="width:34px"></th>
@@ -552,7 +653,7 @@ $(function () {
                         </div>
                     </td>
                 </tr>
-                <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-routing">{{ lang._('Save settings') }}</button></td></tr>
+                <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-devices">{{ lang._('Save settings') }}</button></td></tr>
             </tbody>
         </table>
     </div>

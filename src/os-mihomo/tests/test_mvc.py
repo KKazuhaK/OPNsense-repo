@@ -92,6 +92,38 @@ class FrameworkApiTests(unittest.TestCase):
         self.assertIn("$settings['dashboard_any']", settings)
 
 
+class DeviceTabTests(unittest.TestCase):
+    """The device policy is its own tab, and it has to survive a long list."""
+
+    def setUp(self):
+        self.view = VIEW.read_text()
+
+    def test_the_policy_has_a_tab_of_its_own(self):
+        self.assertIn('href="#devices"', self.view)
+        self.assertIn('<div id="devices" class="tab-pane', self.view)
+
+    def test_a_long_list_can_be_narrowed(self):
+        # A household can carry a hundred devices; a flat list of checkboxes
+        # stops being usable well before that.
+        for control in ('mihomo-device-search', 'mihomo-device-selected-only',
+                        'mihomo-device-count'):
+            self.assertIn(control, self.view)
+
+    def test_a_whole_segment_can_be_chosen_at_once(self):
+        # One entry for a segment replaces one per device and keeps covering
+        # them as they come and go, which an address from a lease cannot.
+        self.assertIn('function segmentOf(', self.view)
+        self.assertIn('mihomo-segment', self.view)
+        # Addresses the segment already covers are dropped, because a rule
+        # behind a segment that matches first can never be reached.
+        self.assertIn("segmentOf(entry) !== segment", self.view)
+
+    def test_filtering_does_not_refetch(self):
+        # The list comes from configd; re-reading it on every keystroke would
+        # put a shell behind the search box.
+        self.assertIn('renderDevices(lastDevices)', self.view)
+
+
 class ViewTests(unittest.TestCase):
     def test_tabs_and_panes_agree(self):
         view = VIEW.read_text()

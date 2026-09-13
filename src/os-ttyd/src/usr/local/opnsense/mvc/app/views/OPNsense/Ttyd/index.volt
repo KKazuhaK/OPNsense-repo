@@ -13,7 +13,7 @@
 </form>
 <script>
 $(function () {
-    var starting = false, first = true;
+    var starting = false, first = true, backupWarning = '';
     var warning = '{{ lang._("The terminal service could not be started. Make sure ttyd is installed and Secure Shell is enabled in System > Settings > Administration.") }}';
     $('#ttyd-url').text(window.location.origin + '/ttyd/');
     function mutate(action) {
@@ -22,7 +22,7 @@ $(function () {
         ajaxCall('/api/ttyd/service/' + action, {}, function (data) {
             starting = false; $('.ttyd-service').prop('disabled', false);
             if ((data || {}).status !== 'ok') {$('#ttyd-message').removeClass('hidden').text(htmlDecode((data || {}).error || warning));}
-            else {$('#ttyd-message').addClass('hidden').empty();}
+            else {backupWarning = data.warning || ''; $('#ttyd-message').toggleClass('hidden', !backupWarning).text(htmlDecode(backupWarning));}
             refresh();
         });
     }
@@ -33,7 +33,7 @@ $(function () {
             $('#ttyd-listen').text(htmlDecode(data.listen || '-')); $('#ttyd-target,#ttyd-panel-target').text(htmlDecode(data.target || '-'));
             $('#ttyd-running').removeClass('label-default label-success label-danger').addClass(data.running ? 'label-success' : 'label-danger').text(data.running ? '{{ lang._("Running") }}' : '{{ lang._("Stopped") }}');
             $('#ttyd-panel').toggleClass('hidden', !data.running);
-            if (data.running) {$('#ttyd-message').addClass('hidden').empty();}
+            if (data.running && !backupWarning) {$('#ttyd-message').addClass('hidden').empty();}
             if (data.running && !$('#ttyd-terminal').attr('src')) {$('#ttyd-terminal').attr('src', '/ttyd/');}
             if (!data.running) {$('#ttyd-terminal').removeAttr('src');}
             if (!starting) {$('.ttyd-service[data-action="start"]').prop('disabled', !!data.running); $('.ttyd-service[data-action="stop"],.ttyd-service[data-action="restart"]').prop('disabled', !data.running);}

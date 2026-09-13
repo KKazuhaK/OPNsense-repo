@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-lucky}"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 ORIGIN="${ORIGIN:-opnsense/os-lucky}"
 COMMENT="${COMMENT:-Lucky network toolbox integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -16,7 +16,7 @@ LUCKY_ASSET="${LUCKY_ASSET:-lucky_${LUCKY_VERSION}_freebsd_x86_64.tar.gz}"
 LUCKY_DOWNLOAD_URL="${LUCKY_DOWNLOAD_URL:-https://github.com/gdy666/lucky/releases/download/v${LUCKY_VERSION}/${LUCKY_ASSET}}"
 DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-300}"
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 WORKDIR="${WORKDIR:-"$SCRIPT_DIR/work/freebsd-pkg"}"
 STAGEDIR="$WORKDIR/stage"
 METADIR="$WORKDIR/meta"
@@ -50,6 +50,13 @@ need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Lucky/Api/Service
 need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Lucky/index.volt"
 need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Lucky/Api/SettingsController.php"
 need_file "src/usr/local/opnsense/scripts/lucky/settings.py"
+need_file "src/usr/local/etc/inc/plugins.inc.d/lucky_backup.inc"
+need_file "src/usr/local/etc/rc.d/os-lucky-backup"
+need_file "src/usr/local/opnsense/scripts/lucky/config_mirror.py"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Lucky/Backup.php"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Lucky/Backup.xml"
+need_file "../common/config_backup.py"
+need_file "../common/config_backup.php"
 need_file "packaging/freebsd/+MANIFEST.in"
 need_file "packaging/freebsd/+PRE_INSTALL"
 need_file "packaging/freebsd/+POST_INSTALL"
@@ -125,6 +132,9 @@ prepare_lucky_binary() {
 
 echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
+install -m 0644 "$SCRIPT_DIR/../common/config_backup.py" "$STAGEDIR/usr/local/opnsense/scripts/lucky/config_backup.py"
+install -m 0644 "$SCRIPT_DIR/../common/config_backup.php" "$STAGEDIR/usr/local/opnsense/scripts/lucky/config_backup.php"
+chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-lucky-backup"
 prepare_lucky_binary
 install -m 0755 "$DOWNLOADDIR/lucky" "$STAGEDIR/usr/local/bin/lucky"
 

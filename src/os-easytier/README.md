@@ -2,9 +2,23 @@
 
 `os-easytier` 是适用于 OPNsense 的 EasyTier 组网 VPN 插件。它集成 EasyTier Core，可在 **VPN > EasyTier** 中完成配置、服务管理、状态查看、节点查看和日志排查。
 
-当前插件版本：`1.0.0`
+当前插件版本：`1.1.1`
 
 内置 EasyTier 版本：`2.6.4`
+
+## 原生配置备份与恢复
+
+插件将 `/usr/local/etc/easytier` 中的持久文件及
+`/etc/rc.conf.d/easytier` 的原始内容、文件权限和存在状态镜像到
+`config.xml` 的 `OPNsense/EasyTier/backup` 节点。OPNsense 的完整配置
+备份因此包含网络凭据及服务禁用状态。日志、PID、锁和 MVC 临时文件不进入镜像。
+
+恢复 OPNsense 配置后，插件会在服务启动前还原文件。独立后台任务每秒检查
+外部文件修改，WebGUI 保存配置或操作服务时也会同步更新镜像；保存后出现备份
+提示时，应先处理该提示再导出配置备份。原有包升级时的 rc 文件临时备份继续保留。
+
+该镜像采用压缩和 Base64 编码，编码本身不提供加密。请使用 OPNsense 配置备份
+的加密选项保护导出的凭据。重新安装插件仍由 OPNsense 的插件恢复流程负责。
 
 ![EasyTier 配置页面](images/configuration.png)
 
@@ -203,7 +217,7 @@ dist/os-easytier.pkg
 - 不要使用 Cron 或 Shellcmd 重复添加 EasyTier 启动命令。
 - 不要在多个节点中重复使用相同的虚拟 IP。
 - 两端发布的局域网网段不能相互重叠。
-- `rpc_portal` 建议保持为 `127.0.0.1:15888`，节点页面依赖该地址查询状态。
+- `rpc_portal` 默认使用 `127.0.0.1:15888`，也支持自定义端口；启动脚本会明确传入监听地址，节点页面跟随配置查询。
 - 默认 `any to any` 规则以易用性为优先，生产环境应根据安全策略进行限制。
 - 本项目为非官方社区插件，不受 Deciso、OPNsense 或 EasyTier 官方支持，使用者应自行评估风险。
 

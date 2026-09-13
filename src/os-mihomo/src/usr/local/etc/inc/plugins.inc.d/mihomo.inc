@@ -30,8 +30,18 @@ function mihomo_services()
 function mihomo_configure()
 {
     return [
+        'early' => ['mihomo_restore_backup'],
+        'local' => ['mihomo_restore_backup'],
         'newwanip' => ['mihomo_newwanip:3'],
     ];
+}
+
+function mihomo_restore_backup($verbose = false)
+{
+    exec('/usr/local/bin/python3 /usr/local/opnsense/scripts/mihomo/mihomo.py reconcile-backup >/dev/null 2>&1', $output, $status);
+    if ($status !== 0) {
+        error_log('The Mihomo configuration backup could not be restored.');
+    }
 }
 
 function mihomo_syslog()

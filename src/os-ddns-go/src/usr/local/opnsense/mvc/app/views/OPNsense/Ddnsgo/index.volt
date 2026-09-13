@@ -7,8 +7,8 @@ $(function () {
     let revision = '';
     function report(data) {
         data = data || {};
-        $('#ddnsgo-message').attr('class', 'alert alert-' + (data.status === 'ok' ? 'success' : 'danger'))
-            .text(data.status === 'ok' ? '{{ lang._('Operation completed.') }}' : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
+        $('#ddnsgo-message').attr('class', 'alert alert-' + (data.status === 'ok' ? (data.warning ? 'warning' : 'success') : 'danger'))
+            .text(data.status === 'ok' ? htmlDecode(data.warning || '{{ lang._('Operation completed.') }}') : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
     }
     function refresh() {
         ajaxGet('/api/ddnsgo/service/status', {}, function (data) {

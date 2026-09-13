@@ -4,7 +4,7 @@
     "os-kazuha-repo": {
       "staging": "repository",
       "abi": "independent",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "stage": {"src": "/"},
       "deps": {},
       "version_file": {"path": "/usr/local/opnsense/version/kazuha-repo", "format": "json"},
@@ -13,15 +13,19 @@
     "os-staticarp": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "stage": {"src": "/"},
+      "shared": {
+        "src/common/config_backup.py": "/usr/local/opnsense/scripts/staticarp/config_backup.py",
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/staticarp/config_backup.php"
+      },
       "deps": {},
       "version_file": {"path": "/usr/local/opnsense/version/staticarp", "format": "json"}
     },
     "os-pftop": {
       "staging": "tree",
       "abi": "independent",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "stage": {"src/usr": "/usr"},
       "deps": {},
       "version_file": {"path": "/usr/local/opnsense/version/pftop", "format": "json"},
@@ -30,7 +34,7 @@
     "os-lang": {
       "staging": "tree",
       "abi": "independent",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "stage": {"src": "/"},
       "deps": {},
       "version_file": {"path": "/usr/local/opnsense/version/lang", "format": "json"}
@@ -38,8 +42,12 @@
     "os-easytier": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "stage": {"src": "/"},
+      "shared": {
+        "src/common/config_backup.py": "/usr/local/opnsense/scripts/easytier/config_backup.py",
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/easytier/config_backup.php"
+      },
       "deps": {},
       "version_file": {"path": "/usr/local/opnsense/version/easytier", "format": "json"},
       "notes": "Both executables are committed under src/, so their bytes are covered by the per-file digests."
@@ -47,8 +55,12 @@
     "os-ddns-go": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "stage": {"src": "/"},
+      "shared": {
+        "src/common/config_backup.py": "/usr/local/opnsense/scripts/ddnsgo/config_backup.py",
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/ddnsgo/config_backup.php"
+      },
       "deps": {},
       "version_file": {"path": "/usr/local/opnsense/version/ddns-go", "format": "json"},
       "notes": "The binary is committed under src/; the release download fallback in build.sh can never satisfy this record."
@@ -56,8 +68,12 @@
     "os-lucky": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "stage": {"src": "/"},
+      "shared": {
+        "src/common/config_backup.py": "/usr/local/opnsense/scripts/lucky/config_backup.py",
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/lucky/config_backup.php"
+      },
       "deps": {},
       "vendored": [
         {
@@ -88,8 +104,12 @@
     "os-sing-box": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "stage": {"src": "/"},
+      "shared": {
+        "src/common/config_backup.py": "/usr/local/opnsense/scripts/singbox/config_backup.py",
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/singbox/config_backup.php"
+      },
       "deps": {"jq": "textproc/jq", "curl": "ftp/curl"},
       "vendored": [
         {
@@ -104,7 +124,7 @@
     "os-frp": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "stage": {"src": "/"},
       "deps": {},
       "vendored": [
@@ -125,7 +145,7 @@
     "os-unboundcustom": {
       "staging": "tree",
       "abi": "independent",
-      "version": "1.0.3",
+      "version": "1.0.4",
       "stage": {"src/opnsense": "/usr/local/opnsense"},
       "deps": {},
       "generated": {
@@ -138,8 +158,8 @@
     "os-ddclient-opnwall": {
       "staging": "tree",
       "abi": "independent",
-      "version": "1.0.2",
-      "stage": {"src": "/"},
+      "version": "1.0.3",
+      "stage": {"src/etc": "/usr/local/etc", "src/usr": "/usr"},
       "deps": {"ddclient": "dns/ddclient", "py313-boto3": "devel/py-boto3@py313"},
       "generated": {
         "/usr/local/opnsense/version/ddclient-opnwall": {
@@ -149,8 +169,88 @@
       "version_file": {"path": "/usr/local/opnsense/version/ddclient-opnwall", "format": "json"}
     },
     "os-ttyd": {
-      "staging": "unsupported",
-      "reason": "The six vendored FreeBSD runtime packages under src/os-ttyd/vendor/ carry no committed digest, the staged inventory depends on which shared library the vendored archive happens to contain, and three staged paths are symlinks that no per-file digest can describe."
+      "staging": "tree",
+      "abi": "FreeBSD:15:amd64",
+      "version": "1.1.1",
+      "stage": {
+        "src": "/"
+      },
+      "shared": {
+        "src/common/config_backup.py": "/usr/local/opnsense/scripts/ttyd/config_backup.py",
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/ttyd/config_backup.php"
+      },
+      "deps": {},
+      "vendored": [
+        {
+          "artifact": "vendor/freebsd15-amd64/libuv.pkg",
+          "sha256": "621b8436b48fda7ed69faabc6207c47a2ef0fd581a17cbbaa5b1f88c5faf4e6a",
+          "members": {
+            "/usr/local/lib/libuv.so.1.0.0": "/usr/local/os-ttyd/lib/libuv.so.1.0.0",
+            "/usr/local/share/licenses/libuv-1.52.1/LICENSE": "/usr/local/os-ttyd/share/licenses/libuv-1.52.1/LICENSE",
+            "/usr/local/share/licenses/libuv-1.52.1/MIT": "/usr/local/os-ttyd/share/licenses/libuv-1.52.1/MIT",
+            "/usr/local/share/licenses/libuv-1.52.1/catalog.mk": "/usr/local/os-ttyd/share/licenses/libuv-1.52.1/catalog.mk"
+          },
+          "checksums_file": "vendor/freebsd15-amd64/checksums.sha256",
+          "archive": "pkg"
+        },
+        {
+          "artifact": "vendor/freebsd15-amd64/libuv.pkg",
+          "sha256": "621b8436b48fda7ed69faabc6207c47a2ef0fd581a17cbbaa5b1f88c5faf4e6a",
+          "members": {
+            "/usr/local/lib/libuv.so.1.0.0": "/usr/local/os-ttyd/lib/libuv.so.1"
+          },
+          "checksums_file": "vendor/freebsd15-amd64/checksums.sha256",
+          "archive": "pkg"
+        },
+        {
+          "artifact": "vendor/freebsd15-amd64/libuv.pkg",
+          "sha256": "621b8436b48fda7ed69faabc6207c47a2ef0fd581a17cbbaa5b1f88c5faf4e6a",
+          "members": {
+            "/usr/local/lib/libuv.so.1.0.0": "/usr/local/os-ttyd/lib/libuv.so"
+          },
+          "checksums_file": "vendor/freebsd15-amd64/checksums.sha256",
+          "archive": "pkg"
+        },
+        {
+          "artifact": "vendor/freebsd15-amd64/libwebsockets.pkg",
+          "sha256": "053ef57233b914c9810243101652882d2bc319352108279fca77c8d6ad9ac8e1",
+          "members": {
+            "/usr/local/lib/libwebsockets.so.21": "/usr/local/os-ttyd/lib/libwebsockets.so.21",
+            "/usr/local/lib/libwebsockets-evlib_uv.so": "/usr/local/os-ttyd/lib/libwebsockets-evlib_uv.so",
+            "/usr/local/share/licenses/libwebsockets-4.5.8/LICENSE": "/usr/local/os-ttyd/share/licenses/libwebsockets-4.5.8/LICENSE",
+            "/usr/local/share/licenses/libwebsockets-4.5.8/MIT": "/usr/local/os-ttyd/share/licenses/libwebsockets-4.5.8/MIT",
+            "/usr/local/share/licenses/libwebsockets-4.5.8/catalog.mk": "/usr/local/os-ttyd/share/licenses/libwebsockets-4.5.8/catalog.mk"
+          },
+          "checksums_file": "vendor/freebsd15-amd64/checksums.sha256",
+          "archive": "pkg"
+        },
+        {
+          "artifact": "vendor/freebsd15-amd64/libwebsockets.pkg",
+          "sha256": "053ef57233b914c9810243101652882d2bc319352108279fca77c8d6ad9ac8e1",
+          "members": {
+            "/usr/local/lib/libwebsockets.so.21": "/usr/local/os-ttyd/lib/libwebsockets.so"
+          },
+          "checksums_file": "vendor/freebsd15-amd64/checksums.sha256",
+          "archive": "pkg"
+        },
+        {
+          "artifact": "vendor/freebsd15-amd64/ttyd.pkg",
+          "sha256": "80a1364e9d1cf40d11d7e5aa52efd218c5fedd5deec65e343b059562922a6578",
+          "members": {
+            "/usr/local/bin/ttyd": "/usr/local/os-ttyd/bin/ttyd",
+            "/usr/local/share/licenses/ttyd-1.7.7_2/LICENSE": "/usr/local/os-ttyd/share/licenses/ttyd-1.7.7_2/LICENSE",
+            "/usr/local/share/licenses/ttyd-1.7.7_2/MIT": "/usr/local/os-ttyd/share/licenses/ttyd-1.7.7_2/MIT",
+            "/usr/local/share/licenses/ttyd-1.7.7_2/catalog.mk": "/usr/local/os-ttyd/share/licenses/ttyd-1.7.7_2/catalog.mk"
+          },
+          "checksums_file": "vendor/freebsd15-amd64/checksums.sha256",
+          "archive": "pkg"
+        }
+      ],
+      "version_file": {
+        "path": "/usr/local/opnsense/version/ttyd",
+        "format": "json"
+      },
+      "notes": "The FreeBSD 15 runtime and license inventory are fixed. Library aliases carry regular copies of their pinned ELF bytes. FreeBSD 14 artifacts are retained but are not candidates for this version."
     }
   }
 }

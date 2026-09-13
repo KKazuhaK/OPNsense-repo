@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-frp}"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.0.1}"
 ORIGIN="${ORIGIN:-opnsense/os-frp}"
 COMMENT="${COMMENT:-frp reverse proxy server and client integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/KKazuhaK/}"
@@ -42,10 +42,12 @@ src/usr/local/etc/frp/frps.toml.sample
 src/usr/local/etc/frp/frpc.toml.sample
 src/usr/local/etc/rc.d/frps
 src/usr/local/etc/rc.d/frpc
+src/usr/local/etc/rc.syshook.d/start/15-frp
 src/usr/local/etc/inc/plugins.inc.d/frp.inc
 src/usr/local/opnsense/service/conf/actions.d/actions_frps.conf
 src/usr/local/opnsense/service/conf/actions.d/actions_frpc.conf
 src/usr/local/opnsense/scripts/frp/manage.py
+src/usr/local/opnsense/scripts/frp/config_mirror.php
 src/usr/local/opnsense/version/frp
 src/usr/local/opnsense/mvc/app/controllers/OPNsense/Frp/IndexController.php
 src/usr/local/opnsense/mvc/app/controllers/OPNsense/Frp/ServerController.php
@@ -57,6 +59,8 @@ src/usr/local/opnsense/mvc/app/views/OPNsense/Frp/client.volt
 src/usr/local/opnsense/mvc/app/views/OPNsense/Frp/common.volt
 src/usr/local/opnsense/mvc/app/models/OPNsense/Frp/Menu/Menu.xml
 src/usr/local/opnsense/mvc/app/models/OPNsense/Frp/ACL/ACL.xml
+src/usr/local/opnsense/mvc/app/models/OPNsense/Frp/Backup.xml
+src/usr/local/opnsense/mvc/app/models/OPNsense/Frp/Backup.php
 packaging/freebsd/+MANIFEST.in
 packaging/freebsd/+PRE_INSTALL
 packaging/freebsd/+POST_INSTALL
@@ -132,7 +136,9 @@ chmod 0755 \
     "$STAGEDIR/usr/local/sbin/frpc" \
     "$STAGEDIR/usr/local/etc/rc.d/frps" \
     "$STAGEDIR/usr/local/etc/rc.d/frpc" \
-    "$STAGEDIR/usr/local/opnsense/scripts/frp/manage.py"
+    "$STAGEDIR/usr/local/etc/rc.syshook.d/start/15-frp" \
+    "$STAGEDIR/usr/local/opnsense/scripts/frp/manage.py" \
+    "$STAGEDIR/usr/local/opnsense/scripts/frp/config_mirror.php"
 # The samples occupy the place of files that hold the authentication token and
 # the dashboard password; keep them root-only so a copy never widens them.
 chmod 0600 \

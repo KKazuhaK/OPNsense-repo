@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ddns-go}"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 ORIGIN="${ORIGIN:-opnsense/os-ddns-go}"
 COMMENT="${COMMENT:-DDNS-Go dynamic DNS integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -14,7 +14,7 @@ OUTPUT_NAME="${OUTPUT_NAME:-${PKG_NAME}.pkg}"
 DDNSGO_GITHUB_API="${DDNSGO_GITHUB_API:-https://api.github.com/repos/jeessy2/ddns-go/releases/latest}"
 DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-300}"
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 WORKDIR="${WORKDIR:-"$SCRIPT_DIR/work/freebsd-pkg"}"
 STAGEDIR="$WORKDIR/stage"
 METADIR="$WORKDIR/meta"
@@ -49,6 +49,13 @@ need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Ddnsgo/Api/Servic
 need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Ddnsgo/index.volt"
 need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Ddnsgo/Api/SettingsController.php"
 need_file "src/usr/local/opnsense/scripts/ddnsgo/settings.py"
+need_file "src/usr/local/etc/inc/plugins.inc.d/ddnsgo_backup.inc"
+need_file "src/usr/local/etc/rc.d/os-ddns-go-backup"
+need_file "src/usr/local/opnsense/scripts/ddnsgo/config_mirror.py"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Ddnsgo/Backup.php"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Ddnsgo/Backup.xml"
+need_file "../common/config_backup.py"
+need_file "../common/config_backup.php"
 need_file "packaging/freebsd/+MANIFEST.in"
 need_file "packaging/freebsd/+PRE_INSTALL"
 need_file "packaging/freebsd/+POST_INSTALL"
@@ -137,6 +144,9 @@ prepare_ddnsgo_binary() {
 
 echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
+install -m 0644 "$SCRIPT_DIR/../common/config_backup.py" "$STAGEDIR/usr/local/opnsense/scripts/ddnsgo/config_backup.py"
+install -m 0644 "$SCRIPT_DIR/../common/config_backup.php" "$STAGEDIR/usr/local/opnsense/scripts/ddnsgo/config_backup.php"
+chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-ddns-go-backup"
 prepare_ddnsgo_binary
 mkdir -p "$STAGEDIR/usr/local/bin"
 install -m 0755 "$DOWNLOADDIR/ddns-go" "$STAGEDIR/usr/local/bin/ddns-go"

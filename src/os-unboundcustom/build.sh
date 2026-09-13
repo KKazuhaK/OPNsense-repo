@@ -3,7 +3,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-unboundcustom}"
-VERSION="${VERSION:-1.0.3}"
+VERSION="${VERSION:-1.0.4}"
 ORIGIN="${ORIGIN:-opnsense/os-unboundcustom}"
 COMMENT="${COMMENT:-Safe custom options for Unbound DNS}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -35,7 +35,7 @@ case "$ABI" in
         PKG_ARCH='freebsd:*:x86:64'
         ;;
     native)
-        PKG_ABI="$(pkg config ABI 2>/dev/null || pkg -vv | awk -F\" '/ABI =/ {print $2; exit}')"
+        PKG_ABI="$(env -u ABI pkg config ABI 2>/dev/null || env -u ABI pkg -vv | awk -F\" '/ABI =/ {print $2; exit}')"
         case "$PKG_ABI" in
             FreeBSD:*:amd64) ;;
             *) die "unsupported native ABI: $PKG_ABI" ;;
@@ -123,7 +123,7 @@ install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_DEINSTALL" "$METADIR/+PRE_DE
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_DEINSTALL" "$METADIR/+POST_DEINSTALL"
 
 echo "==> Creating package"
-pkg create -f tgz -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+env -u ABI pkg create -f tgz -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 
 CREATED="$DISTDIR/$PKG_NAME-$VERSION.pkg"
 [ -f "$CREATED" ] || die "expected package was not created: $CREATED"
@@ -132,7 +132,7 @@ if [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
 fi
 
 PACKAGE="$DISTDIR/$OUTPUT_NAME"
-pkg info -F "$PACKAGE" >/dev/null
+env -u ABI pkg info -F "$PACKAGE" >/dev/null
 echo "==> Package verified: $PACKAGE"
 if command -v sha256 >/dev/null 2>&1; then
     sha256 "$PACKAGE"

@@ -1,4 +1,6 @@
 #!/bin/sh
 
 service os-ddns-go onestop >/dev/null 2>&1 || true
+/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py mirror >/dev/null 2>&1 || true
+service os-ddns-go-backup onestop >/dev/null 2>&1 || true
 exit 0

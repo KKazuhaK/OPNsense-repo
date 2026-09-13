@@ -1,7 +1,7 @@
 # ttyd for OPNsense
 
 [![OPNsense](https://img.shields.io/badge/OPNsense-Plugin-orange)](https://opnsense.org/)
-[![FreeBSD 14](https://img.shields.io/badge/FreeBSD-14-red)](https://www.freebsd.org/)
+[![FreeBSD 15](https://img.shields.io/badge/FreeBSD-15-red)](https://www.freebsd.org/)
 [![ttyd](https://img.shields.io/badge/ttyd-Web%20Terminal-blue)](https://github.com/tsl0922/ttyd)
 [![amd64](https://img.shields.io/badge/Architecture-amd64-success)](#)
 
@@ -10,6 +10,27 @@ This project adds a ttyd browser terminal to OPNsense under:
 ```text
 System > Diagnostics > ttyd
 ```
+
+## Native configuration backup and restore
+
+The plugin mirrors the exact bytes, permissions and presence of
+`/etc/rc.conf.d/ttyd`, the `/usr/local/etc/lighttpd_webgui/conf.d/ttyd.conf`
+proxy configuration, and optional legacy `/usr/local/etc/ttyd.crt` and
+`ttyd.key` files into `OPNsense/Ttyd/backup` in `config.xml`. Full OPNsense
+configuration backups include custom commands, listener overrides and the
+disabled service setting. Global SSH settings remain in the native OPNsense
+configuration. Logs, PID files and locks are excluded.
+
+After configuration restoration, files are restored before the terminal
+service starts. An independent background process checks external edits every
+second, including while ttyd is stopped. Successful WebGUI service operations
+also update the mirror synchronously. Resolve any backup warning before
+exporting a configuration backup. The existing rc and TLS upgrade backups
+remain available during package replacement.
+
+Compression and Base64 encoding do not encrypt the archived files. Use the
+OPNsense backup encryption option to protect custom commands or TLS private
+keys. Plugin reinstallation remains part of the OPNsense plugin restore flow.
 
 The web terminal starts a real TTY through `ttyd`, then prompts for a login name and connects to the local firewall through SSH:
 
@@ -27,7 +48,7 @@ Tested and verified in the following environments:
 
 ## Compatibility
 
-The installer targets OPNsense on FreeBSD 14 amd64. It first uses the bundled FreeBSD 14 amd64 packages under `vendor/freebsd14-amd64`, then tries the configured OPNsense package repositories, then falls back to the official FreeBSD 14 amd64 quarterly repository for `libwebsockets` and `ttyd`.
+The current package targets OPNsense 26.7 on FreeBSD 15 amd64. The build verifies the committed checksums for the three bundled runtime packages under `vendor/freebsd15-amd64`, then stages an explicit file and license inventory under `/usr/local/os-ttyd`. Shared-library aliases contain regular copies of the pinned ELF files. The FreeBSD 14 archives and checksums remain available for legacy work; this version rejects FreeBSD 14 builds until their own inventory and native validation are provided.
 
 ## Files
 
@@ -38,7 +59,8 @@ The installer targets OPNsense on FreeBSD 14 amd64. It first uses the bundled Fr
 - `src/usr/local/opnsense/service/conf/actions.d/actions_ttyd.conf`: configd service actions.
 - `src/usr/local/etc/rc.d/os-ttyd`: rc.d service script.
 - `src/etc/rc.conf.d/ttyd.sample`: default service configuration.
-- `vendor/freebsd14-amd64/*.pkg`: bundled FreeBSD 14 amd64 ttyd runtime packages.
+- `vendor/freebsd15-amd64/*.pkg`: pinned current FreeBSD 15 amd64 runtime packages.
+- `vendor/freebsd14-amd64/*.pkg`: retained legacy FreeBSD 14 runtime packages.
 - `build.sh`: builds `dist/os-ttyd.pkg` on FreeBSD/OPNsense. The package uses a private runtime under `/usr/local/os-ttyd`.
 
 ## Install

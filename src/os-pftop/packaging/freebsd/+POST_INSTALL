@@ -1,5 +1,13 @@
 #!/bin/sh
 
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-pftop >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
+
 echo "===> Preparing pfTop for OPNsense"
 chmod 0644 \
 	/usr/local/opnsense/mvc/app/controllers/OPNsense/Pftop/IndexController.php \

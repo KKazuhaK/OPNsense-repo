@@ -2,6 +2,10 @@
 
 service configd restart >/dev/null 2>&1 || true
 /usr/local/opnsense/scripts/firmware/register.php install os-unboundcustom >/dev/null 2>&1 || true
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
 configctl template reload OPNsense/Unboundcustom >/dev/null 2>&1 || true
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml
 configctl webgui restart >/dev/null 2>&1 || true

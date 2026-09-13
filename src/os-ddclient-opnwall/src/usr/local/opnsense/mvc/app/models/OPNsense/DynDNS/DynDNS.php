@@ -46,7 +46,7 @@ class DynDNS extends BaseModel
             $tagName = $node->getInternalXMLTagName();
             $parentNode = $node->getParentNode();
             if ($validateFullModel || $node->isFieldChanged()) {
-                if ($parentNode->getInternalXMLTagName() === 'account' && in_array($tagName, ['protocol', 'server'])) {
+                if ($parentNode->getInternalXMLTagName() === 'account' && in_array($tagName, ['service', 'protocol', 'server'])) {
                     $parentKey = $parentNode->__reference;
                     $validate_servers[$parentKey] = $parentNode;
                 }

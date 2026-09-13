@@ -1,0 +1,21 @@
+#!/bin/sh
+
+# Adopt whatever the configuration backup restored, once per boot.
+#
+# The package's own post-install already does this, which covers a firewall
+# restored from a backup and then rebuilt from the plugin list.  It does not
+# cover the other order: an operator who restores a configuration onto a box
+# that already has os-frp installed gets a config.xml holding the documents and
+# the boot flags, and nothing that would ever read them.  Without this hook that
+# restore converges never.
+#
+# It runs before 20-freebsd, which is what starts the services /etc/rc.conf.d
+# enables, so the flags and the documents are in place before frps and frpc are
+# started rather than one boot later.  manage.py only writes what actually
+# differs and starts nothing itself, so on every other boot this is a no-op.
+#
+# The side on the command line is ignored: the mirrored section covers both
+# daemons and the action restores both.  Failures are already reported inside
+# the JSON answer, and a boot is not the place to act on one.
+
+/usr/local/bin/python3 /usr/local/opnsense/scripts/frp/manage.py --json frps import-config >/dev/null 2>&1 || true

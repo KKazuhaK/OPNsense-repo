@@ -2,8 +2,8 @@
 $(function () {
     function report(data) {
         data = data || {};
-        $('#lucky-message').attr('class', 'alert alert-' + (data.status === 'ok' ? 'success' : 'danger'))
-            .text(data.status === 'ok' ? '{{ lang._('Settings saved and service command completed.') }}' : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
+        $('#lucky-message').attr('class', 'alert alert-' + (data.status === 'ok' ? (data.warning ? 'warning' : 'success') : 'danger'))
+            .text(data.status === 'ok' ? htmlDecode(data.warning || '{{ lang._('Settings saved and service command completed.') }}') : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
     }
     function refresh() {
         ajaxGet('/api/lucky/service/status', {}, function (data) {

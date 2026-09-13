@@ -107,6 +107,62 @@ class PathRemapTest(unittest.TestCase):
             'rm -f /tmp/fixture/usr/local/etc/ttyd.key /tmp/fixture/etc/rc.conf.d/ttyd /tmp/fixture/var/run/ttyd.pid')
 
 
+class BootWatcherContractTest(unittest.TestCase):
+    def test_early_callback_names_match_the_core_plugin_scanner_and_ship_the_watcher(self):
+        callbacks = [('os-lucky', 'lucky_backup.inc', 'lucky_backup_reconcile'),
+                     ('os-ddns-go', 'ddnsgo_backup.inc', 'ddnsgo_backup_reconcile'),
+                     ('os-staticarp', 'staticarp_backup.inc', 'staticarp_backup_reconcile'),
+                     ('os-easytier', 'easytier.inc', 'easytier_backup_configure'),
+                     ('os-ttyd', 'ttyd.inc', 'ttyd_backup_configure')]
+        for package, filename, callback in callbacks:
+            with self.subTest(package=package):
+                plugin = ROOT / 'src' / package / 'src/usr/local/etc/inc/plugins.inc.d' / filename
+                source = plugin.read_text()
+                self.assertRegex(source, r'function\s+' + re.escape(plugin.stem) + r'_configure\s*\(')
+                self.assertRegex(source, r"'early'\s*=>\s*\[\s*'" + callback + r"'\s*\]")
+                body = source.split('function ' + callback + '(', 1)[1].split('\n}', 1)[0]
+                invocation = re.search(r'/usr/sbin/service\s+([^\s]+)\s+onestart', body)
+                self.assertIsNotNone(invocation, 'Early restore must independently start the backup watcher')
+                service = invocation.group(1)
+                shipped = ROOT / 'src' / package / 'src/usr/local/etc/rc.d' / service
+                self.assertTrue(shipped.is_file(), 'Boot calls a backup service that the package does not ship: ' + service)
+                if not shipped.stat().st_mode & 0o111:
+                    build = (ROOT / 'src' / package / 'build.sh').read_text()
+                    self.assertRegex(build, r'chmod\s+0755[^\n]*"\$STAGEDIR/usr/local/etc/rc.d/' + re.escape(service) + '"',
+                                     'The package must stage its backup service as executable')
+                self.assertLess(body.index('config_mirror.py reconcile'), invocation.start())
+                self.assertNotRegex(body, r'(?:lucky|ddnsgo|staticarp|easytier|ttyd)_enable',
+                                    'Application disablement must not disable its independent watcher')
+
+    def test_singbox_start_hook_calls_a_shipped_backup_script_before_freebsd_services(self):
+        package = ROOT / 'src/os-sing-box/src/usr/local/etc'
+        hook = package / 'rc.syshook.d/start/15-singbox-backup'
+        source = hook.read_text()
+        invocation = re.search(r'/usr/sbin/service\s+([^\s]+)\s+onestart', source)
+        self.assertIsNotNone(invocation)
+        self.assertTrue((package / 'rc.d' / invocation.group(1)).is_file(),
+                        'service selects the rc script filename, not its PROVIDE or internal name')
+        self.assertLess(hook.name, '20-freebsd')
+        self.assertLess(source.index('config_mirror.py reconcile'), invocation.start())
+        self.assertNotIn('sing_box_enable', source)
+
+    @unittest.skipUnless(platform.system() == 'FreeBSD' and Path('/usr/local/etc/rc.freebsd').is_file(),
+                         'requires genuine OPNsense boot scripts')
+    def test_native_core_invokes_plugin_early_callbacks_and_start_syshooks_without_rc_defaults(self):
+        boot = Path('/usr/local/etc/rc.bootup').read_text()
+        rc = Path('/usr/local/etc/rc').read_text()
+        freebsd = Path('/usr/local/etc/rc.freebsd').read_text()
+        scanner = Path('/usr/local/etc/inc/plugins.inc').read_text()
+        syshook = Path('/usr/local/etc/rc.syshook.d/start/20-freebsd').read_text()
+        self.assertIn("plugins_configure('early', true);", boot)
+        self.assertLess(rc.index('/usr/local/etc/rc.bootup'), rc.index('/usr/local/etc/rc.syshook start'))
+        self.assertIn('/usr/local/etc/rc.freebsd start', syshook)
+        self.assertIn("sprintf('%s_configure', $name)", scanner)
+        self.assertIn('call_user_func_array($argf', scanner)
+        self.assertRegex(freebsd, r'if ! rc_enabled[^\n]*; then\s+continue')
+        self.assertNotIn('load_rc_config', freebsd, 'Changed Core selection rules need a fresh boot integration review')
+
+
 @unittest.skipUnless(platform.system() == 'FreeBSD' and shutil.which('pkg'), 'requires native FreeBSD pkg')
 class UpgradeTest(unittest.TestCase):
     def test_legacy_owned_rc_settings_survive_sample_conversion(self):

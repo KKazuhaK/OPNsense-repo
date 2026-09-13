@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ttyd}"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 ORIGIN="${ORIGIN:-opnsense/os-ttyd}"
 COMMENT="${COMMENT:-ttyd terminal for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -31,6 +31,7 @@ need_file() {
 
 command -v pkg >/dev/null 2>&1 || die "pkg command not found. Run this script on FreeBSD/OPNsense."
 command -v tar >/dev/null 2>&1 || die "tar command not found."
+command -v sha256 >/dev/null 2>&1 || die "sha256 command not found."
 
 need_file "src/etc/rc.conf.d/ttyd.sample"
 need_file "src/usr/local/etc/rc.d/os-ttyd"
@@ -42,6 +43,9 @@ need_file "src/usr/local/opnsense/service/conf/actions.d/actions_ttyd.conf"
 need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Ttyd/IndexController.php"
 need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Ttyd/Api/ServiceController.php"
 need_file "src/usr/local/opnsense/scripts/ttyd/manage.py"
+need_file "src/usr/local/opnsense/version/ttyd"
+grep -q "\"product_version\":\"$VERSION\"" "$SCRIPT_DIR/src/usr/local/opnsense/version/ttyd" ||
+	die "src/usr/local/opnsense/version/ttyd does not declare product_version $VERSION"
 need_file "packaging/freebsd/+MANIFEST.in"
 need_file "packaging/freebsd/+PRE_INSTALL"
 need_file "packaging/freebsd/+POST_INSTALL"
@@ -62,18 +66,20 @@ case "$TARGET_ABI" in
 esac
 
 case "$PKG_ABI" in
-	FreeBSD:*:amd64)
+	FreeBSD:15:amd64)
 		ABI_MAJOR="$(printf '%s\n' "$PKG_ABI" | awk -F: '{print $2}')"
 		PKG_ARCH="freebsd:${ABI_MAJOR}:x86:64"
 		;;
 	*)
-		die "unsupported ABI: $PKG_ABI"
+		die "unsupported ABI: $PKG_ABI; this version has a pinned FreeBSD 15 runtime only"
 		;;
 esac
 
 VENDOR_DIR="$SCRIPT_DIR/vendor/freebsd${ABI_MAJOR}-amd64"
 for package in libuv libwebsockets ttyd; do
 	[ -f "$VENDOR_DIR/${package}.pkg" ] || die "missing runtime package: $VENDOR_DIR/${package}.pkg"
+	pin="$(awk -v name="${package}.pkg" '$2 == name {print $1}' "$VENDOR_DIR/checksums.sha256")"
+	[ "$(sha256 -q "$VENDOR_DIR/${package}.pkg")" = "$pin" ] || die "runtime package differs from its committed digest: ${package}.pkg"
 done
 
 rm -rf "$WORKDIR"
@@ -83,16 +89,15 @@ copy_tree() {
 	src="$1"
 	dst="$2"
 	mkdir -p "$dst"
-	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' --no-xattrs -cf - .) | (cd "$dst" && tar -xf -)
+	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' --exclude '*.pyc' --exclude '*.pyo' --no-xattrs -cf - .) | (cd "$dst" && tar -xf -)
 }
 
 copy_from_runtime() {
 	path="$1"
 	dst="${2:-$path}"
-	if [ -e "$RUNTIMEDIR$path" ]; then
-		mkdir -p "$STAGEDIR$(dirname "$dst")"
-		cp -R -P -p "$RUNTIMEDIR$path" "$STAGEDIR$dst"
-	fi
+	[ -f "$RUNTIMEDIR$path" ] && [ ! -L "$RUNTIMEDIR$path" ] || die "missing regular runtime file: $path"
+	mkdir -p "$STAGEDIR$(dirname "$dst")"
+	cp -p "$RUNTIMEDIR$path" "$STAGEDIR$dst"
 }
 
 echo "==> Extracting bundled ttyd runtime for FreeBSD ${ABI_MAJOR}"
@@ -101,29 +106,29 @@ for package in libuv libwebsockets ttyd; do
 done
 
 copy_from_runtime /usr/local/bin/ttyd /usr/local/os-ttyd/bin/ttyd
-copy_from_runtime /usr/local/lib/libuv.so /usr/local/os-ttyd/lib/libuv.so
-copy_from_runtime /usr/local/lib/libuv.so.1 /usr/local/os-ttyd/lib/libuv.so.1
+copy_from_runtime /usr/local/lib/libuv.so.1.0.0 /usr/local/os-ttyd/lib/libuv.so
+copy_from_runtime /usr/local/lib/libuv.so.1.0.0 /usr/local/os-ttyd/lib/libuv.so.1
 copy_from_runtime /usr/local/lib/libuv.so.1.0.0 /usr/local/os-ttyd/lib/libuv.so.1.0.0
 copy_from_runtime /usr/local/lib/libwebsockets-evlib_uv.so /usr/local/os-ttyd/lib/libwebsockets-evlib_uv.so
-copy_from_runtime /usr/local/lib/libwebsockets.so /usr/local/os-ttyd/lib/libwebsockets.so
-copy_from_runtime /usr/local/lib/libwebsockets.so.19 /usr/local/os-ttyd/lib/libwebsockets.so.19
+copy_from_runtime /usr/local/lib/libwebsockets.so.21 /usr/local/os-ttyd/lib/libwebsockets.so
 copy_from_runtime /usr/local/lib/libwebsockets.so.21 /usr/local/os-ttyd/lib/libwebsockets.so.21
-if [ -d "$RUNTIMEDIR/usr/local/share/licenses" ]; then
-	for license_dir in "$RUNTIMEDIR"/usr/local/share/licenses/libuv-* \
-	    "$RUNTIMEDIR"/usr/local/share/licenses/libwebsockets-* \
-	    "$RUNTIMEDIR"/usr/local/share/licenses/ttyd-*; do
-		[ -d "$license_dir" ] || continue
-		copy_tree "$license_dir" "$STAGEDIR/usr/local/os-ttyd/share/licenses/$(basename "$license_dir")"
+for license_name in libuv-1.52.1 libwebsockets-4.5.8 ttyd-1.7.7_2; do
+	for license_file in LICENSE MIT catalog.mk; do
+		copy_from_runtime "/usr/local/share/licenses/$license_name/$license_file" \
+		    "/usr/local/os-ttyd/share/licenses/$license_name/$license_file"
 	done
-fi
-copy_from_runtime /usr/local/share/man/man1/ttyd.1.gz /usr/local/os-ttyd/share/man/man1/ttyd.1.gz
+done
 
 echo "==> Staging OPNsense integration files"
 copy_tree "$SCRIPT_DIR/src/etc" "$STAGEDIR/etc"
 copy_tree "$SCRIPT_DIR/src/usr" "$STAGEDIR/usr"
+for shared in config_backup.py config_backup.php; do
+	install -m 0644 "$SCRIPT_DIR/../common/$shared" "$STAGEDIR/usr/local/opnsense/scripts/ttyd/$shared"
+done
 
 chmod 0644 "$STAGEDIR/etc/rc.conf.d/ttyd.sample"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-ttyd"
+chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-ttyd-backup"
 chmod 0755 "$STAGEDIR/usr/local/os-ttyd/bin/ttyd"
 chmod 0644 \
 	"$STAGEDIR/usr/local/etc/lighttpd_webgui/conf.d/ttyd.conf" \
@@ -133,7 +138,8 @@ chmod 0644 \
 	"$STAGEDIR/usr/local/opnsense/service/conf/actions.d/actions_ttyd.conf"
 
 echo "==> Generating plist"
-find "$STAGEDIR" \( -type f -o -type l \) | sed "s#^$STAGEDIR##" | sort > "$PLIST"
+[ -z "$(find "$STAGEDIR" -type l -print)" ] || die "staged runtime must contain only regular files"
+find "$STAGEDIR" -type f | sed "s#^$STAGEDIR##" | sort > "$PLIST"
 
 FLATSIZE=0
 while IFS= read -r file; do

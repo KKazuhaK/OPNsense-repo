@@ -1,0 +1,10 @@
+<model>
+    <mount>//OPNsense/SingBox/backup</mount>
+    <version>1.0.0</version>
+    <description>Private Sing-box file snapshot carried by the native configuration backup.</description>
+    <items>
+        <schema type="TextField"><Required>N</Required></schema>
+        <archive type="TextField"><Required>N</Required></archive>
+        <checksum type="TextField"><Required>N</Required></checksum>
+    </items>
+</model>

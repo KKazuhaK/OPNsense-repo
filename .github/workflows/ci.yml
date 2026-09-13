@@ -15,36 +15,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: python -m pip install PyYAML==6.0.3
-      - name: Verify routing transitions and failure cases
-        run: |
-          python -m unittest discover -s src/os-mihomo/tests -v
-          python -m unittest discover -s src/os-sing-box/tests -v
-          python -m unittest discover -s src/os-kazuha-repo/tests -v
-          python -m unittest discover -s tests -v
-      - name: Verify migrated MVC plugin backends
-        run: |
-          python -B -m unittest discover -s src/os-speedtest/tests -v
-          python -B -m unittest discover -s src/os-lucky/tests -v
-          python -B -m unittest discover -s src/os-ddns-go/tests -v
-          python -B -m unittest discover -s src/os-frp/tests -v
-          python -B -m unittest discover -s src/os-easytier/tests/native -v
-          python -B -m unittest discover -s src/os-ttyd/tests/native -v
-          python -B -m unittest discover -s src/os-lang/tests/native -p test_archive.py -v
-          # These two default to the installed controller tree; on a runner
-          # there is none, so point them at the source they are checking.
-          php src/os-speedtest/tests/native/test-api.php \
-            src/os-speedtest/src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/Api
-          php src/os-sing-box/tests/native/test-api-contract.php \
-            src/os-sing-box/src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api
-          php tests/native/test-utility-api-contract.php
-          php tests/native/test-small-api-contract.php
-          php src/os-staticarp/tests/native/test-settings.php
+      - run: python -m pip install -r tests/requirements.txt
+      - name: Verify all package behavior and PHP API contracts
+        run: python -B tests/run.py
       - name: Check PHP syntax
         run: find src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
       - name: Check shell scripts
         run: |
-          for plugin in staticarp pftop lucky easytier ddns-go lang ttyd speedtest sing-box; do
+          for plugin in staticarp pftop lucky easytier ddns-go lang ttyd speedtest sing-box frp mihomo kazuha-repo ddclient-opnwall unboundcustom; do
             sh -n "src/os-$plugin/build.sh"
             for phase in PRE_INSTALL POST_INSTALL PRE_DEINSTALL POST_DEINSTALL; do
               hook="src/os-$plugin/packaging/freebsd/+$phase"

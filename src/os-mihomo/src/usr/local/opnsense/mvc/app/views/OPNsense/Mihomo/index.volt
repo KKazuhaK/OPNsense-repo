@@ -306,7 +306,9 @@ $(function () {
                 .text(state.dns_active ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
             $('#mihomo-enable').toggle(!state.transparent);
             $('#mihomo-disable').toggle(!!state.transparent);
-            $('#mihomo-warning').toggle(!!state.error).text(state.error || '');
+            const warnings = [state.error, state.backup_warning].filter(Boolean).join(' ');
+            $('#mihomo-warning').toggle(!!warnings).text(warnings);
+            $('#mihomo-repair-backup').toggle(!!state.backup_warning || !state.running);
         });
         get(api.log, function (d) { $('#mihomo-log').text((d || {}).log || ''); });
         get(api.subLog, function (d) { $('#mihomo-sub-log').text((d || {}).log || ''); });
@@ -324,7 +326,8 @@ $(function () {
             idle(button);
             data = decoded(data) || {};
             if (data.status === 'ok') {
-                report('success', done);
+                const warning = data.warning || (data.result || {}).warning;
+                report(warning ? 'warning' : 'success', warning || done);
                 load();
                 loadDevices();
             } else {
@@ -422,6 +425,8 @@ $(function () {
                         <button type="button" class="btn btn-default mihomo-action" data-action="start" data-done="{{ lang._('Service started.') }}">{{ lang._('Start') }}</button>
                         <button type="button" class="btn btn-default mihomo-action" data-action="stop" data-done="{{ lang._('Service stopped.') }}">{{ lang._('Stop') }}</button>
                         <button type="button" class="btn btn-default mihomo-action" data-action="restart" data-done="{{ lang._('Service restarted.') }}">{{ lang._('Restart') }}</button>
+                        <button id="mihomo-repair-backup" type="button" class="btn btn-warning mihomo-action" style="display:none" data-action="repairBackup" data-done="{{ lang._('Saved backup validated and restored. Transparent routing remains off.') }}">{{ lang._('Repair saved backup') }}</button>
+                        <div class="help-block">{{ lang._('Stop the service before repairing an edited saved backup. Repair validates and imports its saved configuration, then updates its checksum.') }}</div>
                         <div class="hidden" data-for="help_for_service">
                             {{ lang._('Starts or stops the proxy core. Installation and upgrades start proxy ports only; the router keeps its own routing and DNS until transparent routing is enabled below.') }}
                         </div>

@@ -33,7 +33,8 @@ use OPNsense\Core\Backend;
 
 /**
  * Every state change goes through configd, which already owns the entry points
- * the boot and WAN hooks use. Nothing here reaches into the state directory.
+ * the boot and WAN hooks use. Status reads the private backup warning when a
+ * failed first restore leaves no runtime status file yet.
  */
 class ServiceController extends ApiControllerBase
 {
@@ -43,6 +44,7 @@ class ServiceController extends ApiControllerBase
         'enableTransparent' => 'enable-transparent',
         'disableTransparent' => 'disable-transparent',
         'subUpdate' => 'sub-update',
+        'repairBackup' => 'repair-backup',
         'clearLog' => 'clear-log', 'clearSubLog' => 'clear-sub-log',
     ];
 
@@ -77,11 +79,40 @@ class ServiceController extends ApiControllerBase
     {
         $raw = @file_get_contents('/var/run/mihomo-status.json');
         $status = is_string($raw) ? json_decode($raw, true) : null;
-        if (!is_array($status) || time() - ($status['updated'] ?? 0) > 20) {
+        $warning = $this->backupWarning();
+        if (!is_array($status) || !is_numeric($status['updated'] ?? null) || time() - $status['updated'] > 20) {
             return ['running' => false, 'dns_active' => false,
+                    'transparent' => false, 'backup_warning' => $warning,
                     'error' => gettext('Service status is unavailable.')];
         }
+        $status['backup_warning'] = $warning !== '' ? $warning : ($status['backup_warning'] ?? '');
         return $status;
+    }
+
+    private function backupWarning(): string
+    {
+        $path = '/var/db/os-mihomo/backup-warning';
+        $before = @lstat($path);
+        if ($before === false || ($before['mode'] & 0170000) !== 0100000
+            || $before['uid'] !== 0 || ($before['mode'] & 0022) !== 0 || $before['size'] > 1024) {
+            return '';
+        }
+        $stream = @fopen($path, 'rb');
+        if ($stream === false) {
+            return '';
+        }
+        try {
+            $opened = fstat($stream);
+            if ($opened === false || $opened['dev'] !== $before['dev'] || $opened['ino'] !== $before['ino']
+                || ($opened['mode'] & 0170000) !== 0100000 || $opened['uid'] !== 0
+                || ($opened['mode'] & 0022) !== 0 || $opened['size'] > 1024) {
+                return '';
+            }
+            $warning = stream_get_contents($stream, 1025);
+            return is_string($warning) && strlen($warning) <= 1024 ? $warning : '';
+        } finally {
+            fclose($stream);
+        }
     }
 
     public function updateStatusAction(): array

@@ -36,6 +36,38 @@ chmod 0755 /usr/local/opnsense/scripts/frp/manage.py
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 service configd restart >/dev/null 2>&1 || true
 
+# A restored config.xml carries both TOML documents and both boot flags; put
+# them back before anything is started, so a firewall rebuilt from a backup
+# comes up with the tunnel it had rather than with the shipped samples.  The
+# side named here is ignored: the mirrored section covers both daemons and the
+# action restores both.  On an ordinary install or upgrade the stored state
+# already matches what is on disk and nothing is written.
+frp_restore_ok=NO
+if frp_import_result="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/frp/manage.py --json frps import-config)" &&
+    printf '%s' "$frp_import_result" | /usr/local/bin/python3 -c '
+import json, sys
+answer = json.load(sys.stdin)
+result = answer.get("result")
+raise SystemExit(0 if answer.get("ok") is True and isinstance(result, dict) and
+                 isinstance(result.get("warnings"), list) and not result["warnings"] else 1)
+' >/dev/null 2>&1; then
+    frp_restore_ok=YES
+    # Enroll existing legacy files too. No service is started by this writer.
+    /usr/local/bin/python3 - <<'PY' || echo 'Warning: FRP configuration backup could not be updated.' >&2
+import sys
+sys.path.insert(0, '/usr/local/opnsense/scripts/frp')
+import manage
+locks = [manage.locked(side) for side in sorted(manage.SIDES)]
+try:
+    raise SystemExit(0 if manage.mirror().get('ok') is True else 1)
+finally:
+    for lock in locks:
+        lock.close()
+PY
+else
+    echo 'Warning: FRP configuration restore failed or needs repair; its saved backup was retained.' >&2
+fi
+
 # A fresh installation starts nothing.  frps without a token, without dashboard
 # credentials and without an allowPorts range accepts anonymous clients on
 # arbitrary remote ports, so the first start has to follow a deliberate
@@ -44,11 +76,23 @@ service configd restart >/dev/null 2>&1 || true
 for side in frps frpc; do
     [ -f "$state/$side.restart" ] || continue
     rm -f "$state/$side.restart"
+    [ "$frp_restore_ok" = YES ] || continue
+    # A restored administrative disable overrides an outgoing restart marker.
+    /usr/local/bin/python3 - "$side" <<'PY' || continue
+import sys
+sys.path.insert(0, '/usr/local/opnsense/scripts/frp')
+import manage
+raise SystemExit(0 if manage.is_enabled(sys.argv[1]) else 1)
+PY
     /usr/local/bin/python3 /usr/local/opnsense/scripts/frp/manage.py --json "$side" restart >/dev/null 2>&1 || true
 done
 
 if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
     /usr/local/opnsense/scripts/firmware/register.php install os-frp >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
 fi
 echo "frp installed. Configure the server under Services > frp > Server (frps) and the client"
 echo "under Services > frp > Client (frpc) before starting either of them."

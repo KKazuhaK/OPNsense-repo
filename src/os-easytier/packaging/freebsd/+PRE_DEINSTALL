@@ -1,4 +1,5 @@
 #!/bin/sh
+service os-easytier-backup onestop >/dev/null 2>&1 || true
 # Stop EasyTier with a bounded wait.  rc.subr's normal process wait can block a
 # package operation for a long time when easytier-core is slow to terminate.
 pidfile=/var/run/easytier.pid

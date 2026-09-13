@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-lucky >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
+
 # Begin upgrade state restore.
 mkdir -p /etc/rc.conf.d
 if [ ! -f /etc/rc.conf.d/lucky ]; then
@@ -12,6 +20,14 @@ if [ ! -f /etc/rc.conf.d/lucky ]; then
 fi
 rm -f /var/db/os-lucky/rc.conf.upgrade
 # End upgrade state restore.
+
+# A restored native snapshot takes precedence over installation defaults.
+backup_result="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py import-config)" || {
+    echo "===> Unable to restore the saved plugin configuration." >&2
+    exit 1
+}
+backup_snapshot="$(printf '%s\n' "$backup_result" | /usr/local/bin/python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("snapshot") else "no")')"
+
 
 ABI="$(pkg config ABI 2>/dev/null || pkg -vv 2>/dev/null | awk -F'"' '/ABI =/ {print $2; exit}')"
 
@@ -27,7 +43,10 @@ case "$ABI" in
 esac
 
 echo "===> Preparing Lucky runtime"
-mkdir -p /etc/rc.conf.d /usr/local/etc/lucky
+mkdir -p /etc/rc.conf.d
+if [ "$backup_snapshot" = "no" ]; then
+    mkdir -p /usr/local/etc/lucky
+fi
 chmod 0755 /usr/local/bin/lucky /usr/local/etc/rc.d/os-lucky 2>/dev/null || true
 chmod 0644 \
 	/usr/local/opnsense/mvc/app/controllers/OPNsense/Lucky/IndexController.php \
@@ -38,6 +57,16 @@ touch /var/log/lucky.log 2>/dev/null || true
 chmod 0600 /var/log/lucky.log 2>/dev/null || true
 
 find /usr/local/opnsense/mvc/app/controllers/OPNsense/Lucky /usr/local/opnsense/mvc/app/views/OPNsense/Lucky /usr/local/opnsense/scripts/lucky -type f -exec chmod 0644 {} \; 2>/dev/null || true
+
+# Include existing settings in the next normal OPNsense configuration backup.
+/usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py mirror >/dev/null || {
+    echo "===> Unable to save the plugin configuration backup." >&2
+    exit 1
+}
+service os-lucky-backup start >/dev/null || {
+    echo "===> Unable to start the plugin configuration backup watcher." >&2
+    exit 1
+}
 
 # Remove the retired page when upgrading from a legacy package.
 rm -f /usr/local/www/lucky.php

@@ -1,0 +1,10 @@
+<model>
+    <mount>//OPNsense/EasyTier/backup</mount>
+    <description>Native backup mirror for EasyTier configuration files</description>
+    <version>1.0.0</version>
+    <items>
+        <schema type="TextField"><Required>N</Required></schema>
+        <archive type="TextField"><Required>N</Required></archive>
+        <checksum type="TextField"><Required>N</Required></checksum>
+    </items>
+</model>

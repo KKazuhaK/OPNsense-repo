@@ -6,8 +6,7 @@ CONFIG_DIR="/usr/local/etc/staticarp"
 SETTINGS_FILE="$CONFIG_DIR/settings.conf"
 ENTRIES_FILE="$CONFIG_DIR/entries.conf"
 INTERFACES_FILE="$CONFIG_DIR/interfaces.conf"
-
-mkdir -p "$CONFIG_DIR"
+LOCK_FILE="/var/db/os-staticarp-backup/settings.lock"
 
 get_setting() {
 	key="$1"
@@ -63,7 +62,7 @@ load_entries() {
 		ip="$(printf '%s\n' "$line" | awk '{print $1}')"
 		mac="$(printf '%s\n' "$line" | awk '{print $2}')"
 		[ -n "$ip" ] && [ -n "$mac" ] || continue
-		if ifconfig | grep -Eq "^[[:space:]]*inet[[:space:]]+$ip[[:space:]]"; then
+		if ifconfig | grep -Eq "^[[:space:]]*inet[[:space:]]+${ip}[[:space:]]"; then
 			continue
 		fi
 		printf '%s %s\n' "$ip" "$mac" >> "$tmpfile"
@@ -76,7 +75,23 @@ load_entries() {
 }
 
 case "${1:-apply}" in
-	apply)
+	apply|reset)
+		# Keep settings, bindings and interface modes from the same completed save.
+		# The lock file remains present; removing it would split concurrent locks.
+		(umask 077; mkdir -p "$(dirname "$LOCK_FILE")")
+		/usr/bin/lockf -k -t 10 "$LOCK_FILE" /bin/sh "$0" "_${1:-apply}"
+		# Mirroring acquires its own operation lock and then this settings lock.
+		# Run it only after the child and its settings lock have been released.
+		/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py mirror >/dev/null
+		printf 'OK\n'
+		;;
+	_apply)
+		for recovery in "$CONFIG_DIR"/.staticarp-recovery-*; do
+			if [ -e "$recovery" ] || [ -L "$recovery" ]; then
+				echo "A previous settings save needs recovery before bindings can be applied." >&2
+				exit 1
+			fi
+		done
 		if [ "$(get_setting enabled NO)" = "YES" ]; then
 			load_entries
 			apply_interface_modes
@@ -84,12 +99,10 @@ case "${1:-apply}" in
 			reset_interface_modes
 			/usr/sbin/arp -d -a >/dev/null 2>&1 || true
 		fi
-		printf 'OK\n'
 		;;
-	reset)
+	_reset)
 		reset_interface_modes
 		/usr/sbin/arp -d -a >/dev/null 2>&1 || true
-		printf 'OK\n'
 		;;
 	status)
 		printf 'enabled=%s\n' "$(get_setting enabled NO)"

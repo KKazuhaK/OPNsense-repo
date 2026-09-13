@@ -2,6 +2,12 @@
 set -eu
 
 die() { echo "error: $*" >&2; exit 1; }
+restore_plugins=no
+case "$#:$*" in
+    0:) ;;
+    1:--restore-plugins) restore_plugins=yes ;;
+    *) die 'usage: client.sh [--restore-plugins]' ;;
+esac
 [ "$(id -u)" -eq 0 ] || die 'run this bootstrap as root on OPNsense'
 root="${KAZUHA_REPO_ROOT:-}"
 case "$root" in ''|/*) ;; *) die 'repository root must be absolute' ;; esac
@@ -83,3 +89,34 @@ if [ -f "$repos/opnwall.conf" ]; then
 fi
 committed=yes
 echo 'Signed Kazuha repository installed and registered for firmware updates.'
+
+if [ "$restore_plugins" = yes ]; then
+    manifest_hook="$root/usr/local/opnsense/scripts/firmware/repos/kazuha.sh"
+    [ -f "$manifest_hook" ] || die 'the installed repository plugin has no restore manifest support'
+    sh "$manifest_hook" manifest > "$work/manifest"
+    # Resolve every desired name against this series' signed catalog first.
+    # Recorded versions describe the backup; restored machines use compatible
+    # current packages rather than installing old dependencies from another ABI.
+    while read -r plugin recorded extra; do
+        [ -n "$plugin" ] || continue
+        [ -z "$extra" ] || die 'invalid plugin restore manifest'
+        printf '%s\n' "$plugin" | LC_ALL=C grep -Eq '^os-[a-z0-9][a-z0-9-]*$' || die 'invalid plugin name in restore manifest'
+        printf '%s\n' "$recorded" | LC_ALL=C grep -Eq '^[0-9][0-9A-Za-z._,+~-]*$' || die 'invalid plugin version in restore manifest'
+        [ "$plugin" != os-kazuha-repo ] || continue
+        available="$(pkg -4 rquery -r kazuha '%n %v' "$plugin")"
+        available_name="${available%% *}"
+        available_version="${available#* }"
+        [ "$available_name" = "$plugin" ] || die "restored plugin is unavailable for $series: $plugin"
+        printf '%s\n' "$available_version" | LC_ALL=C grep -Eq '^[0-9][0-9A-Za-z._,+~-]*$' || die "invalid catalog version for $plugin"
+        printf '%s-%s\n' "$plugin" "$available_version" >> "$work/restore-packages"
+    done < "$work/manifest"
+    if [ -f "$work/restore-packages" ]; then
+        set --
+        while IFS= read -r package; do set -- "$@" "$package"; done < "$work/restore-packages"
+        pkg -4 install -U -y -r kazuha "$@"
+        sh "$manifest_hook" mirror
+        echo 'Plugins from the restored configuration were installed from the signed catalog.'
+    else
+        echo 'No additional plugins were recorded in the restored configuration.'
+    fi
+fi

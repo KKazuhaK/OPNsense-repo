@@ -41,3 +41,9 @@ pkg add -f dist/os-staticarp.pkg
 ## 注意
 
 启用静态绑定或将接口切换为静态应答前，请先确认当前管理主机已经加入绑定列表，否则可能失去 WebGUI 访问。
+
+## Configuration backup
+
+The normal OPNsense configuration backup includes a compressed, checksummed snapshot of `/usr/local/etc/staticarp` and `/etc/rc.conf.d/staticarp` under `OPNsense/Staticarp/backup`. The existing files remain the runtime configuration source. Successful saves and apply/reset commands update the snapshot; a background watcher also captures external file and service-enable changes.
+
+Restore the normal OPNsense backup and reboot. An early configuration hook restores changed snapshots before service configuration is loaded. Unchanged snapshots do not replace newer runtime files. File contents, absence and permission modes are preserved. Installation imports a saved snapshot before creating defaults. Temporary files, logs, PID files and locks are excluded.

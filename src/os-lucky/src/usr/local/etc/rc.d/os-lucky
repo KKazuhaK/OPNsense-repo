@@ -1,13 +1,25 @@
 #!/bin/sh
 
 # PROVIDE: lucky
-# REQUIRE: NETWORKING
+# REQUIRE: NETWORKING lucky_backup
 # KEYWORD: shutdown
 
 . /etc/rc.subr
 
 name="lucky"
 rcvar="lucky_enable"
+
+# Reconcile restored XML before reading service enable and configuration paths.
+case "${1:-}" in
+    start|onestart|faststart|forcestart)
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py reconcile >/dev/null || exit 1
+        ;;
+esac
+
+backup_force_restart=no
+case "${1:-}" in
+    onerestart|forcerestart) backup_force_restart=yes ;;
+esac
 
 load_rc_config "$name"
 
@@ -24,6 +36,7 @@ start_precmd="${name}_prestart"
 start_cmd="${name}_start"
 stop_cmd="${name}_stop"
 status_cmd="${name}_status"
+restart_cmd="${name}_restart"
 
 lucky_prestart()
 {
@@ -41,7 +54,8 @@ lucky_prestart()
 lucky_start()
 {
 	$command -P "$pidfile" -r -f -o "$logfile" -t "${name}:daemon" \
-		"$lucky_bin" -cd "$lucky_conf_dir" -port "$lucky_http_port"
+		"$lucky_bin" -cd "$lucky_conf_dir" -port "$lucky_http_port" || return $?
+	/usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py mirror >/dev/null
 }
 
 lucky_stop()
@@ -49,11 +63,44 @@ lucky_stop()
 	if [ -f "$pidfile" ]; then
 		daemon_pid="$(cat "$pidfile" 2>/dev/null)"
 		if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
-			pkill -TERM -P "$daemon_pid" 2>/dev/null || true
+			children="$(pgrep -P "$daemon_pid" 2>/dev/null || true)"
 			kill -TERM "$daemon_pid" 2>/dev/null || true
+			for child in $children; do
+				kill -TERM "$child" 2>/dev/null || true
+				remaining=50
+				while kill -0 "$child" 2>/dev/null && [ "$remaining" -gt 0 ]; do
+					sleep 0.1
+					remaining=$((remaining - 1))
+				done
+				# Do not import or mirror while a writer can still flush old settings.
+				if kill -0 "$child" 2>/dev/null; then
+					return 1
+				fi
+			done
 		fi
 		rm -f "$pidfile"
 	fi
+	if [ "${1:-}" != "skip-backup" ]; then
+		/usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py mirror >/dev/null
+	fi
+}
+
+lucky_restart()
+{
+    # Stop embedded writers before applying a newly restored XML snapshot.
+    lucky_stop skip-backup || return $?
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py reconcile >/dev/null || return $?
+    unset lucky_enable lucky_conf_dir lucky_http_port
+    load_rc_config "$name"
+	: "${lucky_enable:=YES}"
+	: "${lucky_conf_dir:=/usr/local/etc/lucky}"
+	: "${lucky_http_port:=16601}"
+    if [ "$backup_force_restart" = "no" ] && ! checkyesno "$rcvar"; then
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py mirror >/dev/null
+        return $?
+    fi
+    lucky_prestart || return $?
+    lucky_start
 }
 
 lucky_status()

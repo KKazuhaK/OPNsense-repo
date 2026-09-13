@@ -18,10 +18,7 @@ if grep -R -l -E -- '-----BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----'
     exit 1
 fi
 python3 "$SCRIPT_DIR/verify-repo.py" "$SITE_DIR" --source "$SCRIPT_DIR"
-python3 -m unittest discover -s "$SCRIPT_DIR/src/os-mihomo/tests"
-python3 -m unittest discover -s "$SCRIPT_DIR/src/os-sing-box/tests"
-python3 -m unittest discover -s "$SCRIPT_DIR/tests"
-python3 -m unittest discover -s "$SCRIPT_DIR/src/os-kazuha-repo/tests"
+python3 -B "$SCRIPT_DIR/tests/run.py"
 source_commit="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SITE_DIR/release.json")"
 [ "$(git -C "$SCRIPT_DIR" rev-parse HEAD)" = "$source_commit" ] || { echo 'release source revision does not match the checkout' >&2; exit 1; }
 [ -z "$(git -C "$SCRIPT_DIR" status --porcelain)" ] || { echo 'commit tested source before publishing' >&2; exit 1; }

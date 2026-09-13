@@ -1,4 +1,4 @@
-VERSION?= 1.0.0
+VERSION?= 1.0.1
 TARGET_PRODUCT_ABI?= 26.7
 
 .PHONY: package clean

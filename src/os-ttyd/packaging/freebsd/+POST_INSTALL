@@ -1,13 +1,18 @@
 #!/bin/sh
 set -eu
 
-mkdir -p /etc/rc.conf.d
-if [ ! -f /etc/rc.conf.d/ttyd ]; then
-    if [ -f /var/db/os-ttyd/rc.conf.upgrade ]; then
-        cp -p /var/db/os-ttyd/rc.conf.upgrade /etc/rc.conf.d/ttyd
-    else
-        install -m 0644 /etc/rc.conf.d/ttyd.sample /etc/rc.conf.d/ttyd
-    fi
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-ttyd >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
+
+# Begin upgrade state restore.
+if [ ! -f /etc/rc.conf.d/ttyd ] && [ -f /var/db/os-ttyd/rc.conf.upgrade ]; then
+    mkdir -p /etc/rc.conf.d
+    cp -p /var/db/os-ttyd/rc.conf.upgrade /etc/rc.conf.d/ttyd
 fi
 rm -f /var/db/os-ttyd/rc.conf.upgrade
 
@@ -21,9 +26,18 @@ for name in ttyd.crt ttyd.key; do
         rm -f "$backup"
     fi
 done
+# End upgrade state restore.
 
 # Remove the retired entry point when upgrading from the legacy page.
 rm -f /usr/local/www/diag_ttyd.php
+result="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/ttyd/config_mirror.py import-config)" || exit 1
+snapshot="$(printf '%s' "$result" | /usr/local/bin/python3 -c 'import json,sys; result=json.load(sys.stdin); sys.exit(1) if not result.get("ok") else print("yes" if result.get("snapshot") else "no")')" || exit 1
+if [ "$snapshot" = no ] && [ ! -e /etc/rc.conf.d/ttyd ]; then
+    mkdir -p /etc/rc.conf.d
+    install -m 0644 /etc/rc.conf.d/ttyd.sample /etc/rc.conf.d/ttyd
+fi
+/usr/local/bin/python3 /usr/local/opnsense/scripts/ttyd/config_mirror.py mirror >/dev/null || echo 'Warning: ttyd configuration backup could not be updated.' >&2
+service os-ttyd-backup onestart >/dev/null 2>&1 || echo 'Warning: ttyd configuration backup watcher could not be started.' >&2
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -40,7 +54,6 @@ log "$YELLOW" "Setting file permissions..."
 chmod 0755 /usr/local/etc/rc.d/os-ttyd 2>/dev/null || true
 chmod 0755 /usr/local/os-ttyd/bin/ttyd 2>/dev/null || true
 chmod 0644 \
-	/usr/local/etc/lighttpd_webgui/conf.d/ttyd.conf \
 	/usr/local/opnsense/mvc/app/views/OPNsense/Ttyd/index.volt \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/Menu/Menu.xml \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Ttyd/ACL/ACL.xml \

@@ -1,0 +1,97 @@
+<model>
+    <mount>//OPNsense/Mihomo/backup</mount>
+    <description>Mihomo intent mirrored into config.xml so the native backup carries it</description>
+    <version>1.0.0</version>
+    <!--
+        An OPNsense backup is config.xml and nothing else, so anything the plugin
+        keeps under /var/db/os-mihomo is lost the moment the operator restores one.
+        This section is a one-directional mirror of the small, non-derivable part
+        of that state: the files on disk stay what the daemon reads, and this is
+        what the backup carries for free.
+
+        Two properties the field types are chosen for:
+
+        Nothing is Required. A section that is absent, partial, or written by an
+        older version of the plugin must still load, because the alternative is a
+        model that refuses to instantiate on exactly the restored box that needs it.
+
+        Every field is a TextField, even the ones that hold a boolean or a port.
+        A BooleanField defaults to "0" when its node is missing, which reads back
+        as a stored false and is indistinguishable from one; the empty string a
+        TextField gives instead is what lets the Python side tell "this version
+        never wrote that field" from "the operator turned it off". The same
+        reasoning keeps the ports and the MTU out of IntegerField: a value a
+        future range check would reject must still reach the backup, because
+        failing to mirror is worse than mirroring something this version cannot
+        parse. All decoding, defaulting and validation lives in mihomo.py.
+    -->
+    <items>
+        <!-- The settings.json intent keys. state_schema and switch_schema are
+             deliberately absent: they describe the on-disk file's own migration
+             history, and the import path re-stamps them to the constants this
+             version ships rather than restoring a stale pair. -->
+        <subscription_url type="TextField"/>
+        <secret type="TextField"/>
+        <device type="TextField"/>
+        <service_enabled type="TextField"/>
+        <!-- Mirrored so the backup records what the box was doing, never so the
+             import can put it back: transparent routing is re-armed by the
+             operator on the restored box, the same click that armed it here. -->
+        <transparent type="TextField"/>
+        <transparent_consent type="TextField"/>
+        <mixed_port type="TextField"/>
+        <socks_port type="TextField"/>
+        <bind_address type="TextField"/>
+        <allow_lan type="TextField"/>
+        <tun_stack type="TextField"/>
+        <tun_mtu type="TextField"/>
+        <dns_mode type="TextField"/>
+        <dns_hijack type="TextField"/>
+        <dns_fallback type="TextField"/>
+        <router_dns type="TextField"/>
+        <ipv6 type="TextField"/>
+        <geo_source type="TextField"/>
+        <dns_default type="TextField"/>
+        <dns_nameserver type="TextField"/>
+        <dns_proxy_nameserver type="TextField"/>
+        <device_mode type="TextField"/>
+        <device_list type="TextField"/>
+        <controller type="TextField"/>
+
+        <!-- The overlay the operator hand-edits, verbatim. merge_preset names the
+             shipped preset when the overlay is still that preset untouched, so a
+             restore re-derives it from the preset this version ships instead of
+             pinning bytes written by an older one. -->
+        <merge_yaml type="TextField"/>
+        <merge_preset type="TextField"/>
+
+        <!-- The subscription as last fetched, gzipped: roughly 490 KB of YAML
+             becomes 60 KB of compressed bytes. It is stored so a restore never
+             depends on the provider still being reachable or the URL still being
+             valid; the normal fetch path takes over from there. -->
+        <subscription_snapshot type="Base64Field"/>
+
+        <!-- Which proxy group is set to what, for the groups whose selection is
+             not simply the first option the provider listed. Read from and
+             replayed through the control API rather than copied out of the core's
+             bbolt cache, which is 32 KB of format we do not own. -->
+        <proxy_selections type="TextField"/>
+
+        <!-- The ownership journals, verbatim. They record which <optN> interface
+             assignment, which filter rule and which <unboundplus> edits in THIS
+             config.xml are ours, so they belong inside the config.xml they
+             journal: that pairing is what lets a restore onto a different box
+             undo edits that would otherwise dangle forever. -->
+        <dns_state type="TextField"/>
+        <tun_state type="TextField"/>
+        <!-- Hash of this XML's UUID, hostname and domain. A matching, nonempty
+             value pairs the archived journals with this configuration before
+             ownership rollback; it never authorizes transparent routing. This
+             identity travels with a full backup and is not hardware attestation. -->
+        <consent_scope type="TextField"/>
+        <!-- Integrity of all mirrored fields, including credentials and journals. -->
+        <checksum type="TextField"/>
+        <!-- Explicit type:file rule and proxy providers; HTTP caches are derived. -->
+        <local_files type="TextField"/>
+    </items>
+</model>

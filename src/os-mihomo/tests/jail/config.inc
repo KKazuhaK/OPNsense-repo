@@ -1,19 +1,9 @@
 <?php
-/* Minimal synthetic configuration adapter; never reads the production config. */
-namespace OPNsense\Core {
-    class Config {
-        private static $instance;
-        private $xml;
-        private $handle;
-        public static function getInstance() { return self::$instance ??= new self(); }
-        public function lock() {
-            $this->handle = fopen('/tmp/config.lock', 'a');
-            flock($this->handle, LOCK_EX);
-            $this->xml = simplexml_load_file('/conf/config.xml');
-        }
-        public function object() { return $this->xml; }
-        public function save($revision) { $this->xml->asXML('/conf/config.xml'); }
-        public function unlock() { fclose($this->handle); }
-    }
+/* Genuine package-owned Core reads only the private jail's generated config.xml.
+   The revision helper and service/configd/filter adapters remain synthetic. */
+require_once('script/load_phalcon.php');
+
+function make_config_revision_entry($text)
+{
+    return ['description' => $text, 'username' => 'VNET lifecycle test'];
 }
-namespace { function make_config_revision_entry($text) { return $text; } }

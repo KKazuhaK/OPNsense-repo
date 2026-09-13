@@ -6,6 +6,12 @@
 
 . /etc/rc.subr
 
+case "$1" in
+    start|onestart|restart|onerestart)
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/ttyd/config_mirror.py reconcile >/dev/null || exit 1
+        ;;
+esac
+
 name="ttyd"
 rcvar="ttyd_enable"
 
@@ -72,11 +78,24 @@ ttyd_start()
 		sh -c "$ttyd_command"
 }
 
+ttyd_pid()
+{
+	[ -f "$pidfile" ] || return 1
+	daemon_pid="$(cat "$pidfile" 2>/dev/null)"
+	case "$daemon_pid" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$daemon_pid" -gt 1 ] 2>/dev/null || return 1
+	# A stale PID file must not authorize signalling an unrelated process.
+	process_identity="$(/bin/timeout 2 /bin/ps -p "$daemon_pid" -o comm= -o command= 2>/dev/null)" || return 1
+	printf '%s\n' "$process_identity" | grep -Eq '^[[:space:]]*daemon[[:space:]]+daemon: ttyd:daemon\[[0-9]+\] \(daemon\)[[:space:]]*$' || return 1
+	printf '%s\n' "$daemon_pid"
+}
+
 ttyd_stop()
 {
 	if [ -f "$pidfile" ]; then
-		daemon_pid="$(cat "$pidfile" 2>/dev/null)"
-		if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+		if daemon_pid="$(ttyd_pid)" && kill -0 "$daemon_pid" 2>/dev/null; then
 			pkill -TERM -P "$daemon_pid" 2>/dev/null || true
 			kill -TERM "$daemon_pid" 2>/dev/null || true
 		fi
@@ -86,8 +105,8 @@ ttyd_stop()
 
 ttyd_status()
 {
-	if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-		echo "${name} is running as pid $(cat "$pidfile")."
+	if daemon_pid="$(ttyd_pid)" && kill -0 "$daemon_pid" 2>/dev/null; then
+		echo "${name} is running as pid ${daemon_pid}."
 		return 0
 	fi
 

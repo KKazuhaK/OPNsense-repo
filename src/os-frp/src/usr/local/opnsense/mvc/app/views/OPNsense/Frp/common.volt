@@ -164,7 +164,8 @@ window.frpCommon = function (page) {
             idle(button);
             data = decoded(data) || {};
             if (data.status === 'ok') {
-                report('success', done);
+                const warning = data.result && data.result.mirror && data.result.mirror.warning;
+                report(warning ? 'warning' : 'success', warning ? done + ' ' + warning : done);
                 if (after) { after(); }
             } else {
                 report('danger', data.error

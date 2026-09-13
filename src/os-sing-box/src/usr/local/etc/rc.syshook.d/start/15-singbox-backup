@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# Restore a newly imported configuration before 20-freebsd starts services.
+/usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py reconcile >/dev/null 2>&1 || true
+/usr/sbin/service sing-box-backup onestart >/dev/null 2>&1 || true

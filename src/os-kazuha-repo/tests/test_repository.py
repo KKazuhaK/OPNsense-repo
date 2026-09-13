@@ -64,14 +64,63 @@ if candidate:
  assert 'https://kkazuhak.github.io/OPNsense-repo/repo/${ABI}' in content
  assert str(repo.parents[1] / "kazuha.pub") in content
 if os.environ["FAIL_PHASE"] == phase: sys.exit(1)
-if "rquery" in args: print("1.0.0" if "%v" in args else "os-kazuha-repo")''',
+if "rquery" in args:
+ if "%n %v" in args:
+  version=json.loads(os.environ.get("CATALOG", "{}" )).get(args[-1])
+  if version: print(args[-1]+" "+version)
+ else: print("1.0.0" if "%v" in args else "os-kazuha-repo")''',
         }.items():
             path = self.bin / name
             path.write_text('#!' + sys.executable + '\n' + code + '\n')
             path.chmod(0o755)
 
-    def run_script(self, script):
-        return subprocess.run(['sh', str(script)], env=self.env, capture_output=True, text=True)
+    def run_script(self, script, *arguments):
+        return subprocess.run(['sh', str(script), *arguments], env=self.env, capture_output=True, text=True)
+
+    def restore_manifest(self, content, catalog):
+        hook = self.root / 'usr/local/opnsense/scripts/firmware/repos/kazuha.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('''#!/bin/sh
+case "$1" in
+manifest) cat "$KAZUHA_REPO_ROOT/restore-manifest" ;;
+mirror) exit 0 ;;
+*) exit 1 ;;
+esac
+''')
+        (self.root / 'restore-manifest').write_text(content)
+        self.env['CATALOG'] = json.dumps(catalog)
+
+    def test_bootstrap_restores_manifest_names_using_current_signed_catalog_versions(self):
+        self.restore_manifest('os-kazuha-repo 1.0.0\nos-frp 1.0.0\nos-speedtest 1.1.0\n',
+                              {'os-frp': '1.0.1', 'os-speedtest': '1.1.1'})
+        result = self.run_script(BOOTSTRAP, '--restore-plugins')
+        self.assertEqual(0, result.returncode, result.stderr)
+        calls = [json.loads(line) for line in (self.base / 'trace').read_text().splitlines()]
+        restore = [call for call in calls if 'install' in call and 'os-frp-1.0.1' in call]
+        self.assertEqual(1, len(restore))
+        self.assertEqual(['os-frp-1.0.1', 'os-speedtest-1.1.1'], restore[0][-2:])
+        self.assertTrue(all('-r' in call and 'kazuha' in call for call in restore))
+
+    def test_restore_preflights_all_plugins_before_installing_any_of_them(self):
+        self.restore_manifest('os-frp 1.0.0\nos-missing 1.0.0\n', {'os-frp': '1.0.1'})
+        result = self.run_script(BOOTSTRAP, '--restore-plugins')
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('unavailable', result.stderr)
+        calls = [json.loads(line) for line in (self.base / 'trace').read_text().splitlines()]
+        self.assertFalse(any('install' in call and 'os-frp-1.0.1' in call for call in calls))
+
+    def test_restore_rejects_invalid_manifest_names_and_versions(self):
+        for content in ['--repository 1.0.0\n', 'os-frp 1.0.0;touch\n',
+                        'os-frp 1.0.0 extra\n', 'os-frp\n']:
+            with self.subTest(content=content):
+                self.restore_manifest(content, {'os-frp': '1.0.1'})
+                self.assertNotEqual(0, self.run_script(BOOTSTRAP, '--restore-plugins').returncode)
+
+    def test_bootstrap_requires_explicit_restore_option(self):
+        self.restore_manifest('os-frp 1.0.0\n', {'os-frp': '1.0.1'})
+        self.assertEqual(0, self.run_script(BOOTSTRAP).returncode)
+        calls = [json.loads(line) for line in (self.base / 'trace').read_text().splitlines()]
+        self.assertFalse(any('os-frp-1.0.1' in call for call in calls))
 
     def assert_original_files(self):
         self.assertEqual('original repository configuration\n', self.config.read_text())
@@ -162,7 +211,7 @@ if "rquery" in args: print("1.0.0" if "%v" in args else "os-kazuha-repo")''',
         metadata = json.loads((PLUGIN / 'src/usr/local/opnsense/version/kazuha-repo').read_text())
         self.assertEqual('os-kazuha-repo', metadata['product_id'])
         self.assertEqual('26.7', metadata['product_abi'])
-        self.assertEqual('1.0.0', metadata['product_version'])
+        self.assertEqual('1.0.1', metadata['product_version'])
         self.assertEqual('92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b', hashlib.sha256(KEY.read_bytes()).hexdigest())
 
 

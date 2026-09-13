@@ -1,0 +1,38 @@
+<model>
+    <mount>//OPNsense/Frp/backup</mount>
+    <!-- An OPNsense configuration backup is /conf/config.xml and nothing else.
+         frp keeps its state in /usr/local/etc/frp and /etc/rc.conf.d, so until
+         this section existed a restored firewall came back with the shipped
+         samples and a tunnel that never dialled again.  This is a mirror, not a
+         second source of truth: the daemons still read the files, and every
+         field here is written from them. -->
+    <description>frp state carried by the OPNsense configuration backup</description>
+    <version>1.0.0</version>
+    <items>
+        <!-- The whole document, byte for byte, including auth.token.  frp's
+             own decoding uses strict configuration validation, the Advanced tab accepts any key
+             frp accepts, and a single coerced type stops the daemon: there is
+             no field-by-field model of a frp configuration that is both
+             faithful and safe, so the document is the representation. -->
+        <frps_toml type="TextField">
+            <Required>N</Required>
+        </frps_toml>
+        <frpc_toml type="TextField">
+            <Required>N</Required>
+        </frpc_toml>
+        <!-- /etc/rc.conf.d/frps and /etc/rc.conf.d/frpc are not package-owned
+             and are seeded to NO on a reinstall, so these two booleans are the
+             only thing deciding whether the tunnel comes back at the next boot. -->
+        <frps_enable type="BooleanField">
+            <default>0</default>
+            <Required>N</Required>
+        </frps_enable>
+        <frpc_enable type="BooleanField">
+            <default>0</default>
+            <Required>N</Required>
+        </frpc_enable>
+    </items>
+    <!-- Nothing above is Required: a section that is absent, half written by an
+         older version or partly unknown to a newer one still has to load, or
+         the restore path this exists for is the path that breaks. -->
+</model>

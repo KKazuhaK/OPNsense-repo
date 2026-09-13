@@ -1,5 +1,13 @@
 #!/bin/sh
 set -eu
+control=/usr/local/opnsense/scripts/mihomo/mihomo.py
+# Mirror existing managed intent before an upgrade retires the old runtime.
+if [ -n "${PKG_UPGRADE+x}" ] && [ -f /var/db/os-mihomo/settings.json ] &&
+    grep -q 'def mirror_backup' "$control" 2>/dev/null; then
+    if ! /usr/local/bin/python3 "$control" mirror-backup; then
+        echo 'Warning: the Mihomo backup could not be refreshed; the existing saved configuration is retained.' >&2
+    fi
+fi
 # Save the original package-owned configuration before the old removal hook runs.
 if [ -n "${PKG_UPGRADE+x}" ]; then
     install -d -m 0700 /var/db/os-mihomo/migrate

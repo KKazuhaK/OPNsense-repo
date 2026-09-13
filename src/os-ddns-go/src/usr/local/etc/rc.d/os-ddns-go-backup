@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# PROVIDE: ddnsgo_backup
+# REQUIRE: FILESYSTEMS
+# BEFORE: ddnsgo
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="ddnsgo_backup"
+rcvar="ddnsgo_backup_enable"
+load_rc_config "$name"
+: "${ddnsgo_backup_enable:=YES}"
+
+pidfile="/var/run/ddnsgo-backup.pid"
+command="/usr/sbin/daemon"
+procname="/usr/local/bin/python3"
+command_args="-p $pidfile -f /usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py watch"
+start_precmd="ddnsgo_backup_prestart"
+stop_postcmd="ddnsgo_backup_stopped"
+
+ddnsgo_backup_prestart()
+{
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py reconcile >/dev/null
+}
+
+ddnsgo_backup_stopped()
+{
+    rm -f "$pidfile"
+}
+
+run_rc_command "$1"

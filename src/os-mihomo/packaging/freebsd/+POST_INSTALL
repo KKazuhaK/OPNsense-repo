@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 control=/usr/local/opnsense/scripts/mihomo/mihomo.py
+# Import the native snapshot before any defaults or service startup.
+restore_ready=YES
+if ! /usr/local/bin/python3 "$control" reconcile-backup; then
+    restore_ready=NO
+    echo 'Warning: the saved Mihomo configuration needs repair. Installation will finish with the service stopped and the saved backup retained.' >&2
+fi
 install -d -m 0700 /var/db/os-mihomo
 # Discard historical subscription diagnostics that may contain credentials.
 if [ ! -f /var/db/os-mihomo/settings.json ]; then
@@ -12,21 +18,29 @@ for log in /var/log/mihomo.log /var/log/mihomo_sub.log; do
     chmod 0640 "$log"
 done
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
-if [ -n "${PKG_UPGRADE+x}" ]; then
-    /usr/local/bin/python3 "$control" init upgrade
-else
-    /usr/local/bin/python3 "$control" init fresh
-fi
-cron_result="$(/usr/local/bin/php /usr/local/opnsense/scripts/mihomo/setup_unbound.php restore-cron)"
-case "$cron_result" in *updated*) configctl cron restart ;; esac
-# Retire the known local workaround entry points after archiving them on migration.
-if [ -f /var/db/os-mihomo/migrate/actions_mihomolocal.conf ]; then
-    rm -f /usr/local/opnsense/service/conf/actions.d/actions_mihomolocal.conf
-    rm -f /usr/local/etc/mihomo/update-sub.sh /usr/local/etc/mihomo/repair-after-upgrade.sh
+if [ "$restore_ready" = YES ]; then
+    if [ -n "${PKG_UPGRADE+x}" ]; then
+        /usr/local/bin/python3 "$control" init upgrade
+    else
+        /usr/local/bin/python3 "$control" init fresh
+    fi
+    cron_result="$(/usr/local/bin/php /usr/local/opnsense/scripts/mihomo/setup_unbound.php restore-cron)"
+    case "$cron_result" in *updated*) configctl cron restart ;; esac
+    # Retire known workaround entry points only after successful migration.
+    if [ -f /var/db/os-mihomo/migrate/actions_mihomolocal.conf ]; then
+        rm -f /usr/local/opnsense/service/conf/actions.d/actions_mihomolocal.conf
+        rm -f /usr/local/etc/mihomo/update-sub.sh /usr/local/etc/mihomo/repair-after-upgrade.sh
+    fi
 fi
 service configd restart
 if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
     /usr/local/opnsense/scripts/firmware/register.php install os-mihomo
 fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 ||
+        echo 'Warning: the installed plugin recovery manifest could not be refreshed.' >&2
+fi
 # A fresh installation runs proxy ports only. Upgrade retains the explicit policy.
-/usr/local/bin/python3 "$control" boot
+if [ "$restore_ready" = YES ]; then
+    /usr/local/bin/python3 "$control" boot
+fi

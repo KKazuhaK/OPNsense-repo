@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # PROVIDE: staticarp
-# REQUIRE: NETWORKING
+# REQUIRE: NETWORKING staticarp_backup
 # KEYWORD: shutdown
 
 . /etc/rc.subr
@@ -10,6 +10,13 @@ name="staticarp"
 rcvar="staticarp_enable"
 start_cmd="staticarp_start"
 stop_cmd="staticarp_stop"
+
+# Reconcile restored XML before reading service enable and configuration paths.
+case "${1:-}" in
+    start|onestart|faststart|forcestart|restart|onerestart|fastrestart|forcerestart)
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py reconcile >/dev/null || exit 1
+        ;;
+esac
 
 load_rc_config "$name"
 : "${staticarp_enable:=YES}"

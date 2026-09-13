@@ -56,6 +56,9 @@ $(function () {
     function servers(items, selected) {
         var select=$('#speedtest-server').empty().append($('<option>').val('').text(t('server_auto')));
         (items || []).forEach(function (item) {select.append($('<option>').val(item.id).text(htmlDecode('['+item.id+'] '+item.name+' - '+item.sponsor+' / '+item.latency+' / '+Number(item.distance).toFixed(1)+' km')));});
+        if (selected && !select.find('option').toArray().some(function (option) {return option.value === String(selected);})) {
+            select.append($('<option>').val(selected).text('['+selected+']'));
+        }
         select.val(selected || '').selectpicker('refresh');
     }
     function result(data) {

@@ -10,8 +10,8 @@ $(function () {
     const labels = {normal: '{{ lang._('Normal Reply') }}', staticarp: '{{ lang._('Static Reply') }}', '-arp': '{{ lang._('No Reply') }}'};
     function report(data) {
         data = data || {};
-        $('#staticarp-message').attr('class', 'alert alert-' + (data.status === 'ok' ? 'success' : 'danger'))
-            .text(data.status === 'ok' ? '{{ lang._('Configuration saved and applied.') }}' : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
+        $('#staticarp-message').attr('class', 'alert alert-' + (data.status === 'ok' ? (data.warning ? 'warning' : 'success') : 'danger'))
+            .text(data.status === 'ok' ? htmlDecode(data.warning || '{{ lang._('Configuration saved and applied.') }}') : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
     }
     function load() {
         ajaxGet('/api/staticarp/settings/get', {}, function (data) {
@@ -52,7 +52,7 @@ $(function () {
         ajaxCall('/api/staticarp/service/reset', {}, function (data) {
             data = data || {};
             $('#staticarp-message').attr('class', 'alert alert-' + (data.status === 'ok' ? 'warning' : 'danger'))
-                .text(data.status === 'ok' ? '{{ lang._('Static binding has been reset.') }}' : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
+                .text(data.status === 'ok' ? htmlDecode(data.warning || '{{ lang._('Static binding has been reset.') }}') : htmlDecode(data.error || '{{ lang._('Operation failed.') }}')).show();
         });
     });
     $(document).on('click', '.staticarp-download', function () {

@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# PROVIDE: staticarp_backup
+# REQUIRE: FILESYSTEMS
+# BEFORE: staticarp
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="staticarp_backup"
+rcvar="staticarp_backup_enable"
+load_rc_config "$name"
+: "${staticarp_backup_enable:=YES}"
+
+pidfile="/var/run/staticarp-backup.pid"
+command="/usr/sbin/daemon"
+procname="/usr/local/bin/python3"
+command_args="-p $pidfile -f /usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py watch"
+start_precmd="staticarp_backup_prestart"
+stop_postcmd="staticarp_backup_stopped"
+
+staticarp_backup_prestart()
+{
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py reconcile >/dev/null
+}
+
+staticarp_backup_stopped()
+{
+    rm -f "$pidfile"
+}
+
+run_rc_command "$1"

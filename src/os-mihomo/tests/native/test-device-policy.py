@@ -115,10 +115,11 @@ class DevicePolicyTests(unittest.TestCase):
 
     def steered(self, rule):
         """Whether the device policy decided this connection rather than the rules."""
-        return rule.startswith(('SrcIPCIDR', 'NOT('))
+        return rule.startswith(('SrcIPCIDR', 'NOT(', 'NOT/('))
 
     def test_a_blacklisted_device_is_forced_direct(self):
-        self.assertTrue(self.steered(self.matched('blacklist', [SOURCE])))
+        rule = self.matched('blacklist', [SOURCE])
+        self.assertTrue(self.steered(rule), rule)
 
     def test_a_device_missing_from_the_blacklist_follows_the_rules(self):
         self.assertFalse(self.steered(self.matched('blacklist', [OTHER])))
@@ -130,7 +131,8 @@ class DevicePolicyTests(unittest.TestCase):
         # The inverted form is the one worth proving: a whitelist cannot be
         # written as a match on the listed devices, because matching stops at
         # the first rule that matches.
-        self.assertTrue(self.steered(self.matched('whitelist', [OTHER])))
+        rule = self.matched('whitelist', [OTHER])
+        self.assertTrue(self.steered(rule), rule)
 
 
 if __name__ == '__main__':

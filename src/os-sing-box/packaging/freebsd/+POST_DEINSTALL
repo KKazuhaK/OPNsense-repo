@@ -2,6 +2,8 @@
 
 # Package upgrades keep live settings, interface assignments and runtime state.
 [ -n "${PKG_UPGRADE+x}" ] && exit 0
+rm -rf /var/db/os-singbox-backup
+rm -f /var/run/sing-box-backup.pid /var/log/sing-box-backup.log
 
 echo "===> Refreshing OPNsense menu cache"
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json

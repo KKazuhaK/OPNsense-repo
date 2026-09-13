@@ -25,6 +25,7 @@ class TargetTest(unittest.TestCase):
         patch.object(manager, 'CONFIG', self.config).start()
         patch.object(manager, 'RC_CONFIG', self.rc_config).start()
         patch.object(manager, 'run', return_value=SimpleNamespace(returncode=0)).start()
+        patch.object(manager, 'mirror_configuration', return_value=True).start()
 
     def test_target_uses_configured_native_ssh_port(self):
         self.assertEqual(manager.dispatch('status')['target'], '127.0.0.1:10511')
@@ -43,6 +44,19 @@ class TargetTest(unittest.TestCase):
     def test_invalid_ssh_port_falls_back_to_default(self):
         self.config.write_text('<opnsense><system><ssh><port>invalid</port></ssh></system></opnsense>')
         self.assertEqual(manager.ssh_port(), 22)
+
+    def test_successful_service_operation_reports_backup_warning(self):
+        with patch.object(manager, 'mirror_configuration', return_value=False) as mirror:
+            result = manager.dispatch('stop')
+        self.assertEqual(result['status'], 'ok')
+        self.assertIn('configuration backup could not be updated', result['warning'])
+        mirror.assert_called_once()
+
+    def test_failed_service_operation_never_mirrors(self):
+        with patch.object(manager, 'run', return_value=SimpleNamespace(returncode=1)):
+            with patch.object(manager, 'mirror_configuration') as mirror:
+                self.assertEqual(manager.dispatch('start')['status'], 'failed')
+        mirror.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -10,7 +10,7 @@ class ServiceController extends ApiControllerBase
     {
         $output = (string)(new Backend())->configdRun('staticarp status');
         preg_match('/^entries=([0-9]+)$/m', $output, $entries);
-        return ['enabled' => strpos($output, 'enabled=YES') !== false, 'entries' => (int)($entries[1] ?? 0)];
+        return ['enabled' => preg_match('/^enabled=YES$/m', $output) === 1, 'entries' => (int)($entries[1] ?? 0)];
     }
 
     private function run(string $action): array

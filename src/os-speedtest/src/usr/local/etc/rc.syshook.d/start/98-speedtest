@@ -1,0 +1,10 @@
+#!/bin/sh
+# A configuration can arrive after the plugin is already installed: a restore
+# onto a running box, or a section put there by hand. Nothing replays it then,
+# so the settings would stay whatever this disk happens to hold until someone
+# opened the page. Converging once per boot is late but certain, and costs
+# nothing when there is nothing to do: the import writes no file when the
+# configuration and the settings on disk already agree, and none at all when
+# the configuration carries no section.
+/usr/local/bin/python3 /usr/local/opnsense/scripts/speedtest/config_mirror.py import-config >/dev/null 2>&1 || true
+exit 0

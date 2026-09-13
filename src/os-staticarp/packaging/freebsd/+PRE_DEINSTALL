@@ -1,4 +1,6 @@
 #!/bin/sh
 
 /usr/local/sbin/staticarpctl reset >/dev/null 2>&1 || true
+/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py mirror >/dev/null 2>&1 || true
+service os-staticarp-backup onestop >/dev/null 2>&1 || true
 exit 0

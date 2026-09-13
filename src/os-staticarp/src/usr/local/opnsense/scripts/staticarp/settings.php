@@ -8,6 +8,7 @@ const STATICARP_CONFIG_DIR = '/usr/local/etc/staticarp';
 const STATICARP_SETTINGS_FILE = STATICARP_CONFIG_DIR . '/settings.conf';
 const STATICARP_ENTRIES_FILE = STATICARP_CONFIG_DIR . '/entries.conf';
 const STATICARP_INTERFACES_FILE = STATICARP_CONFIG_DIR . '/interfaces.conf';
+const STATICARP_LOCK_FILE = '/var/db/os-staticarp-backup/settings.lock';
 
 function staticarp_write_file($path, $content, $flags = 0)
 {
@@ -24,8 +25,8 @@ function staticarp_write_file($path, $content, $flags = 0)
 
 function staticarp_ensure_config_dir()
 {
-    if (!is_dir(STATICARP_CONFIG_DIR)) {
-        mkdir(STATICARP_CONFIG_DIR, 0755, true);
+    if (!is_dir(STATICARP_CONFIG_DIR) && !@mkdir(STATICARP_CONFIG_DIR, 0755, true) && !is_dir(STATICARP_CONFIG_DIR)) {
+        throw new RuntimeException('Could not create the settings directory.');
     }
 }
 
@@ -71,14 +72,123 @@ function staticarp_read_interface_modes()
 function staticarp_write_config($enabled, $entries, $interface_rows)
 {
     staticarp_ensure_config_dir();
-    staticarp_write_file(STATICARP_SETTINGS_FILE, 'enabled=' . ($enabled ? 'YES' : 'NO') . "\n", LOCK_EX);
-    staticarp_write_file(STATICARP_ENTRIES_FILE, rtrim($entries) . "\n", LOCK_EX);
-
     $lines = [];
     foreach ($interface_rows as $row) {
         $lines[] = implode(' ', [$row['name'], $row['device'], $row['mode']]);
     }
-    staticarp_write_file(STATICARP_INTERFACES_FILE, implode("\n", $lines) . "\n", LOCK_EX);
+    $contents = [STATICARP_SETTINGS_FILE => 'enabled=' . ($enabled ? 'YES' : 'NO') . "\n",
+        STATICARP_ENTRIES_FILE => rtrim($entries) . "\n",
+        STATICARP_INTERFACES_FILE => implode("\n", $lines) . "\n"];
+    if (!is_dir(dirname(STATICARP_LOCK_FILE)) && !@mkdir(dirname(STATICARP_LOCK_FILE), 0700, true) &&
+        !is_dir(dirname(STATICARP_LOCK_FILE))) {
+        throw new RuntimeException('Could not lock the settings files.');
+    }
+    $lock = fopen(STATICARP_LOCK_FILE, 'c');
+    if ($lock === false) {
+        throw new RuntimeException('Could not lock the settings files.');
+    }
+    chmod(STATICARP_LOCK_FILE, 0600);
+    $staged = [];
+    $originals = [];
+    $applied = [];
+    try {
+        $deadline = microtime(true) + 10;
+        while (!flock($lock, LOCK_EX | LOCK_NB)) {
+            if (microtime(true) >= $deadline) {
+                throw new RuntimeException('The settings are busy. Try again.');
+            }
+            usleep(50000);
+        }
+        $previous_recoveries = glob(STATICARP_CONFIG_DIR . '/.staticarp-recovery-*') ?: [];
+        /* Stage the entire save and private recovery files before replacing any
+           live file. The backup engine shares this lock and cannot see a mixed save. */
+        foreach ($contents as $path => $content) {
+            if (is_link($path) || (file_exists($path) && !is_file($path))) {
+                throw new RuntimeException('A settings file is not a regular file.');
+            }
+            $originals[$path] = null;
+            if (is_file($path)) {
+                $old = file_get_contents($path);
+                if ($old === false) {
+                    throw new RuntimeException('Could not preserve the settings files.');
+                }
+                $recovery = tempnam(STATICARP_CONFIG_DIR, '.staticarp-recovery-');
+                if ($recovery === false) {
+                    throw new RuntimeException('Could not preserve the settings files.');
+                }
+                $originals[$path] = ['file' => $recovery, 'mode' => fileperms($path) & 0777, 'absent' => false];
+                if (file_put_contents($recovery, $old, LOCK_EX) !== strlen($old) || !chmod($recovery, 0600)) {
+                    throw new RuntimeException('Could not preserve the settings files.');
+                }
+            } else {
+                $recovery = tempnam(STATICARP_CONFIG_DIR, '.staticarp-recovery-absent-' . basename($path) . '-');
+                if ($recovery === false) {
+                    throw new RuntimeException('Could not preserve the settings files.');
+                }
+                $originals[$path] = ['file' => $recovery, 'mode' => 0, 'absent' => true];
+                $absence = 'Original file was absent: ' . basename($path) . "\n";
+                if (file_put_contents($recovery, $absence, LOCK_EX) !== strlen($absence) || !chmod($recovery, 0600)) {
+                    throw new RuntimeException('Could not preserve the settings files.');
+                }
+            }
+            $temporary = tempnam(STATICARP_CONFIG_DIR, '.staticarp-');
+            if ($temporary === false) {
+                throw new RuntimeException('Could not write the settings files.');
+            }
+            $staged[$path] = $temporary;
+            if (file_put_contents($temporary, $content, LOCK_EX) !== strlen($content) || !chmod($temporary, 0644)) {
+                throw new RuntimeException('Could not write the settings files.');
+            }
+        }
+        foreach ($staged as $path => $temporary) {
+            if (!rename($temporary, $path)) {
+                throw new RuntimeException('Could not replace the settings files.');
+            }
+            $applied[] = $path;
+        }
+        /* A completed explicit save supersedes originals from an earlier failed
+           rollback. A failed save leaves those recovery files untouched. */
+        foreach ($previous_recoveries as $recovery) {
+            if (is_file($recovery) || is_link($recovery)) {
+                @unlink($recovery);
+            }
+        }
+    } catch (Throwable $exception) {
+        foreach (array_reverse($applied) as $path) {
+            $original = $originals[$path];
+            if ($original['absent']) {
+                if (!@unlink($path) && (file_exists($path) || is_link($path))) {
+                    $originals[$path] = null;
+                }
+            } else {
+                /* Keep the original private until bytes, mode and replacement
+                   have all succeeded. Failed metadata restoration also needs
+                   the recovery guard to protect the last good XML snapshot. */
+                $rollback = tempnam(STATICARP_CONFIG_DIR, '.staticarp-rollback-' . basename($path) . '-');
+                if ($rollback === false) {
+                    $originals[$path] = null;
+                    continue;
+                }
+                $staged[] = $rollback;
+                if (!@copy($original['file'], $rollback) || !@chmod($rollback, $original['mode']) ||
+                    !@rename($rollback, $path)) {
+                    $originals[$path] = null;
+                }
+            }
+        }
+        throw $exception;
+    } finally {
+        foreach ($staged as $temporary) {
+            @unlink($temporary);
+        }
+        foreach ($originals as $original) {
+            if ($original !== null) {
+                @unlink($original['file']);
+            }
+        }
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
 }
 
 function staticarp_valid_ip($ip)
@@ -199,7 +309,8 @@ try {
             'arp' => staticarp_current_arp_list()];
     } elseif ($action === 'set') {
         $given = json_decode((string)file_get_contents($argv[2] ?? ''), true);
-        if (!is_array($given)) {
+        if (!is_array($given) || (array_key_exists('entries', $given) && !is_string($given['entries'])) ||
+            (array_key_exists('modes', $given) && !is_array($given['modes']))) {
             throw new InvalidArgumentException('Invalid settings.');
         }
         $errors = [];
@@ -220,7 +331,11 @@ try {
             $rows[] = ['name' => $name, 'device' => $interface['device'], 'mode' => $mode];
         }
         staticarp_write_config($enabled, $entries, $rows);
-        $result = ['status' => 'ok', 'enabled' => $enabled];
+        $backup_output = [];
+        $backup_status = 0;
+        exec('/usr/local/bin/python3 ' . escapeshellarg(__DIR__ . '/config_mirror.py') . ' mirror >/dev/null 2>&1', $backup_output, $backup_status);
+        $result = $backup_status === 0 ? ['status' => 'ok', 'enabled' => $enabled]
+            : ['status' => 'failed', 'saved' => true, 'error' => gettext('Settings were saved, but the configuration backup failed.')];
     } elseif ($action === 'script') {
         $name = $argv[2] ?? '';
         if (!isset($interfaces[$name])) {

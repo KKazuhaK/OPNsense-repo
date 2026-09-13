@@ -157,8 +157,289 @@ def advertises_ipv6(content):
     return False
 
 
+DNS_MODES = ('fake-ip', 'redir-host', 'normal')
+DNS_MODE_DEFAULT = 'fake-ip'
+# Mihomo defaults fake-ip-range but not its IPv6 counterpart, and builds no IPv6
+# pool without one: AAAA answers then have no fake address to return, silently,
+# because a valid IPv4 pool is enough to pass its own validation. The default
+# mirrors the IPv4 side by using the benchmarking range reserved for this.
+FAKE_IP_RANGE6_DEFAULT = '2001:2::/64'
+HIJACK_TARGETS = ['any:53', 'tcp://any:53']
+# Rule databases, as verified reachable sets. A category that one source does not
+# publish makes every rule naming it fail, so the sets are never mixed.
+GEO_SOURCES = {
+    'metacubex': {
+        'geoip': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat',
+        'geosite': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat',
+        'mmdb': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb',
+        'asn': 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb',
+    },
+    'loyalsoldier-cdn': {
+        'geoip': 'https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat',
+        'geosite': 'https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat',
+        'mmdb': 'https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/Country.mmdb',
+    },
+    'loyalsoldier': {
+        'geoip': 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat',
+        'geosite': 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat',
+        'mmdb': 'https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb',
+    },
+}
+# jsDelivr refuses MetaCubeX/meta-rules-dat: the repository is past its 50 MB
+# package limit, and it never serves release assets. Loyalsoldier is the mirrored set.
+GEO_SOURCE_DEFAULT = 'metacubex'
+GEO_UPDATE_HOURS = 24
+
+
+# What a subscription that ships no DNS policy gets instead of nothing. It sits
+# UNDER the subscription, so a provider that states its own dns block keeps it in
+# full: the two are never blended, because half of one policy and half of another
+# resolves neither correctly.
+BASELINE_DNS = {
+    'enable': True,
+    'prefer-h3': False,
+    'use-hosts': True,
+    'use-system-hosts': True,
+    # respect-rules needs the proxy path up before the first lookup resolves,
+    # which is a bootstrap loop on a router that has just started.
+    'respect-rules': False,
+    # Bootstrap servers must be IP-hosted, or there is nothing to resolve them with.
+    'default-nameserver': ['223.5.5.5', '119.29.29.29'],
+    'proxy-server-nameserver': ['https://dns.alidns.com/dns-query', 'https://doh.pub/dns-query'],
+    'nameserver': ['https://dns.alidns.com/dns-query', 'https://doh.pub/dns-query'],
+    'nameserver-policy': {
+        # Private names must go to the system resolver. A public DoH cannot answer
+        # .lan, .local or a NAS hostname, so sending them there breaks the LAN.
+        'geosite:private': ['system'],
+        'geosite:cn': ['https://dns.alidns.com/dns-query', 'https://doh.pub/dns-query'],
+        # Cloudflare by literal IP: its certificate carries IP SANs, so this
+        # validates without skip-cert-verify. Google by IP would not.
+        'geosite:geolocation-!cn': ['https://1.1.1.1/dns-query', 'https://1.0.0.1/dns-query'],
+    },
+    'fake-ip-range': '198.18.0.0/15',
+    'fake-ip-filter-mode': 'blacklist',
+    'fake-ip-filter': ['geosite:private', '*.lan', '*.local', '*.arpa', 'localhost',
+                       'localhost.*', '+.msftconnecttest.com', '+.msftncsi.com',
+                       '+.pool.ntp.org', 'time.*.com', 'time.*.gov', 'time.*.apple.com',
+                       '+.push.apple.com', '+.market.xiaomi.com'],
+}
+
+
+def baseline(data):
+    """Fill in a DNS policy only when the subscription carries none of its own."""
+    if isinstance(data.get('dns'), dict) and data['dns']:
+        return {}
+    return {'dns': copy.deepcopy(BASELINE_DNS)}
+
+
+# DNS upstreams the user may state instead of the ones the subscription ships.
+# An empty list means "whatever the subscription provides", never "none".
+DNS_SERVER_FIELDS = {'dns_default': 'default-nameserver', 'dns_nameserver': 'nameserver',
+                     'dns_proxy_nameserver': 'proxy-server-nameserver'}
+DNS_SERVER_LIMIT = 8
+# Accepted beside an address: mihomo resolves these through the host itself.
+DNS_SERVER_ALIASES = ('system', 'dhcp')
+
+
+def dns_server_host(value):
+    """The host a DNS upstream points at, whatever syntax states it."""
+    text = value.split('#', 1)[0]
+    if '://' in text:
+        text = text.split('://', 1)[1].split('/', 1)[0]
+    if text.startswith('['):
+        return text[1:].split(']', 1)[0]
+    # A single colon is a port; several mean the address itself is IPv6.
+    return text.rsplit(':', 1)[0] if text.count(':') == 1 else text
+
+
+def check_dns_servers(field, values):
+    if not isinstance(values, list) or len(values) > DNS_SERVER_LIMIT:
+        raise Error("At most %d DNS servers may be listed per field." % DNS_SERVER_LIMIT)
+    for value in values:
+        if (not isinstance(value, str) or not value.strip() or value != value.strip()
+                or any(char in value for char in " \t\r\n\x00")):
+            raise Error("A DNS server must be a single address without spaces.")
+        if value in DNS_SERVER_ALIASES and field != 'dns_default':
+            continue
+        if field != 'dns_default':
+            continue
+        # Bootstrap servers resolve the other servers, so nothing can resolve them,
+        # and mihomo itself rejects anything here that is not a bare address.
+        try:
+            ipaddress.ip_address(dns_server_host(value))
+        except ValueError:
+            raise Error("Default nameservers must be addressed by literal IP, because "
+                        "they are what resolves every other server: " + value) from None
+
+
+# Simple switches for the settings a user changes most often. They are applied
+# UNDER the merge YAML, so a hand-written override always wins. When an overlay
+# states one of these keys in its canonical form, absorb_switches() lifts it into
+# the switch instead, so the UI never shows a value the config contradicts.
+SWITCH_DEFAULTS = {'router_dns': False, 'ipv6': False, 'dns_hijack': True,
+                   'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT}
+# Bumped only to re-seed the switches from an installation that predates them.
+SWITCH_SCHEMA = 2
+CONTROLLER_PORT = 9090
+LOOPBACK_CONTROLLER = '127.0.0.1:%d' % CONTROLLER_PORT
+ANY_CONTROLLER = '0.0.0.0:%d' % CONTROLLER_PORT
+
+
+def switch_overlay(settings):
+    """Base overlay produced by the simple switches."""
+    ipv6 = bool(settings.get('ipv6', False))
+    overlay = {
+        'ipv6': ipv6,
+        'dns': {'ipv6': ipv6,
+                'enhanced-mode': settings.get('dns_mode', DNS_MODE_DEFAULT)},
+        'tun': {'dns-hijack': list(HIJACK_TARGETS) if settings.get('dns_hijack', True) else []},
+        'geox-url': dict(GEO_SOURCES[settings.get('geo_source') or GEO_SOURCE_DEFAULT]),
+        'geodata-mode': True, 'geo-auto-update': True, 'geo-update-interval': GEO_UPDATE_HOURS,
+    }
+    # Router DNS owns every upstream, so a stated server would contradict it.
+    if not settings.get('router_dns'):
+        for field, key in DNS_SERVER_FIELDS.items():
+            stated = settings.get(field)
+            if stated:
+                overlay['dns'][key] = list(stated)
+    return overlay
+
+
+def switch_conflicts(rendered, settings):
+    """Switches whose effective value the merge YAML overrode."""
+    dns = rendered.get('dns') or {}
+    tun = rendered.get('tun') or {}
+    wanted = switch_overlay(settings)
+    out = []
+    if dns.get('ipv6') is not wanted['dns']['ipv6']:
+        out.append('ipv6')
+    if dns.get('enhanced-mode') != wanted['dns']['enhanced-mode']:
+        out.append('dns_mode')
+    if bool(tun.get('dns-hijack')) is not bool(wanted['tun']['dns-hijack']):
+        out.append('dns_hijack')
+    return out
+
+
+def absorb_switches(overlay, settings):
+    """Lift canonical switch values out of an overlay into the settings.
+
+    A value the switches cannot express (a custom dns-hijack target list, an
+    unknown DNS mode) is deliberately left in the overlay, where it keeps
+    winning; switch_conflicts() then reports it to the user.
+    """
+    if not isinstance(overlay, dict):
+        return settings
+    settings = dict(settings)
+    dns = overlay.get('dns') if isinstance(overlay.get('dns'), dict) else {}
+    tun = overlay.get('tun') if isinstance(overlay.get('tun'), dict) else {}
+
+    top6, dns6 = overlay.get('ipv6'), dns.get('ipv6')
+    stated = [v for v in (top6, dns6) if v is not None]
+    if stated and all(isinstance(v, bool) for v in stated) and len(set(stated)) == 1:
+        settings['ipv6'] = stated[0]
+        overlay.pop('ipv6', None)
+        dns.pop('ipv6', None)
+
+    if dns.get('enhanced-mode') in DNS_MODES:
+        settings['dns_mode'] = dns.pop('enhanced-mode')
+
+    # The controller is settings policy now, so leaving it here would display a
+    # value the rendered configuration ignores.
+    controller = overlay.get('external-controller')
+    if isinstance(controller, str) and ':' in controller:
+        host, _, port = controller.rpartition(':')
+        if host in ('127.0.0.1', '0.0.0.0') and port.isdigit():
+            settings['controller'] = controller
+            overlay.pop('external-controller')
+
+    for field, key in DNS_SERVER_FIELDS.items():
+        stated = dns.get(key)
+        if isinstance(stated, list) and all(isinstance(v, str) for v in stated):
+            settings[field] = list(stated)
+            dns.pop(key)
+
+    urls = overlay.get('geox-url')
+    if isinstance(urls, dict):
+        for name, known in GEO_SOURCES.items():
+            if urls == known:
+                settings['geo_source'] = name
+                overlay.pop('geox-url')
+                break
+
+    hijack = tun.get('dns-hijack')
+    if isinstance(hijack, list) and (not hijack or hijack == HIJACK_TARGETS):
+        settings['dns_hijack'] = bool(hijack)
+        tun.pop('dns-hijack')
+
+    for key, section in (('dns', dns), ('tun', tun)):
+        if overlay.get(key) is section and not section:
+            overlay.pop(key)
+    return settings
+
+
+def adopt_switches(rendered, settings):
+    """Seed the switches from a configuration rendered before they existed.
+
+    Upgrades must not change behaviour, so the effective values win over the
+    defaults. The stored overlay is absorbed afterwards and overrides this,
+    because it states intent while a rendered file only states the outcome.
+    """
+    settings = dict(settings)
+    dns = rendered.get('dns') if isinstance(rendered.get('dns'), dict) else {}
+    tun = rendered.get('tun') if isinstance(rendered.get('tun'), dict) else {}
+    for value in (rendered.get('ipv6'), dns.get('ipv6')):
+        if isinstance(value, bool):
+            settings['ipv6'] = value
+            break
+    # A disabled section carries the inert state render() forces, not an intent.
+    if dns.get('enable') is True and dns.get('enhanced-mode') in DNS_MODES:
+        settings['dns_mode'] = dns['enhanced-mode']
+    if tun.get('enable') is True and isinstance(tun.get('dns-hijack'), list):
+        settings['dns_hijack'] = bool(tun['dns-hijack'])
+    for name, known in GEO_SOURCES.items():
+        if rendered.get('geox-url') == known:
+            settings['geo_source'] = name
+            break
+    return settings
+
+
+def orphan_policy_keys(base, overlay):
+    """Merge YAML policy keys that match nothing the subscription states.
+
+    nameserver-policy is a mapping, so an overlay entry replaces a provider one
+    only when the key matches character for character. A provider that renames
+    its key, or a typo in ours, turns the override into a new entry beside the
+    one it was meant to replace: both stay in force, and nothing reports it.
+    """
+    def policy(mapping):
+        dns = mapping.get('dns') if isinstance(mapping.get('dns'), dict) else {}
+        value = dns.get('nameserver-policy') if isinstance(dns, dict) else None
+        return value if isinstance(value, dict) else {}
+    existing = policy(base)
+    return [key for key in policy(overlay) if key not in existing]
+
+
+def switch_overrides(overlay):
+    """Switch keys a hand-written overlay still dictates after absorption."""
+    probe = copy.deepcopy(overlay) if isinstance(overlay, dict) else {}
+    absorb_switches(probe, {})
+    dns = probe.get('dns') if isinstance(probe.get('dns'), dict) else {}
+    tun = probe.get('tun') if isinstance(probe.get('tun'), dict) else {}
+    out = []
+    if 'ipv6' in probe or 'ipv6' in dns:
+        out.append('ipv6')
+    if 'enhanced-mode' in dns:
+        out.append('dns_mode')
+    if 'dns-hijack' in tun:
+        out.append('dns_hijack')
+    if 'geox-url' in probe:
+        out.append('geo_source')
+    out.extend(field for field, key in DNS_SERVER_FIELDS.items() if key in dns)
+    return out
+
+
 def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_advertised=False):
-    result = copy.deepcopy(data)
+    result = merge_yaml(baseline(data), data)
     router_dns = settings.get('router_dns', False)
     if router_dns:
         result = merge_yaml(result, {'dns': {
@@ -166,6 +447,7 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
             'default-nameserver': ['127.0.0.1'], 'nameserver-policy': {}}})
         # An empty policy replaces the provider policy rather than deep-merging it.
         result['dns']['nameserver-policy'] = {}
+    result = merge_yaml(result, switch_overlay(settings))
     if overlay is None:
         overlay = parse_yaml((Path(__file__).resolve().parents[3] / 'share/mihomo/presets/full.yaml').read_bytes())
         if settings.get('controller'):
@@ -192,11 +474,20 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
             raise Error("The fake-IP range is invalid.") from None
         if network.version != 4 or not network.subnet_of(ipaddress.ip_network("198.18.0.0/15")):
             raise Error("The fake-IP range must stay within 198.18.0.0/15.")
+        if dns.get('ipv6') is True:
+            dns.setdefault('fake-ip-range6', FAKE_IP_RANGE6_DEFAULT)
+            try:
+                network6 = ipaddress.ip_network(dns['fake-ip-range6'], strict=False)
+            except ValueError:
+                raise Error("The IPv6 fake-IP range is invalid.") from None
+            if network6.version != 6 or network6.is_global:
+                raise Error("The IPv6 fake-IP range must not be globally routable.")
     result["dns"] = dns
     result['tun'] = tun
     result.update({
         "external-ui": result.get('external-ui', HOME + "/ui"),
         "external-ui-url": result.get('external-ui-url', DEFAULT_UI_URL), "secret": settings["secret"],
+        "external-controller": settings.get('controller') or LOOPBACK_CONTROLLER,
     })
     for key in ('port', 'socks-port', 'mixed-port', 'redir-port', 'tproxy-port'):
         value = result.get(key, 0)
@@ -465,6 +756,7 @@ class Manager:
         self.source_file = self.state / "subscription.yaml"
         self.config_file = self.state / "config.yaml"
         self.merge_file = self.state / 'merge.yaml'
+        self.warnings_file = self.state / 'warnings.json'
         self.status_file = self.path("/var/run/mihomo-status.json")
 
     def path(self, path):
@@ -485,28 +777,35 @@ class Manager:
     def settings(self):
         try:
             value = json.loads(self.settings_file.read_bytes())
-            value.setdefault('router_dns', False)
+            for key, fallback in SWITCH_DEFAULTS.items():
+                value.setdefault(key, fallback)
             self.check_settings(value)
             return value
         except (OSError, ValueError, TypeError, KeyError):
             raise Error("Mihomo settings are missing or invalid; run initialization first.") from None
 
     def check_settings(self, settings):
-        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns'):
-            if key == 'router_dns' and key not in settings:
+        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns', 'ipv6', 'dns_hijack'):
+            if key not in settings and key in SWITCH_DEFAULTS:
                 continue
             if not isinstance(settings.get(key), bool):
                 raise Error("Service policies must be boolean values.")
+        if settings.get('dns_mode', DNS_MODE_DEFAULT) not in DNS_MODES:
+            raise Error("The DNS mode must be one of: " + ", ".join(DNS_MODES) + ".")
+        if settings.get('geo_source', GEO_SOURCE_DEFAULT) not in GEO_SOURCES:
+            raise Error("The rule database must be one of: " + ", ".join(GEO_SOURCES) + ".")
+        for field in DNS_SERVER_FIELDS:
+            check_dns_servers(field, settings.get(field) or [])
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
         controller = settings.get("controller", "127.0.0.1:9090")
         try:
             host, port = controller.rsplit(":", 1)
-            address = ipaddress.IPv4Address(host)
-            if address.is_unspecified or not 1 <= int(port) <= 65535:
+            ipaddress.IPv4Address(host)
+            if not 1 <= int(port) <= 65535 or int(port) == 53:
                 raise ValueError
         except (AttributeError, ValueError):
-            raise Error("The controller must bind to a specific IPv4 address and port.") from None
+            raise Error("The controller must bind to an IPv4 address and port.") from None
         for key in ("subscription_url", "device"):
             if not isinstance(settings.get(key), str) or any(char in settings[key] for char in "\r\n\x00"):
                 raise Error("Invalid subscription settings.")
@@ -519,9 +818,14 @@ class Manager:
 
     def publish_status(self, settings=None, dns_active=False, error=""):
         settings = settings or self.settings()
+        overrides = []
+        if self.merge_file.exists():
+            with contextlib.suppress(Error, OSError):
+                overrides = switch_overrides(parse_yaml(self.merge_file.read_bytes()))
         status = {"running": self.system.running(), "transparent": settings["transparent"],
                   "dns_active": dns_active, "dns_fallback": settings["dns_fallback"],
-                  "service_enabled": settings["service_enabled"], "error": error, "updated": time.time()}
+                  "service_enabled": settings["service_enabled"], "overrides": overrides,
+                  "error": error, "updated": time.time()}
         atomic_write(self.status_file, json.dumps(status).encode(), 0o644)
         return status
 
@@ -559,8 +863,8 @@ class Manager:
             settings = {"subscription_url": env.get("mihomo_URL", ""),
                         "secret": env.get("mihomo_secret") or existing.get("secret") or secrets.token_hex(32),
                         "device": re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname())[:64] or "router",
-                        "transparent": False, 'router_dns': False,
-                        "dns_fallback": True, "service_enabled": True}
+                        "transparent": False, "dns_fallback": True, "service_enabled": True,
+                        **SWITCH_DEFAULTS}
             if existing:
                 atomic_write(self.source_file, source.read_bytes())
             self.write_settings(settings)
@@ -582,6 +886,29 @@ class Manager:
             if settings.get('controller'):
                 overlay['external-controller'] = settings['controller']
             atomic_write(self.merge_file, yaml.safe_dump(overlay, sort_keys=False).encode())
+        # The switches own these keys. Adopt whatever the installed configuration
+        # already does, then lift any canonical value out of the stored overlay, so
+        # a later toggle cannot be silently reverted by merge.yaml.
+        migrating = settings.get('switch_schema') != SWITCH_SCHEMA
+        rendered = {}
+        if migrating and self.config_file.exists():
+            with contextlib.suppress(Error, OSError):
+                rendered = parse_yaml(self.config_file.read_bytes())
+                settings = adopt_switches(rendered, settings)
+        stored = parse_yaml(self.merge_file.read_bytes())
+        cleaned = copy.deepcopy(stored)
+        lifted = absorb_switches(cleaned, settings)
+        if cleaned != stored:
+            settings = lifted
+            atomic_write(self.merge_file, yaml.safe_dump(cleaned, sort_keys=False, allow_unicode=True).encode())
+        if migrating:
+            # The stored overlay predates the address in use, so the running
+            # configuration decides where the controller is bound, not the file.
+            if isinstance(rendered.get('external-controller'), str):
+                settings['controller'] = rendered['external-controller']
+            settings.setdefault('controller', ANY_CONTROLLER)
+            settings['switch_schema'] = SWITCH_SCHEMA
+        self.write_settings(settings)
         runtime_home = self.path(HOME)
         runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in ('GeoIP.dat', 'GeoSite.dat'):
@@ -596,6 +923,9 @@ class Manager:
             atomic_write(self.config_file, candidate.read_bytes())
         finally:
             candidate.unlink(missing_ok=True)
+        # An upgrade replaces this file under a watchdog that already loaded the
+        # previous one. Retire it here so the next start runs the installed code.
+        self.system.stop_watch()
         self.publish_status(settings)
         return {"initialized": True, "transparent": settings["transparent"]}
 
@@ -612,6 +942,13 @@ class Manager:
                 for node in entries if node.get('uuid') != 'b126bf65-a985-49ca-a9d2-16f156aac198'
                 and (node.findtext('enabled') == '1' or snapshot.get('roots', {}).get(node.get('uuid')) == '1'))
         return upstreams, advertises_ipv6(config)
+
+    def record_warnings(self, data, overlay=None):
+        """Publish what the applied configuration silently did not do."""
+        if overlay is None:
+            overlay = parse_yaml(self.merge_file.read_bytes()) if self.merge_file.exists() else {}
+        orphans = orphan_policy_keys(merge_yaml(baseline(data), data), overlay)
+        atomic_write(self.warnings_file, json.dumps({'policy_orphans': orphans}).encode(), 0o644)
 
     def candidate(self, data, settings, overlay=None):
         upstreams, ipv6 = self.router_context(settings)
@@ -651,6 +988,7 @@ class Manager:
             atomic_write(self.config_file, candidate.read_bytes())
         finally:
             candidate.unlink(missing_ok=True)
+        self.record_warnings(data)
         tun = bool(generated.get('tun', {}).get('enable'))
         dns_active = bool(tun and generated.get('dns', {}).get('enable') and generated['dns'].get('listen') == '127.0.0.1:1053' and not settings.get('router_dns'))
         self.system.dns(False, settings)
@@ -670,6 +1008,8 @@ class Manager:
 
     def apply(self, content, settings=None, subscription=True, overlay=None):
         settings = settings or self.settings()
+        if overlay is not None:
+            settings = absorb_switches(overlay, settings)
         self.check_settings(settings)
         data = parse_yaml(content)
         if subscription:
@@ -697,6 +1037,7 @@ class Manager:
                 self.write_settings(settings)
                 if overlay is not None:
                     atomic_write(self.merge_file, yaml.safe_dump(overlay, sort_keys=False, allow_unicode=True).encode())
+                self.record_warnings(data, overlay)
                 if running:
                     self.start(settings)
                 else:
@@ -857,9 +1198,16 @@ class Manager:
         if action == "set-settings":
             value = json.loads(Path(argument).read_bytes())
             settings = self.settings()
-            for key in ("subscription_url", "secret", "device", "dns_fallback", 'router_dns'):
+            for key in ("subscription_url", "secret", "device", "dns_fallback",
+                        'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
+                        *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
+            if 'dashboard_any' in value:
+                current = settings.get('controller') or LOOPBACK_CONTROLLER
+                port = current.rsplit(':', 1)[-1] if ':' in current else str(CONTROLLER_PORT)
+                host = '0.0.0.0' if value['dashboard_any'] else '127.0.0.1'
+                settings['controller'] = host + ':' + port
             if self.source_file.exists():
                 return self.apply(self.source_file.read_bytes(), settings)
             base = {"proxies": [], "proxy-groups": [], "rules": ["MATCH,DIRECT"]}
@@ -891,6 +1239,7 @@ class Manager:
             if action in {"restart", "wan-restart"} and self.system.running():
                 self.stop(settings)
             if self.system.running():
+                self.system.watch()
                 return self.publish_status(settings, settings["transparent"])
             return self.start(settings)
         if action == "status":
@@ -913,12 +1262,17 @@ def main():
         return 1
     manager = Manager()
     if args.action == "watch":
+        reported = None
         while True:
             try:
                 with manager.lock(blocking=False):
                     manager.watchdog_tick()
-            except (Error, OSError):
-                pass
+                reported = None
+            except (Error, OSError) as failure:
+                message = str(failure)
+                if message != reported:
+                    reported = message
+                    print('watchdog tick failed: ' + message, flush=True)
             time.sleep(5)
     try:
         if args.action == "sub-update":

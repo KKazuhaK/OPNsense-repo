@@ -7,6 +7,7 @@ import lzma
 import os
 from pathlib import Path
 import shutil
+import re
 import subprocess
 import sys
 import tarfile
@@ -20,6 +21,12 @@ spec.loader.exec_module(verify)
 spec = importlib.util.spec_from_file_location('build_target', REPO / 'src/os-mihomo/packaging/target.py')
 target_helper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(target_helper)
+
+
+# The build script owns the version; a bump must not need an edit here as well.
+BUILD_VERSION = re.search(r'^VERSION="\$\{VERSION:-([^}"]+)\}"',
+                          (Path(__file__).resolve().parents[1] / 'build.sh').read_text(),
+                          re.MULTILINE).group(1)
 
 
 class BuildTests(unittest.TestCase):
@@ -123,7 +130,7 @@ elif args[0]!='info':
         directory = self.project / 'dist' / abi
         if series:
             directory /= series
-        return directory / 'os-mihomo-1.1.2.pkg'
+        return directory / ('os-mihomo-%s.pkg' % BUILD_VERSION)
 
     def manifest(self, package):
         with tarfile.open(package) as archive:
@@ -163,7 +170,7 @@ runpy.run_path(args[0],run_name='__main__')
             manifest = json.load(archive.extractfile('+MANIFEST'))
         self.assertEqual(self.env['FAKE_PKG_PYTHON_VERSION'], manifest['deps']['python313']['version'])
         self.assertEqual('26.7', manifest['annotations']['product_abi'])
-        self.assertEqual('1.1.2', manifest['annotations']['product_version'])
+        self.assertEqual(BUILD_VERSION, manifest['annotations']['product_version'])
         self.assertEqual('FreeBSD:15:amd64', manifest['abi'])
         self.assertEqual('freebsd:15:x86:64', manifest['arch'])
         with tarfile.open(self.package_path()) as archive:

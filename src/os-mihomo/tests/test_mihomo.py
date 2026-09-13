@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'src/usr/local/opnsense/scripts/mihomo/mihomo.py'
 spec = importlib.util.spec_from_file_location('mihomo', SCRIPT)
@@ -497,3 +498,60 @@ class CronMigrationTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class WatchdogTests(unittest.TestCase):
+    """A watchdog must never outlive the code it was started from."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.system = FakeSystem()
+        self.manager = m.Manager(Path(self.temp.name), self.system)
+
+    def test_initialize_retires_the_watchdog_so_the_next_start_reloads_the_file(self):
+        calls = []
+        self.system.stop_watch = lambda: calls.append('stop-watch')
+        self.manager.initialize(upgrade=True)
+        self.assertEqual(['stop-watch'], calls)
+
+    def test_a_core_that_survived_the_upgrade_still_regains_a_watchdog(self):
+        self.manager.initialize()
+        calls = []
+        self.system.watch = lambda: calls.append('watch')
+        self.system.alive = True
+        started = []
+        self.manager.start = lambda *a, **k: started.append(a)
+        self.manager.dispatch('boot')
+        # start() is skipped for a running core, so boot has to spawn it itself.
+        self.assertEqual(['watch'], calls)
+        self.assertEqual([], started)
+
+
+class ControllerMigrationTests(unittest.TestCase):
+    """A stale merge YAML must not move a controller the running config already set."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.manager = m.Manager(Path(self.temp.name), FakeSystem())
+        self.manager.initialize()
+        self.manager.dispatch('start')
+
+    def test_the_running_address_wins_over_the_one_left_in_the_overlay(self):
+        settings = self.manager.settings()
+        settings['controller'] = m.ANY_CONTROLLER
+        settings.pop('switch_schema')
+        self.manager.write_settings(settings)
+        # The overlay still carries the loopback address the install shipped with.
+        overlay = m.parse_yaml(self.manager.merge_file.read_bytes())
+        overlay['external-controller'] = m.LOOPBACK_CONTROLLER
+        self.manager.merge_file.write_bytes(yaml.safe_dump(overlay).encode())
+        config = m.parse_yaml(self.manager.config_file.read_bytes())
+        config['external-controller'] = m.ANY_CONTROLLER
+        self.manager.config_file.write_bytes(yaml.safe_dump(config).encode())
+
+        self.manager.initialize(upgrade=True)
+        self.assertEqual(m.ANY_CONTROLLER, self.manager.settings()['controller'])
+        self.assertNotIn('external-controller',
+                         m.parse_yaml(self.manager.merge_file.read_bytes()))

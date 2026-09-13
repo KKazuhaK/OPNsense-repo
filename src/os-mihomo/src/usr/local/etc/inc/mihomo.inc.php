@@ -38,6 +38,76 @@ function mihomo_settings(): array
     return is_string($settings) ? (json_decode($settings, true) ?: []) : [];
 }
 
+function mihomo_effective_dns(): array
+{
+    /* The upstreams actually in force, read from the rendered configuration so an
+       empty form field can show what it inherits instead of showing nothing. The
+       dns block sits near the top, so the scan stops as soon as it ends. */
+    $wanted = ['default-nameserver' => [], 'nameserver' => [], 'proxy-server-nameserver' => []];
+    $handle = @fopen('/var/db/os-mihomo/config.yaml', 'r');
+    if ($handle === false) {
+        return $wanted;
+    }
+    $inside = false;
+    $key = null;
+    while (($line = fgets($handle)) !== false) {
+        $line = rtrim($line, "\r\n");
+        if ($line === '' || $line[0] === '#') {
+            continue;
+        }
+        if ($line[0] !== ' ') {
+            if ($inside) {
+                break;
+            }
+            $inside = rtrim($line) === 'dns:';
+            continue;
+        }
+        if (!$inside) {
+            continue;
+        }
+        if (preg_match('/^  ([a-z0-9-]+):\s*(.*)$/', $line, $found)) {
+            $key = array_key_exists($found[1], $wanted) ? $found[1] : null;
+            if ($key !== null && $found[2] !== '' && $found[2][0] === '[') {
+                $wanted[$key] = array_filter(array_map(
+                    static fn($v) => trim($v, " '\"" ), explode(',', trim($found[2], '[]'))));
+                $key = null;
+            }
+        } elseif ($key !== null && preg_match('/^  - (.+)$/', $line, $found)) {
+            $wanted[$key][] = trim($found[1], " '\"");
+        }
+    }
+    fclose($handle);
+    return $wanted;
+}
+
+function mihomo_policy_orphans(): array
+{
+    /* Per-domain overrides that matched no provider entry, so they were added
+       beside the entry they were meant to replace instead of replacing it. */
+    $raw = @file_get_contents('/var/db/os-mihomo/warnings.json');
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    return is_array($data) && is_array($data['policy_orphans'] ?? null) ? $data['policy_orphans'] : [];
+}
+
+function mihomo_override_badge(array $overrides, string $key): string
+{
+    /* The merge YAML states this key by hand, so the switch beside it is inert. */
+    if (!in_array($key, $overrides, true)) {
+        return '';
+    }
+    return '<span class="label label-warning" style="margin-left:6px">'
+        . htmlspecialchars(gettext('Overridden by the merge YAML'), ENT_QUOTES | ENT_HTML5, 'UTF-8')
+        . '</span>';
+}
+
+function mihomo_overrides(): array
+{
+    /* Switches the stored merge YAML dictates by hand; independent of service state. */
+    $status = @file_get_contents('/var/run/mihomo-status.json');
+    $result = is_string($status) ? json_decode($status, true) : null;
+    return is_array($result) && is_array($result['overrides'] ?? null) ? $result['overrides'] : [];
+}
+
 function mihomo_status(): array
 {
     $status = @file_get_contents('/var/run/mihomo-status.json');

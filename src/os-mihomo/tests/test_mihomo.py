@@ -431,6 +431,17 @@ class IntegrationHelperTests(unittest.TestCase):
     def zone(self):
         return self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
 
+    def test_disable_removes_the_forward_zone_even_when_the_rest_fails(self):
+        # Everything after this point can throw -- a restored configuration
+        # whose Unbound model no longer matches, a truncated state file -- and
+        # the caller stops the core regardless. A zone left behind points the
+        # router's root at a port with nothing behind it.
+        self.assertEqual(0, self.helper('enable').returncode)
+        self.assertTrue(self.zone().exists())
+        self.config.write_text('<opnsense><interfaces/><filter/><OPNsense/></opnsense>')
+        self.assertNotEqual(0, self.helper('disable').returncode)
+        self.assertFalse(self.zone().exists())
+
     def test_a_validating_resolver_gets_no_forward_zone(self):
         # Mihomo answers fake-ip records, which carry no signature, so every
         # signed zone would fail validation. The only configuration that makes

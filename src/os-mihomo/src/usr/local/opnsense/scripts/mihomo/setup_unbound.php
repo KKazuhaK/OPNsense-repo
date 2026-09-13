@@ -215,6 +215,15 @@ if (!in_array($mode, ['enable', 'enable-tun', 'disable', 'remove', 'restore-cron
     fwrite(STDERR, "usage: setup_unbound.php enable|enable-tun|disable|remove|restore-cron [fallback:0|1]\n");
     exit(64);
 }
+/* Removing the forward zone comes before anything that can fail. Everything
+   below can throw -- an Unbound model the operator's restored backup no longer
+   matches, a truncated state file -- and the caller stops the core regardless,
+   so a removal left until after those checks can leave Unbound forwarding the
+   root to a port with nothing behind it. */
+$earlyZoneChange = false;
+if (in_array($mode, ['disable', 'remove'], true)) {
+    $earlyZoneChange = mihomoForwardZone(false, $fallback);
+}
 $root = rtrim(getenv('OS_MIHOMO_ROOT') ?: '', '/');
 $stateDir = $root . '/var/db/os-mihomo';
 $dnsStatePath = $stateDir . '/dns-state.json';
@@ -334,7 +343,7 @@ try {
             if ($forwarder instanceof DOMElement) {
                 $dots->removeChild($forwarder);
             }
-            $zoneChanged = mihomoForwardZone(false, $fallback);
+            $zoneChanged = mihomoForwardZone(false, $fallback) || $earlyZoneChange;
             if ($snapshot !== null) {
                 if (trim($forwarding->textContent) === '0') {
                     $forwarding->nodeValue = (string)$snapshot['forwarding'];
@@ -383,7 +392,7 @@ try {
         @unlink($stateDir . '/migrate/cron.json');
         @unlink($stateDir . '/migrate/config.xml');
     }
-    echo $before !== $doc->saveXML() || $zoneChanged
+    echo $before !== $doc->saveXML() || $zoneChanged || $earlyZoneChange
         ? "Mihomo integration updated.\n" : "Mihomo integration unchanged.\n";
 } catch (Throwable $error) {
     fwrite(STDERR, "Mihomo integration failed. Existing DNS state is retained for recovery.\n");

@@ -24,7 +24,6 @@ $failed = 0;
 $root = getenv('MIHOMO_ROOT') ?: '';
 foreach ([
     $root . '/usr/local/opnsense/scripts/mihomo/setup_unbound.php' => ['util.inc', 'config.inc'],
-    $root . '/usr/local/etc/inc/mihomo.inc.php'                    => [],
 ] as $file => $includes) {
     if (!is_readable($file)) { printf("  ? %-24s 不存在\n", basename($file)); continue; }
     $pid = pcntl_fork();

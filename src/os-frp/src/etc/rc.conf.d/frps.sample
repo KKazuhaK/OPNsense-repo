@@ -1,0 +1,16 @@
+# rc.conf(5) fragment for the frp server (frps).
+#
+# The web UI flips frps_enable with sysrc(8) when the service is started or
+# stopped, so this file also decides whether frps comes up at boot.  It ships
+# disabled because the shipped frps.toml still carries CHANGE_ME placeholders
+# for the fields that have no safe default.
+frps_enable="NO"
+
+# Optional overrides.  The pidfile is deliberately not configurable: the
+# Services: Overview entry in plugins.inc.d/frp.inc hardcodes /var/run/frps.pid
+# and would stop reporting the daemon if the two ever disagreed.
+#frps_config="/usr/local/etc/frp/frps.toml"
+#frps_logfile="/var/log/frps.log"
+
+# There is no frps_flags: every frps setting lives in the TOML file, and a
+# stray value here would be inserted into the daemon(8) argument list.

@@ -1,0 +1,27 @@
+#!/bin/sh
+# An upgrade replaces the files in place and the incoming post-install restores
+# the services, so only a real removal clears runtime state here.
+rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
+if [ -n "${PKG_UPGRADE+x}" ]; then
+    exit 0
+fi
+
+rm -f \
+    /var/run/frps.pid \
+    /var/run/frpc.pid \
+    /var/db/os-frp/frps.restart \
+    /var/db/os-frp/frpc.restart \
+    /var/db/os-frp/frps.rc.conf.upgrade \
+    /var/db/os-frp/frpc.rc.conf.upgrade \
+    /var/db/os-frp/frps.lock \
+    /var/db/os-frp/frpc.lock
+# manage.py serialises its mutations on the two lock files above; with them gone
+# the state directory holds nothing this plugin put there.
+rmdir /var/db/os-frp 2>/dev/null || true
+
+service configd restart >/dev/null 2>&1 || true
+# Configuration under /usr/local/etc/frp and the logs are deliberately kept:
+# they hold the tunnel definitions and the credentials a reinstall needs.
+echo "frp removed. /usr/local/etc/frp and /var/log/frp{s,c}.log were preserved."
+
+exit 0

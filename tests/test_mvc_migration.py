@@ -25,6 +25,7 @@ PLUGINS = {
     'os-ttyd': ('Ttyd', 'ttyd'),
     'os-speedtest': ('Speedtest', 'speedtest'),
     'os-sing-box': ('SingBox', 'singbox'),
+    'os-frp': ('Frp', 'frp'),
 }
 # Public methods verified against the real OPNsense 26.7 Request.php. Phalcon
 # methods such as getHttpHost are absent, even though its examples use them.
@@ -58,19 +59,47 @@ class MvcMigrationTests(unittest.TestCase):
         for package, (module, route) in PLUGINS.items():
             yield ROOT / 'src' / package, module, route
 
+    @staticmethod
+    def pages(package, module, route):
+        """Every page the menu offers, with what has to exist behind it.
+
+        Most plugins serve one page from IndexController and index.volt. A
+        plugin whose menu heading expands -- os-frp, the way Services > Network
+        Time does -- serves one page per child, and OPNsense routes
+        /ui/<module>/<name> to <Name>Controller::indexAction. Asking the menu
+        rather than assuming one page keeps both shapes honest.
+        """
+        menu = ET.parse(package / MVC / 'models/OPNsense' / module / 'Menu/Menu.xml').getroot()
+        found = {}
+        for url in sorted({node.get('url') for node in menu.iter() if node.get('url')}):
+            parts = [part for part in url.split('/') if part and part != '*']
+            if len(parts) < 2 or parts[0] != 'ui' or parts[1] != route:
+                continue
+            # /ui/x and the hidden /ui/x/* name the same page; keep it once, or
+            # a view gets concatenated with itself and every id looks duplicated.
+            name = parts[2] if len(parts) > 2 else 'index'
+            found.setdefault(name, (url,
+                package / MVC / 'controllers/OPNsense' / module / (name.capitalize() + 'Controller.php'),
+                package / MVC / 'views/OPNsense' / module / (name + '.volt')))
+        return list(found.values())
+
     def test_legacy_pages_are_removed_and_mvc_entry_points_ship(self):
-        for package, module, _ in self.packages():
+        for package, module, route in self.packages():
             with self.subTest(package=package.name):
                 self.assertEqual([], list((package / 'src/usr/local/www').glob('*.php')))
-                controller = package / MVC / 'controllers/OPNsense' / module / 'IndexController.php'
-                view = package / MVC / 'views/OPNsense' / module / 'index.volt'
-                self.assertTrue(controller.is_file(), str(controller))
-                self.assertTrue(view.is_file(), str(view))
-                source = controller.read_text()
-                self.assertIn('namespace OPNsense\\' + module + ';', source)
-                self.assertRegex(source, r'extends\s+\\OPNsense\\Base\\IndexController')
-                self.assertIn("pick('OPNsense/" + module + "/index')", source)
-                self.assertTrue(list((controller.parent / 'Api').glob('*Controller.php')))
+                pages = self.pages(package, module, route)
+                self.assertTrue(pages, 'the menu offers no page under /ui/' + route)
+                for url, controller, view in pages:
+                    # A url with nothing behind it renders in the sidebar and
+                    # answers "Page not found" on the click.
+                    self.assertTrue(controller.is_file(), '%s has no %s' % (url, controller.name))
+                    self.assertTrue(view.is_file(), '%s has no %s' % (url, view.name))
+                    source = controller.read_text()
+                    self.assertIn('namespace OPNsense\\' + module + ';', source)
+                    self.assertRegex(source, r'extends\s+\\OPNsense\\Base\\IndexController')
+                    self.assertIn("pick('OPNsense/%s/%s')" % (module, view.stem), source)
+                api = package / MVC / 'controllers/OPNsense' / module / 'Api'
+                self.assertTrue(list(api.glob('*Controller.php')))
 
     def test_menu_and_acl_register_both_page_and_api(self):
         for package, module, route in self.packages():
@@ -78,8 +107,9 @@ class MvcMigrationTests(unittest.TestCase):
                 models = package / MVC / 'models/OPNsense' / module
                 menu = ET.parse(models / 'Menu/Menu.xml').getroot()
                 urls = {element.get('url') for element in menu.iter() if element.get('url')}
-                self.assertIn('/ui/' + route, urls)
-                self.assertIn('/ui/' + route + '/*', urls)
+                # Either one page at /ui/<route>, or a heading that expands
+                # into pages beneath it; both are real OPNsense shapes.
+                self.assertTrue(any(url.startswith('/ui/' + route) for url in urls), urls)
                 self.assertFalse(any('.php' in url for url in urls), urls)
                 acl = ET.parse(models / 'ACL/ACL.xml').getroot()
                 patterns = {element.text for element in acl.iter('pattern')}
@@ -114,12 +144,28 @@ class MvcMigrationTests(unittest.TestCase):
     def test_volt_markup_and_referenced_api_actions(self):
         for package, module, route in self.packages():
             with self.subTest(package=package.name):
-                text = (package / MVC / 'views/OPNsense' / module / 'index.volt').read_text()
+                pages = self.pages(package, module, route)
+                self.assertTrue(pages, 'the menu offers no page under /ui/' + route)
+                whole = []
+                for _, _, view in pages:
+                    # As the browser receives it: the view plus whatever it
+                    # pulls in, since a partial's ids land on the same page.
+                    text = view.read_text()
+                    for name in re.findall(r'partial\(\s*"([^"]+)"', text):
+                        shared = package / MVC / 'views' / (name + '.volt')
+                        if shared.is_file():
+                            text += '\n' + shared.read_text()
+                    whole.append(text)
+                    markup = Markup(text)
+                    # Unique WITHIN a page. Two pages of one plugin may reuse an
+                    # id between them; nothing renders them together.
+                    self.assertEqual(len(markup.ids), len(set(markup.ids)),
+                                     'Duplicate IDs on ' + view.name)
+                    self.assertTrue(all(attrs.get('type') for attrs in markup.inputs),
+                                    'An input has no explicit type on ' + view.name)
+                text = '\n'.join(whole)
                 self.assertNotIn('<?', text)
                 self.assertNotRegex(text, r'(?:color|background(?:-color)?)\s*:', 'The view declares a theme color')
-                markup = Markup(text)
-                self.assertEqual(len(markup.ids), len(set(markup.ids)), 'Duplicate page IDs')
-                self.assertTrue(all(attrs.get('type') for attrs in markup.inputs), 'An input has no explicit type')
                 api = package / MVC / 'controllers/OPNsense' / module / 'Api'
                 controllers = {path.stem.removesuffix('Controller').lower(): path.read_text() for path in api.glob('*Controller.php')}
                 endpoints = re.findall(r'/api/' + re.escape(route) + r'/([a-zA-Z]+)/([a-zA-Z][a-zA-Z0-9_]*)', text)

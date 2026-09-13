@@ -1,0 +1,95 @@
+#!/bin/sh
+# PROVIDE: frpc
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# frp client.  The server has its own script, /usr/local/etc/rc.d/frps, so the
+# two daemons start, stop and fail independently.  frpc deliberately does not
+# REQUIRE frps: the server it registers with is usually elsewhere, and when it
+# is not, loginFailExit = false makes frpc wait for it instead.
+
+. /etc/rc.subr
+
+name="frpc"
+rcvar="frpc_enable"
+desc="frp reverse proxy client"
+
+load_rc_config "${name}"
+
+: "${frpc_enable:=NO}"
+: "${frpc_config:=/usr/local/etc/frp/frpc.toml}"
+: "${frpc_logfile:=/var/log/frpc.log}"
+
+# daemon(8) supervises the child only to clean up after it: no -r, because
+# --strict_config turns a single misspelled key into a permanent exit(1) and a
+# restarting supervisor would make that an invisible loop.  frpc retries a lost
+# server connection on its own, so nothing else needs restarting either.  The
+# child pid, not the wrapper's, lands in pidfile, so rc.subr and Services:
+# Overview both report frpc itself.
+command="/usr/sbin/daemon"
+procname="/usr/local/sbin/frpc"
+pidfile="/var/run/frpc.pid"
+command_args="-f -p ${pidfile} -t ${name} -o ${frpc_logfile} ${procname} -c ${frpc_config}"
+
+# Every frpc setting lives in the TOML file.  rc.subr would splice
+# ${name}_flags in ahead of command_args, that is into daemon(8)'s own
+# argument list, so refuse to carry a value that could only break the
+# invocation.
+frpc_flags=""
+
+start_precmd="frpc_prestart"
+stop_postcmd="frpc_poststop"
+
+# Ask the daemon itself whether the file parses.  It is the only check that
+# cannot drift from what frpc accepts, and it reports the offending key of a
+# --strict_config failure instead of leaving an empty log behind.
+frpc_verify_config()
+{
+    if frpc_verify_output=$("${procname}" verify -c "${frpc_config}" --strict_config=true 2>&1); then
+        return 0
+    fi
+    case "${frpc_verify_output}" in
+    *"unknown command"*|*"unknown flag"*|*"unknown shorthand flag"*)
+        # A build without the verify subcommand: leave the check to the daemon.
+        return 0
+        ;;
+    esac
+    echo "${frpc_verify_output}"
+    return 1
+}
+
+frpc_prestart()
+{
+    if [ ! -x "${procname}" ]; then
+        echo "frpc is not installed: ${procname}"
+        return 1
+    fi
+    if [ ! -s "${frpc_config}" ]; then
+        echo "frpc configuration is missing or empty: ${frpc_config}"
+        return 1
+    fi
+    # The shipped sample writes CHANGE_ME for serverAddr and auth.token.  Left
+    # in place, frpc would dial a host that does not exist and would offer a
+    # published placeholder as its token to whatever did answer, so treat it
+    # as a hard stop.  Only uncommented lines count; the sample's own comments
+    # name the placeholder.
+    if /usr/bin/grep -v '^[[:space:]]*#' "${frpc_config}" | /usr/bin/grep -q '"CHANGE_ME"'; then
+        echo "frpc configuration still holds CHANGE_ME placeholders: ${frpc_config}"
+        echo "Set the server address and the shared token in Services > frp > Client (frpc) first."
+        return 1
+    fi
+    frpc_verify_config || return 1
+
+    install -d -m 0700 /usr/local/etc/frp
+    chmod 0600 "${frpc_config}"
+    touch "${frpc_logfile}"
+    chmod 0600 "${frpc_logfile}"
+    rm -f "${pidfile}"
+}
+
+frpc_poststop()
+{
+    rm -f "${pidfile}"
+}
+
+run_rc_command "$1"

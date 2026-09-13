@@ -347,6 +347,10 @@ class ArchiveTests(unittest.TestCase):
                 verify.verify_source_package(self.package([(name, b'cache')]), self.root)
 
     def test_unmanifested_file_and_duplicate_member_are_rejected(self):
-        for extra in [('usr/local/bin/unexpected', b'extra'), ('usr/local/bin/mihomo', b'core fixture')]:
-            with self.assertRaisesRegex(ValueError, 'archive inventory'):
+        # One message each, not one regex for both: a shared pattern lets either
+        # tamper be caught by the other one's check and still look tested.
+        cases = [(('usr/local/bin/unexpected', b'extra'), 'archive inventory'),
+                 (('usr/local/bin/mihomo', b'core fixture'), 'lists a member twice')]
+        for extra, message in cases:
+            with self.assertRaisesRegex(ValueError, message):
                 verify.verify_source_package(self.package([extra]), self.root)

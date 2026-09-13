@@ -1,0 +1,69 @@
+# frpc (frp client) configuration for OPNsense.  frp 0.71.0, TOML format.
+#
+# frpc parses this file with --strict_config, which is on by default: one
+# unknown or misspelled key aborts the daemon with exit status 1 instead of
+# warning.  Every key below is a field of frp's ClientConfig; the full list is
+# in the upstream conf/frpc_full_example.toml.
+#
+# Values spelled CHANGE_ME are placeholders.  /usr/local/etc/rc.d/frpc refuses
+# to start while any of them is still in place, so this file is inert as
+# shipped.  Replace them in Services > frp > Client (frpc), or here, before
+# enabling the service.
+
+# Address and control port of the frps instance this router registers with.
+# A hostname is re-resolved on every reconnect, which suits a dynamic server.
+serverAddr = "CHANGE_ME"
+serverPort = 7000
+
+# Name of this client on the server.  It also prefixes every proxy name, so
+# two routers can both publish a proxy called "lan-ssh" without colliding.
+user = "opnsense"
+
+# Keep retrying instead of exiting when the server is unreachable.  The default
+# is true, which makes frpc quit if it boots before the server is up.
+loginFailExit = false
+
+[auth]
+method = "token"
+# Must match the frps auth.token character for character.
+token = "CHANGE_ME"
+
+[log]
+# The rc script redirects the daemon output into /var/log/frpc.log, which is
+# the file the plugin's log viewer reads; leave this on "console" so there is
+# exactly one writer.
+to = "console"
+level = "info"
+# The console output goes to a file, where ANSI colour would only add noise.
+disablePrintColor = true
+
+[transport]
+# tcp, kcp or quic.  tcp needs no extra port on the server side.
+protocol = "tcp"
+
+[transport.tls]
+# Wrap the control connection in TLS.  This is the default and it is what an
+# frps configured with transport.tls.force = true requires.
+enable = true
+
+# Admin API of this client.  The plugin restarts frpc rather than reloading it
+# through this API, so it stays off.  Give it a password before enabling it.
+#[webServer]
+#addr = "127.0.0.1"
+#port = 7400
+#user = "admin"
+#password = "CHANGE_ME"
+
+# Each [[proxies]] entry publishes one local service through the server.  While
+# this block stays commented out frpc connects and exposes nothing.
+#
+# remotePort must fall inside the server's allowPorts range, otherwise frps
+# rejects the proxy and logs the reason.
+#
+#[[proxies]]
+#name = "lan-ssh"
+#type = "tcp"
+#localIP = "192.168.1.1"
+#localPort = 22
+#remotePort = 6000
+#transport = { useEncryption = true, useCompression = true }

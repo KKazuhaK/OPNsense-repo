@@ -46,7 +46,10 @@ sed -e "s#@PKG_NAME@#$PKG_NAME#g" -e "s#@ORIGIN@#$ORIGIN#g" -e "s#@VERSION@#$VER
   "$SCRIPT_DIR/packaging/freebsd/+MANIFEST.in" > "$METADIR/+MANIFEST"
 for hook in +PRE_INSTALL +POST_INSTALL +PRE_DEINSTALL +POST_DEINSTALL; do install -m 0644 "$SCRIPT_DIR/packaging/freebsd/$hook" "$METADIR/$hook"; done
 
-env -u ABI pkg create -e -f tgz -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+# No -e: it expands +MANIFEST into readable UCL, and a UCL manifest cannot be
+# compared field by field against the committed staging record the way every
+# other plugin's compact JSON manifest is.
+env -u ABI pkg create -f tgz -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 mv -f "$DISTDIR/$PKG_NAME-$VERSION.pkg" "$DISTDIR/$OUTPUT_NAME"
 env -u ABI pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
 echo "Package: $DISTDIR/$OUTPUT_NAME"

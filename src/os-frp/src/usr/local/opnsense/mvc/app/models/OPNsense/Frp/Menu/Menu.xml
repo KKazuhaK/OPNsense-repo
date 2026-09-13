@@ -1,0 +1,11 @@
+<menu>
+    <Services>
+        <!-- The parent carries no url of its own: it is a heading that expands,
+             the way Services > Network Time does, and each daemon underneath it
+             is a page with a real url. -->
+        <Frp VisibleName="frp" order="75" cssClass="fa fa-exchange fa-fw">
+            <Server order="10" VisibleName="Server (frps)" url="/ui/frp/server"/>
+            <Client order="20" VisibleName="Client (frpc)" url="/ui/frp/client"/>
+        </Frp>
+    </Services>
+</menu>

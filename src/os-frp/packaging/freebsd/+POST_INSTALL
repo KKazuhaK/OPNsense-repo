@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+state=/var/db/os-frp
+install -d -m 0700 "$state"
+mkdir -p /etc/rc.conf.d /usr/local/etc/frp /var/log
+
+for side in frps frpc; do
+    # Restore the stashed rc.conf.d fragment, or seed it from the sample.  An
+    # existing live file is never touched.
+    if [ ! -f "/etc/rc.conf.d/$side" ]; then
+        if [ -f "$state/$side.rc.conf.upgrade" ]; then
+            cp -p "$state/$side.rc.conf.upgrade" "/etc/rc.conf.d/$side"
+        else
+            install -m 0644 "/etc/rc.conf.d/$side.sample" "/etc/rc.conf.d/$side"
+        fi
+    fi
+    rm -f "$state/$side.rc.conf.upgrade"
+
+    # The live TOML holds the authentication token, the dashboard password and
+    # any proxy secret, so it is not packaged and is written only when absent.
+    if [ ! -e "/usr/local/etc/frp/$side.toml" ]; then
+        install -m 0600 -o root -g wheel "/usr/local/etc/frp/$side.toml.sample" "/usr/local/etc/frp/$side.toml"
+    fi
+    chmod 0600 "/usr/local/etc/frp/$side.toml"
+    chown root:wheel "/usr/local/etc/frp/$side.toml"
+
+    touch "/var/log/$side.log"
+    chmod 0600 "/var/log/$side.log"
+    chmod 0755 "/usr/local/etc/rc.d/$side"
+done
+chmod 0755 /usr/local/opnsense/scripts/frp/manage.py
+
+# OPNsense caches the merged menu and ACL models for up to an hour.  Drop both
+# caches so the new VPN entry is reachable on the next page request.
+rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
+service configd restart >/dev/null 2>&1 || true
+
+# A fresh installation starts nothing.  frps without a token, without dashboard
+# credentials and without an allowPorts range accepts anonymous clients on
+# arbitrary remote ports, so the first start has to follow a deliberate
+# configuration.  Only a side the outgoing version was running is brought back,
+# and manage.py still refuses a configuration that is not safe to start.
+for side in frps frpc; do
+    [ -f "$state/$side.restart" ] || continue
+    rm -f "$state/$side.restart"
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/frp/manage.py --json "$side" restart >/dev/null 2>&1 || true
+done
+
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-frp >/dev/null 2>&1 || true
+fi
+echo "frp installed. Configure the server under Services > frp > Server (frps) and the client"
+echo "under Services > frp > Client (frpc) before starting either of them."

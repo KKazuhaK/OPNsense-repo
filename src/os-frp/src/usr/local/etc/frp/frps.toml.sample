@@ -1,0 +1,74 @@
+# frps (frp server) configuration for OPNsense.  frp 0.71.0, TOML format.
+#
+# frps parses this file with --strict_config, which is on by default: one
+# unknown or misspelled key aborts the daemon with exit status 1 instead of
+# warning.  Every key below is a field of frp's ServerConfig; the full list is
+# in the upstream conf/frps_full_example.toml.
+#
+# TOML assigns a bare key to the table header above it, so every top-level
+# setting has to stay in this first block.  Moving one below a [table] header
+# renames it -- allowPorts written under [webServer] becomes webServer.allowPorts
+# and takes the daemon down on the next start.
+#
+# Values spelled CHANGE_ME are placeholders.  /usr/local/etc/rc.d/frps refuses
+# to start while any of them is still in place, so this file is inert as
+# shipped.  Replace them in Services > frp > Server (frps), or here, before
+# enabling the service.
+
+# Control port the frp clients connect to.  This plugin adds no firewall rule:
+# allow the port on the WAN yourself, from Firewall > Rules.
+bindPort = 7000
+
+# NO SAFE DEFAULT.  Without allowPorts a client may bind ANY remote port on
+# this firewall, including ports already used by OPNsense services.  Keep the
+# range as narrow as the deployment allows; entries are { start, end } ranges
+# or { single } ports.
+allowPorts = [
+    { start = 6000, end = 6100 },
+]
+
+# Do not echo server-side error detail back to clients.
+detailedErrorsToClient = false
+
+# Upper bound on the remote ports a single client may hold at once.
+#maxPortsPerClient = 8
+
+# HTTP and HTTPS reverse proxying by virtual host.  Uncomment to let clients
+# publish "http"/"https" proxies under one shared port instead of one port
+# each.  These are top-level keys, so keep them in this block.
+#vhostHTTPPort = 8080
+#vhostHTTPSPort = 8443
+#subDomainHost = "frp.example.com"
+
+[auth]
+method = "token"
+# NO SAFE DEFAULT.  An empty token authenticates every client that also sends
+# an empty token, which is anybody who can reach bindPort.  Use a long random
+# value and configure the same one on each frpc.
+token = "CHANGE_ME"
+
+# Dashboard and admin API.  The admin API can list and delete proxies, so it
+# must stay on the loopback address and must never run without credentials.
+[webServer]
+addr = "127.0.0.1"
+port = 7500
+# NO SAFE DEFAULT.  When user and password are both empty frps skips the
+# authentication middleware entirely and the admin API is open to anyone who
+# reaches the port.
+user = "admin"
+password = "CHANGE_ME"
+
+[log]
+# The rc script redirects the daemon output into /var/log/frps.log, which is
+# the file the plugin's log viewer reads; leave this on "console" so there is
+# exactly one writer.
+to = "console"
+level = "info"
+# The console output goes to a file, where ANSI colour would only add noise.
+disablePrintColor = true
+
+[transport.tls]
+# Refuse clients that do not wrap the control connection in TLS.  frpc enables
+# TLS by default, and frps generates its own certificate when certFile and
+# keyFile are unset, so this works without any further setup.
+force = true

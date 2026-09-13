@@ -27,6 +27,7 @@ jobs:
           python -B -m unittest discover -s src/os-speedtest/tests -v
           python -B -m unittest discover -s src/os-lucky/tests -v
           python -B -m unittest discover -s src/os-ddns-go/tests -v
+          python -B -m unittest discover -s src/os-frp/tests -v
           python -B -m unittest discover -s src/os-easytier/tests/native -v
           python -B -m unittest discover -s src/os-ttyd/tests/native -v
           python -B -m unittest discover -s src/os-lang/tests/native -p test_archive.py -v
@@ -38,6 +39,7 @@ jobs:
             src/os-sing-box/src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api
           php tests/native/test-utility-api-contract.php
           php tests/native/test-small-api-contract.php
+          php src/os-staticarp/tests/native/test-settings.php
       - name: Check PHP syntax
         run: find src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
       - name: Check shell scripts

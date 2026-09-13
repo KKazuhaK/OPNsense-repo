@@ -308,10 +308,11 @@ class ControllerTests(unittest.TestCase):
                          self.rendered(dict(overlay), controller=m.ANY_CONTROLLER)['external-controller'])
 
     def test_an_inert_controller_key_is_lifted_out_of_the_merge_yaml(self):
-        overlay = {'external-controller': m.ANY_CONTROLLER, 'mixed-port': 7890}
+        # 'log-level' is no switch of ours, so it must survive absorption.
+        overlay = {'external-controller': m.ANY_CONTROLLER, 'log-level': 'warning'}
         lifted = m.absorb_switches(overlay, self.settings)
         self.assertEqual(m.ANY_CONTROLLER, lifted['controller'])
-        self.assertEqual({'mixed-port': 7890}, overlay)
+        self.assertEqual({'log-level': 'warning'}, overlay)
         # An address the switch cannot express stays put rather than being rewritten.
         kept = {'external-controller': '192.0.2.1:9090'}
         self.assertNotIn('controller', m.absorb_switches(kept, self.settings))
@@ -327,6 +328,82 @@ class ControllerTests(unittest.TestCase):
                 manager.check_settings(dict(self.settings, controller=bad))
         with self.assertRaises(m.Error):
             manager.check_settings(dict(self.settings, controller=m.ANY_CONTROLLER, secret=''))
+
+
+class ServiceSwitchTests(unittest.TestCase):
+    """The proxy ports, LAN binding and TUN parameters as first-class settings."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+
+    # The fixture subscription listens on :53, which render() refuses; the
+    # presets normally override it. These tests must not also state the keys
+    # under test, because a merge value deliberately beats a switch.
+    MINIMAL = {'dns': {'listen': '127.0.0.1:1053'}}
+
+    def generated(self, overlay=None, **settings):
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings},
+            overlay=copy.deepcopy(self.MINIMAL if overlay is None else overlay)))
+
+    def test_the_switches_reach_the_configuration(self):
+        generated = self.generated(mixed_port=8080, socks_port=8081, allow_lan=True,
+                                   bind_address='192.168.8.1', tun_stack='system', tun_mtu=1400)
+        self.assertEqual(8080, generated['mixed-port'])
+        self.assertEqual(8081, generated['socks-port'])
+        self.assertIs(True, generated['allow-lan'])
+        self.assertEqual('192.168.8.1', generated['bind-address'])
+        self.assertEqual('system', generated['tun']['stack'])
+        self.assertEqual(1400, generated['tun']['mtu'])
+
+    def test_a_merge_yaml_value_is_lifted_into_the_switch_it_belongs_to(self):
+        # Otherwise the form shows a value the running configuration contradicts,
+        # which is the whole reason these are absorbed rather than merely merged.
+        overlay = {'mixed-port': 8080, 'socks-port': 8081, 'allow-lan': True,
+                   'bind-address': '192.168.8.1', 'tun': {'stack': 'mixed', 'mtu': 1300}}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual(8080, lifted['mixed_port'])
+        self.assertEqual(8081, lifted['socks_port'])
+        self.assertIs(True, lifted['allow_lan'])
+        self.assertEqual('192.168.8.1', lifted['bind_address'])
+        self.assertEqual('mixed', lifted['tun_stack'])
+        self.assertEqual(1300, lifted['tun_mtu'])
+        self.assertEqual({}, overlay, 'an absorbed key must not keep overriding')
+        # And the lifted values render back to exactly what was written.
+        generated = m.parse_yaml(m.render(self.data, lifted, overlay=copy.deepcopy(self.MINIMAL)))
+        self.assertEqual(8080, generated['mixed-port'])
+        self.assertEqual('mixed', generated['tun']['stack'])
+
+    def test_a_value_the_switch_cannot_express_keeps_winning_and_is_reported(self):
+        overlay = {'tun': {'stack': 'nonesuch'}}
+        lifted = m.absorb_switches(copy.deepcopy(overlay), self.settings)
+        self.assertEqual('gvisor', lifted['tun_stack'], 'an unknown stack must not be adopted')
+        self.assertIn('tun_stack', m.switch_overrides(overlay))
+
+    def test_true_is_not_a_port(self):
+        # YAML booleans are ints in Python, so "mixed-port: true" would absorb
+        # as port 1 and quietly move the proxy.
+        overlay = {'mixed-port': True}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual(m.SWITCH_DEFAULTS['mixed_port'], lifted['mixed_port'])
+        self.assertEqual({'mixed-port': True}, overlay)
+
+    def test_an_upgrade_keeps_the_ports_it_was_running(self):
+        rendered = {'mixed-port': 8080, 'socks-port': 8081, 'allow-lan': True,
+                    'bind-address': '10.0.0.1', 'tun': {'enable': True, 'stack': 'system', 'mtu': 1300}}
+        seeded = m.adopt_switches(rendered, {})
+        self.assertEqual(8080, seeded['mixed_port'])
+        self.assertEqual('10.0.0.1', seeded['bind_address'])
+        self.assertEqual('system', seeded['tun_stack'])
+
+    def test_a_stopped_tun_states_no_intent_to_adopt(self):
+        # render() forces these off when transparent routing is off, so reading
+        # them back would record the enforcement as if it were a choice.
+        seeded = m.adopt_switches({'tun': {'enable': False, 'stack': 'system', 'mtu': 1300}}, {})
+        self.assertNotIn('tun_stack', seeded)
+        self.assertNotIn('tun_mtu', seeded)
 
 
 class BaselineTests(unittest.TestCase):

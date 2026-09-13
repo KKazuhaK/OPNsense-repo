@@ -41,9 +41,15 @@ class SettingsController extends ApiControllerBase
     private const STATE = '/var/db/os-mihomo';
 
     /* Fields the form owns. Anything absent keeps whatever is stored. */
-    private const FLAGS = ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any'];
-    private const CHOICES = ['dns_mode' => 'fake-ip', 'geo_source' => 'metacubex', 'device_mode' => 'off'];
+    private const FLAGS = ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any',
+                           'allow_lan'];
+    private const CHOICES = ['dns_mode' => 'fake-ip', 'geo_source' => 'metacubex', 'device_mode' => 'off',
+                             'tun_stack' => 'gvisor'];
     private const LISTS = ['dns_default', 'dns_nameserver', 'dns_proxy_nameserver', 'device_list'];
+    /* Sent as numbers rather than strings, because the backend distinguishes
+       them: a port that arrives as "7890" fails its type check. */
+    private const NUMBERS = ['mixed_port' => 7890, 'socks_port' => 7891, 'tun_mtu' => 1420];
+    private const TEXTS = ['bind_address' => '127.0.0.1'];
 
     public function getAction(): array
     {
@@ -94,6 +100,17 @@ class SettingsController extends ApiControllerBase
         foreach (self::LISTS as $field) {
             /* Commas and newlines both separate; an empty field inherits. */
             $payload[$field] = array_values(preg_split('/[\s,]+/', (string)($given[$field] ?? ''), -1, PREG_SPLIT_NO_EMPTY));
+        }
+        foreach (self::NUMBERS as $field => $fallback) {
+            $value = trim((string)($given[$field] ?? ''));
+            /* An empty box means the default rather than zero. A value that is
+               not a number is passed through unchanged so the backend rejects
+               it by name instead of it silently becoming the default. */
+            $payload[$field] = $value === '' ? $fallback
+                : (preg_match('/^[0-9]{1,5}$/', $value) ? (int)$value : $value);
+        }
+        foreach (self::TEXTS as $field => $fallback) {
+            $payload[$field] = trim((string)($given[$field] ?? '')) ?: $fallback;
         }
         return $this->backend('set-settings', json_encode($payload));
     }

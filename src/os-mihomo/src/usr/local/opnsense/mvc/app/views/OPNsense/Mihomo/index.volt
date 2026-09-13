@@ -104,11 +104,17 @@ $(function () {
             $('#subscription_url').attr('placeholder', data.has_url
                 ? '{{ lang._('Leave empty to keep the stored URL') }}'
                 : '{{ lang._('No subscription URL is stored yet') }}');
-            ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any'].forEach(function (flag) {
+            ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any',
+             'allow_lan'].forEach(function (flag) {
                 $('#' + flag).prop('checked', !!s[flag]);
             });
-            ['dns_mode', 'geo_source', 'device_mode'].forEach(function (choice) {
+            ['dns_mode', 'geo_source', 'device_mode', 'tun_stack'].forEach(function (choice) {
                 $('#' + choice).val(s[choice] || $('#' + choice + ' option:first').val());
+            });
+            /* A stored value fills the box; the placeholder already shows the
+               default, so an empty box reads as "whatever the default is". */
+            ['mixed_port', 'socks_port', 'tun_mtu', 'bind_address'].forEach(function (field) {
+                $('#' + field).val(s[field] === undefined || s[field] === null ? '' : s[field]);
             });
             ['dns_default', 'dns_nameserver', 'dns_proxy_nameserver'].forEach(function (field) {
                 $('#' + field).val((s[field] || []).join(', '));
@@ -197,7 +203,11 @@ $(function () {
             dns_nameserver: $('#dns_nameserver').val(),
             dns_proxy_nameserver: $('#dns_proxy_nameserver').val()
         }};
-        ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any'].forEach(function (flag) {
+        ['mixed_port', 'socks_port', 'tun_mtu', 'bind_address', 'tun_stack'].forEach(function (field) {
+            payload.settings[field] = $('#' + field).val();
+        });
+        ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any',
+         'allow_lan'].forEach(function (flag) {
             payload.settings[flag] = $('#' + flag).is(':checked') ? 1 : 0;
         });
         call(api.set, payload, '{{ lang._('Settings saved. The configuration was regenerated from the stored subscription.') }}', $(this));
@@ -349,6 +359,77 @@ $(function () {
     </div>
 
     <div id="routing" class="tab-pane fade in">
+        <table class="table table-striped opnsense_standard_table_form">
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Local proxy') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <tbody>
+                <tr>
+                    <td><a id="help_for_mixedport" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Mixed port') }}</td>
+                    <td><input type="number" id="mixed_port" class="form-control" style="width:160px" min="1" max="65535" placeholder="7890">
+                        <span class="label label-warning mihomo-override" id="override_mixed_port" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="hidden" data-for="help_for_mixedport">
+                            {{ lang._('Accepts HTTP and SOCKS on one port, for clients pointed at the proxy by hand. Transparent routing does not use it. Ports 53, 1053 and 9090 belong to the resolver, to Mihomo\'s own DNS and to the dashboard, so they are refused here.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_socksport" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('SOCKS port') }}</td>
+                    <td><input type="number" id="socks_port" class="form-control" style="width:160px" min="1" max="65535" placeholder="7891">
+                        <span class="label label-warning mihomo-override" id="override_socks_port" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="hidden" data-for="help_for_socksport">
+                            {{ lang._('SOCKS5 only, for clients that will not use the mixed port. It cannot be the same as the mixed port.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_allowlan" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Reachable from the LAN') }}</td>
+                    <td><input type="checkbox" id="allow_lan">
+                        <span class="label label-warning mihomo-override" id="override_allow_lan" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="hidden" data-for="help_for_allowlan">
+                            {{ lang._('Off means the two ports above answer only on the router itself. Turn it on to let other devices use the proxy directly, which is the way to proxy a single machine without turning on transparent routing for the whole network. The firewall still decides who reaches the port.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_bindaddress" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Bind address') }}</td>
+                    <td><input type="text" id="bind_address" class="form-control" style="width:240px" placeholder="127.0.0.1">
+                        <span class="label label-warning mihomo-override" id="override_bind_address" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="hidden" data-for="help_for_bindaddress">
+                            {{ lang._('Which address the two ports answer on. Use the router\'s LAN address to offer the proxy to that network alone, or * for every address. It only takes effect once Reachable from the LAN is on.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-proxy">{{ lang._('Save settings') }}</button></td></tr>
+            </tbody>
+        </table>
+        <table class="table table-striped opnsense_standard_table_form">
+            <thead><tr><td style="width:22%"><strong>{{ lang._('Transparent routing') }}</strong></td><td style="width:78%"></td></tr></thead>
+            <tbody>
+                <tr>
+                    <td><a id="help_for_tunstack" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('TUN stack') }}</td>
+                    <td>
+                        <select id="tun_stack" class="selectpicker" data-style="btn-default" data-width="240px">
+                            <option value="gvisor">{{ lang._('gVisor (default)') }}</option>
+                            <option value="system">{{ lang._('System') }}</option>
+                            <option value="mixed">{{ lang._('Mixed') }}</option>
+                        </select>
+                        <span class="label label-warning mihomo-override" id="override_tun_stack" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="hidden" data-for="help_for_tunstack">
+                            {{ lang._('How the tunnel moves packets. gVisor runs in Mihomo and needs nothing from the host, which is why it is the default. System hands the work to the kernel and is faster where that works. Mixed uses the system stack for TCP and gVisor for UDP. Change it only if throughput is a problem, and watch that transparent routing still comes up afterwards.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_tunmtu" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('TUN MTU') }}</td>
+                    <td><input type="number" id="tun_mtu" class="form-control" style="width:160px" min="576" max="9000" placeholder="1420">
+                        <span class="label label-warning mihomo-override" id="override_tun_mtu" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="hidden" data-for="help_for_tunmtu">
+                            {{ lang._('Largest packet the tunnel carries. 1420 leaves room for the headers most nodes add. Too large and large packets vanish instead of being fragmented, which looks like some sites loading and others hanging.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr><td></td><td><button type="button" class="btn btn-primary mihomo-save" id="mihomo-save-tun">{{ lang._('Save settings') }}</button></td></tr>
+            </tbody>
+        </table>
         <table class="table table-striped opnsense_standard_table_form">
             <thead><tr><td style="width:22%"><strong>{{ lang._('Device policy') }}</strong></td><td style="width:78%"></td></tr></thead>
             <tbody>

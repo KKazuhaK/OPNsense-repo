@@ -327,9 +327,17 @@ def check_dns_servers(field, values):
 # states one of these keys in its canonical form, absorb_switches() lifts it into
 # the switch instead, so the UI never shows a value the config contradicts.
 SWITCH_DEFAULTS = {'router_dns': False, 'ipv6': False, 'dns_hijack': True,
-                   'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT}
+                   'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT,
+                   'mixed_port': 7890, 'socks_port': 7891, 'allow_lan': False,
+                   'bind_address': '127.0.0.1', 'tun_stack': 'gvisor', 'tun_mtu': 1420}
 # Bumped only to re-seed the switches from an installation that predates them.
-SWITCH_SCHEMA = 2
+SWITCH_SCHEMA = 3
+# gVisor needs no kernel support and is what the presets ship; system is faster
+# where the host can carry it; mixed uses system for TCP and gVisor for UDP.
+TUN_STACKS = ('gvisor', 'system', 'mixed')
+PORT_LIMIT = 65535
+DNS_LISTEN_PORT = 1053
+MTU_RANGE = (576, 9000)
 CONTROLLER_PORT = 9090
 LOOPBACK_CONTROLLER = '127.0.0.1:%d' % CONTROLLER_PORT
 ANY_CONTROLLER = '0.0.0.0:%d' % CONTROLLER_PORT
@@ -340,9 +348,15 @@ def switch_overlay(settings):
     ipv6 = bool(settings.get('ipv6', False))
     overlay = {
         'ipv6': ipv6,
+        'mixed-port': int(settings.get('mixed_port', SWITCH_DEFAULTS['mixed_port'])),
+        'socks-port': int(settings.get('socks_port', SWITCH_DEFAULTS['socks_port'])),
+        'allow-lan': bool(settings.get('allow_lan', False)),
+        'bind-address': str(settings.get('bind_address') or SWITCH_DEFAULTS['bind_address']),
         'dns': {'ipv6': ipv6,
                 'enhanced-mode': settings.get('dns_mode', DNS_MODE_DEFAULT)},
-        'tun': {'dns-hijack': list(HIJACK_TARGETS) if settings.get('dns_hijack', True) else []},
+        'tun': {'dns-hijack': list(HIJACK_TARGETS) if settings.get('dns_hijack', True) else [],
+                'stack': settings.get('tun_stack') or SWITCH_DEFAULTS['tun_stack'],
+                'mtu': int(settings.get('tun_mtu', SWITCH_DEFAULTS['tun_mtu']))},
         'geox-url': dict(GEO_SOURCES[settings.get('geo_source') or GEO_SOURCE_DEFAULT]),
         'geodata-mode': True, 'geo-auto-update': True, 'geo-update-interval': GEO_UPDATE_HOURS,
     }
@@ -367,6 +381,15 @@ def switch_conflicts(rendered, settings):
         out.append('dns_mode')
     if bool(tun.get('dns-hijack')) is not bool(wanted['tun']['dns-hijack']):
         out.append('dns_hijack')
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port'),
+                       ('allow_lan', 'allow-lan'), ('bind_address', 'bind-address')):
+        if key in rendered and rendered[key] != wanted[key]:
+            out.append(field)
+    # A stopped TUN carries the inert values render() forces, not a conflict.
+    if tun.get('enable'):
+        for field, key in (('tun_stack', 'stack'), ('tun_mtu', 'mtu')):
+            if key in tun and tun[key] != wanted['tun'][key]:
+                out.append(field)
     return out
 
 
@@ -392,6 +415,22 @@ def absorb_switches(overlay, settings):
 
     if dns.get('enhanced-mode') in DNS_MODES:
         settings['dns_mode'] = dns.pop('enhanced-mode')
+
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port')):
+        port = overlay.get(key)
+        # bool is an int, and "allow-lan: true" next door makes that a live risk.
+        if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= PORT_LIMIT:
+            settings[field] = port
+            overlay.pop(key)
+    if isinstance(overlay.get('allow-lan'), bool):
+        settings['allow_lan'] = overlay.pop('allow-lan')
+    if isinstance(overlay.get('bind-address'), str) and overlay['bind-address']:
+        settings['bind_address'] = overlay.pop('bind-address')
+    if tun.get('stack') in TUN_STACKS:
+        settings['tun_stack'] = tun.pop('stack')
+    mtu = tun.get('mtu')
+    if isinstance(mtu, int) and not isinstance(mtu, bool) and MTU_RANGE[0] <= mtu <= MTU_RANGE[1]:
+        settings['tun_mtu'] = tun.pop('mtu')
 
     # The controller is settings policy now, so leaving it here would display a
     # value the rendered configuration ignores.
@@ -446,6 +485,19 @@ def adopt_switches(rendered, settings):
         settings['dns_mode'] = dns['enhanced-mode']
     if tun.get('enable') is True and isinstance(tun.get('dns-hijack'), list):
         settings['dns_hijack'] = bool(tun['dns-hijack'])
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port')):
+        if isinstance(rendered.get(key), int) and not isinstance(rendered.get(key), bool):
+            settings[field] = rendered[key]
+    if isinstance(rendered.get('allow-lan'), bool):
+        settings['allow_lan'] = rendered['allow-lan']
+    if isinstance(rendered.get('bind-address'), str) and rendered['bind-address']:
+        settings['bind_address'] = rendered['bind-address']
+    # An inert section carries what render() forces, not what was intended.
+    if tun.get('enable') is True:
+        if tun.get('stack') in TUN_STACKS:
+            settings['tun_stack'] = tun['stack']
+        if isinstance(tun.get('mtu'), int) and not isinstance(tun.get('mtu'), bool):
+            settings['tun_mtu'] = tun['mtu']
     for name, known in GEO_SOURCES.items():
         if rendered.get('geox-url') == known:
             settings['geo_source'] = name
@@ -484,6 +536,13 @@ def switch_overrides(overlay):
         out.append('dns_hijack')
     if 'geox-url' in probe:
         out.append('geo_source')
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port'),
+                       ('allow_lan', 'allow-lan'), ('bind_address', 'bind-address')):
+        if key in probe:
+            out.append(field)
+    for field, key in (('tun_stack', 'stack'), ('tun_mtu', 'mtu')):
+        if key in tun:
+            out.append(field)
     out.extend(field for field, key in DNS_SERVER_FIELDS.items() if key in dns)
     return out
 
@@ -904,7 +963,8 @@ class Manager:
             raise Error("Mihomo settings are missing or invalid; run initialization first.") from None
 
     def check_settings(self, settings):
-        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns', 'ipv6', 'dns_hijack'):
+        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns', 'ipv6',
+                    'dns_hijack', 'allow_lan'):
             if key not in settings and key in SWITCH_DEFAULTS:
                 continue
             if not isinstance(settings.get(key), bool):
@@ -915,6 +975,34 @@ class Manager:
             raise Error("The rule database must be one of: " + ", ".join(GEO_SOURCES) + ".")
         for field in DNS_SERVER_FIELDS:
             check_dns_servers(field, settings.get(field) or [])
+        ports = {}
+        for field, label in (('mixed_port', 'mixed'), ('socks_port', 'SOCKS')):
+            value = settings.get(field, SWITCH_DEFAULTS[field])
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= PORT_LIMIT:
+                raise Error('The %s port must be a number between 1 and %d.' % (label, PORT_LIMIT))
+            # 53 belongs to the resolver, 1053 to Mihomo's own, 9090 to the
+            # dashboard. Taking one of them stops the core starting, and the
+            # reason is buried in its log rather than shown here.
+            if value in (53, DNS_LISTEN_PORT, CONTROLLER_PORT):
+                raise Error('Port %d is already used by the router, so the %s port cannot take it.'
+                            % (value, label))
+            if value in ports:
+                raise Error('The mixed and SOCKS ports cannot both be %d.' % value)
+            ports[value] = field
+        stack = settings.get('tun_stack', SWITCH_DEFAULTS['tun_stack'])
+        if stack not in TUN_STACKS:
+            raise Error('The TUN stack must be one of: ' + ', '.join(TUN_STACKS) + '.')
+        mtu = settings.get('tun_mtu', SWITCH_DEFAULTS['tun_mtu'])
+        if isinstance(mtu, bool) or not isinstance(mtu, int) or not MTU_RANGE[0] <= mtu <= MTU_RANGE[1]:
+            raise Error('The TUN MTU must be a number between %d and %d.' % MTU_RANGE)
+        bind = settings.get('bind_address', SWITCH_DEFAULTS['bind_address'])
+        if not isinstance(bind, str) or not bind:
+            raise Error('The bind address is required; use * to accept every address.')
+        if bind != '*':
+            try:
+                ipaddress.ip_address(bind.strip('[]'))
+            except ValueError:
+                raise Error('The bind address must be an IP address, or * for every address.') from None
         if settings.get('device_mode', 'off') not in DEVICE_MODES:
             raise Error('The device policy must be one of: ' + ', '.join(DEVICE_MODES) + '.')
         device_networks(settings.get('device_list'))

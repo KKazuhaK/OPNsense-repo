@@ -38,6 +38,35 @@ function mihomo_settings(): array
     return is_string($settings) ? (json_decode($settings, true) ?: []) : [];
 }
 
+function mihomo_dashboard_url(array $settings): string
+{
+    /* Zashboard accepts hostname/port/secret from the fragment as well as the
+       query string, and a fragment is never sent to a server or a referrer, so
+       the secret stays in the browser. Empty when the controller is bound to
+       loopback, because nothing outside the router could reach it. */
+    $controller = (string)($settings['controller'] ?? '127.0.0.1:9090');
+    $secret = (string)($settings['secret'] ?? '');
+    if ($secret === '' || strpos($controller, ':') === false || strpos($controller, '127.0.0.1:') === 0) {
+        return '';
+    }
+    $port = substr($controller, strrpos($controller, ':') + 1);
+    if (!preg_match('/^[0-9]{1,5}$/', $port)) {
+        return '';
+    }
+    /* Reach the dashboard on whatever address the operator reached this page on. */
+    $host = (string)($_SERVER['HTTP_HOST'] ?? '');
+    if ($host !== '' && $host[0] === '[') {
+        $host = substr($host, 0, strpos($host, ']') + 1);
+    } else {
+        $host = preg_replace('/:[0-9]+$/', '', $host);
+    }
+    if ($host === '') {
+        return '';
+    }
+    return 'http://' . $host . ':' . $port . '/ui/#/setup?hostname=' . rawurlencode(trim($host, '[]'))
+        . '&port=' . rawurlencode($port) . '&secret=' . rawurlencode($secret);
+}
+
 function mihomo_effective_dns(): array
 {
     /* The upstreams actually in force, read from the rendered configuration so an

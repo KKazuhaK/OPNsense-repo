@@ -555,3 +555,32 @@ class ControllerMigrationTests(unittest.TestCase):
         self.assertEqual(m.ANY_CONTROLLER, self.manager.settings()['controller'])
         self.assertNotIn('external-controller',
                          m.parse_yaml(self.manager.merge_file.read_bytes()))
+
+
+class FreshDashboardTests(unittest.TestCase):
+    """A fresh install comes up reachable; the presets state no settings-owned key."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.manager = m.Manager(Path(self.temp.name), FakeSystem())
+
+    def test_a_fresh_install_binds_every_interface(self):
+        self.manager.initialize()
+        self.assertEqual(m.ANY_CONTROLLER, self.manager.settings()['controller'])
+
+    def test_no_preset_states_the_controller(self):
+        # A preset that named it would be absorbed and defeat the default above.
+        directory = Path(m.__file__).resolve().parents[3] / 'share/mihomo/presets'
+        for preset in sorted(directory.glob('*.yaml')):
+            self.assertNotIn('external-controller', m.parse_yaml(preset.read_bytes()), preset.name)
+
+    def test_an_upgrade_keeps_the_address_it_had(self):
+        self.manager.initialize()
+        settings = self.manager.settings()
+        settings['controller'] = m.LOOPBACK_CONTROLLER
+        settings.pop('switch_schema')
+        self.manager.write_settings(settings)
+        self.manager.dispatch('start')
+        self.manager.initialize(upgrade=True)
+        self.assertEqual(m.LOOPBACK_CONTROLLER, self.manager.settings()['controller'])

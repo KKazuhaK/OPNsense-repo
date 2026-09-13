@@ -166,13 +166,13 @@ include("fbegin.inc");
 							<div class="form-group">
 								<label class="col-sm-2 control-label"><?=gettext("Config")?></label>
 								<div class="col-sm-10">
-									<input class="form-control" name="conf_dir" value="<?=htmlspecialchars($conf_dir)?>">
+									<input type="text" class="form-control" name="conf_dir" value="<?=htmlspecialchars($conf_dir)?>">
 								</div>
 							</div>
 							<div class="form-group">
 								<label class="col-sm-2 control-label"><?=gettext("Port")?></label>
 								<div class="col-sm-10">
-									<input class="form-control" name="web_port" value="<?=htmlspecialchars((string)$web_port)?>">
+									<input type="text" class="form-control" name="web_port" value="<?=htmlspecialchars((string)$web_port)?>">
 								</div>
 							</div>
 							<div class="form-group">

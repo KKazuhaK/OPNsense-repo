@@ -74,7 +74,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $result = ['ok' => false, 'error' => 'Invalid action.'];
         }
         $ok = ($result['ok'] ?? false) === true;
-        $message = $ok ? ($action === 'sub-update' ? 'Subscription update queued. Check its status below.' : 'Operation completed successfully.') : ($result['error'] ?? 'Operation failed.');
+        /* Say which operation succeeded; "completed successfully" tells nobody what changed. */
+        $done = ['set-settings' => gettext('Settings saved. The configuration was regenerated from the stored subscription.'),
+                 'sub-update' => gettext('Subscription update queued. Check its status below.'),
+                 'clear-sub-log' => gettext('Subscription log cleared.')];
+        $message = $ok ? ($done[$action] ?? gettext('Operation completed.')) : ($result['error'] ?? gettext('Operation failed.'));
     }
 }
 $settings = mihomo_settings();
@@ -94,6 +98,7 @@ include('fbegin.inc');
       <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
+          <thead>
           <tr>
             <td style="width:22%"><strong><?=gettext('Subscription')?></strong></td>
             <td style="width:78%; text-align:right">
@@ -102,6 +107,8 @@ include('fbegin.inc');
               &nbsp;&nbsp;
             </td>
           </tr>
+          </thead>
+          <tbody>
           <tr>
             <td><a id="help_for_url" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Subscription URL')?></td>
             <td>
@@ -143,10 +150,19 @@ include('fbegin.inc');
               </div>
             </td>
           </tr>
-          <tr>
-            <td style="width:22%"><strong><?=gettext('DNS policy')?></strong></td>
-            <td style="width:78%"></td>
-          </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="content-box tab-content table-responsive __mb">
+        <table class="table table-striped opnsense_standard_table_form">
+          <thead>
+            <tr>
+              <td style="width:22%"><strong><?=gettext('DNS policy')?></strong></td>
+              <td style="width:78%"></td>
+            </tr>
+          </thead>
+          <tbody>
           <tr>
             <td><a id="help_for_fallback" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Restore direct DNS on exit')?></td>
             <td>
@@ -270,6 +286,7 @@ include('fbegin.inc');
             <td></td>
             <td><button type="submit" class="btn btn-primary" name="action" value="set-settings"><?=gettext('Save settings')?></button></td>
           </tr>
+          </tbody>
         </table>
       </div>
     </form>
@@ -278,6 +295,7 @@ include('fbegin.inc');
       <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
+          <thead>
           <tr>
             <td style="width:22%"><strong><?=gettext('Subscription log')?></strong></td>
             <td style="width:78%; text-align:right">
@@ -287,6 +305,8 @@ include('fbegin.inc');
               &nbsp;&nbsp;
             </td>
           </tr>
+          </thead>
+          <tbody>
           <tr>
             <td><a id="help_for_fetch" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Update')?></td>
             <td>
@@ -303,6 +323,7 @@ include('fbegin.inc');
               <button type="submit" class="btn btn-default" name="action" value="clear-sub-log"><?=gettext('Clear log')?></button>
             </td>
           </tr>
+          </tbody>
         </table>
       </div>
     </form>

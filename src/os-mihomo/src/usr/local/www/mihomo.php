@@ -56,7 +56,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $result = mihomo_action($action);
         }
         $ok = ($result['ok'] ?? false) === true;
-        $message = $ok ? 'Operation completed successfully.' : ($result['error'] ?? 'Operation failed.');
+        /* Say which operation succeeded, and for the two that change forwarding
+           for every client on the network, say what that means. */
+        $done = ['start' => gettext('Service started.'),
+                 'stop' => gettext('Service stopped.'),
+                 'restart' => gettext('Service restarted.'),
+                 'enable-transparent' => gettext('Transparent routing enabled. LAN traffic and DNS now pass through Mihomo.'),
+                 'disable-transparent' => gettext('Transparent routing disabled. Routing and DNS were returned to the router.'),
+                 'save-merge' => gettext('Merge YAML saved and applied.'),
+                 'save-config' => gettext('Subscription configuration saved and applied.'),
+                 'load-preset' => gettext('Preset loaded and applied. It replaced the merge YAML.'),
+                 'clear-log' => gettext('Log cleared.')];
+        $message = $ok ? ($done[$action] ?? gettext('Operation completed.')) : ($result['error'] ?? gettext('Operation failed.'));
     }
 }
 $status = mihomo_status();
@@ -79,6 +90,7 @@ include('fbegin.inc');
       <input type="hidden" name="csrf_token" value="<?=mihomo_escape($csrf)?>">
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
+          <thead>
           <tr>
             <td style="width:22%"><strong><?=gettext('Service and transparent routing')?></strong></td>
             <td style="width:78%; text-align:right">
@@ -87,6 +99,8 @@ include('fbegin.inc');
               &nbsp;&nbsp;
             </td>
           </tr>
+          </thead>
+          <tbody>
           <tr>
             <td><?=gettext('Service')?></td>
             <td id="mihomo-status-cell">
@@ -126,6 +140,20 @@ include('fbegin.inc');
             </td>
           </tr>
           <tr>
+            <td><a id="help_for_dashboard" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Dashboard')?></td>
+            <td>
+              <?php $dashboard = mihomo_dashboard_url($settings); ?>
+              <?php if ($dashboard !== ''): ?>
+                <a class="btn btn-default" href="<?=mihomo_escape($dashboard)?>" target="_blank" rel="noopener noreferrer"><?=gettext('Open dashboard')?></a>
+              <?php else: ?>
+                <span class="text-muted"><?=gettext('The control API is bound to loopback. Turn on Reachable dashboard under Subscription, or forward the port over SSH.')?></span>
+              <?php endif; ?>
+              <div class="hidden" data-for="help_for_dashboard">
+                <?=gettext('Opens the bundled dashboard already signed in, by carrying the address and secret in the link fragment. A fragment is never sent to a server and never appears in a referrer, but it does land in this browser history, so treat a shared machine accordingly. The button appears only while the control API is reachable from somewhere other than the router itself.')?>
+              </div>
+            </td>
+          </tr>
+          <tr>
             <td><a id="help_for_advanced" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Advanced options')?></td>
             <td>
               <input type="checkbox" id="mihomo-advanced-toggle">
@@ -134,6 +162,7 @@ include('fbegin.inc');
               </div>
             </td>
           </tr>
+          </tbody>
         </table>
       </div>
 
@@ -141,10 +170,13 @@ include('fbegin.inc');
 
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
+          <thead>
           <tr>
             <td style="width:22%"><strong><?=gettext('Local merge YAML')?></strong></td>
             <td style="width:78%"></td>
           </tr>
+          </thead>
+          <tbody>
           <tr>
             <td><a id="help_for_merge" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Merge YAML')?></td>
             <td>
@@ -172,15 +204,19 @@ include('fbegin.inc');
               </div>
             </td>
           </tr>
+          </tbody>
         </table>
       </div>
 
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
+          <thead>
           <tr>
             <td style="width:22%"><strong><?=gettext('Subscription configuration')?></strong></td>
             <td style="width:78%"></td>
           </tr>
+          </thead>
+          <tbody>
           <tr>
             <td><a id="help_for_config" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Subscription YAML')?></td>
             <td>
@@ -194,6 +230,7 @@ include('fbegin.inc');
             <td></td>
             <td><button type="submit" class="btn btn-primary" name="action" value="save-config"><?=gettext('Validate and apply configuration')?></button></td>
           </tr>
+          </tbody>
         </table>
       </div>
 
@@ -201,10 +238,13 @@ include('fbegin.inc');
 
       <div class="content-box tab-content table-responsive __mb">
         <table class="table table-striped opnsense_standard_table_form">
+          <thead>
           <tr>
             <td style="width:22%"><strong><?=gettext('Log viewer')?></strong></td>
             <td style="width:78%"></td>
           </tr>
+          </thead>
+          <tbody>
           <tr>
             <td></td>
             <td>
@@ -212,6 +252,7 @@ include('fbegin.inc');
               <button type="submit" class="btn btn-default" name="action" value="clear-log"><?=gettext('Clear log')?></button>
             </td>
           </tr>
+          </tbody>
         </table>
       </div>
     </form>

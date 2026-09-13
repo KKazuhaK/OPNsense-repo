@@ -22,7 +22,7 @@ import time
 import yaml
 
 MAX_CONFIG = 16 * 1024 * 1024
-UNBOUND_GENERATED = '/var/unbound/etc/dot.conf'
+UNBOUND_GENERATED = '/var/unbound/etc/00-mihomo.conf'
 FORWARDER = '127.0.0.1@1053'
 ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1

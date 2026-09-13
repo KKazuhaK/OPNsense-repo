@@ -126,6 +126,21 @@ assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
 assert action('status')['result']['dns_active']
 assert ET.parse('/conf/config.xml').find('./filter/rule') is not None
 passed('Explicit activation creates the actual TUN and owned DNS/interface/firewall configuration')
+# The forward zone is a drop-in file, not an entry in the operator's Unbound
+# configuration. An entry naming the root as its domain makes OPNsense generate
+# domain-insecure: "." beside it -- a negative trust anchor for a zone that
+# already has one from auto-trust-anchor-file -- and Unbound then reports the
+# anchor for '.' presented twice and refuses to start at all.
+zone = Path('/usr/local/etc/unbound.opnsense.d/00-mihomo.conf')
+assert zone.exists(), 'the forward zone drop-in must be written'
+assert '127.0.0.1@1053' in zone.read_text()
+assert sorted(p.name for p in zone.parent.glob('*.conf'))[0] == zone.name, \
+    'Unbound keeps the first forward zone it reads for a name, so ours must sort first'
+assert ET.parse('/conf/config.xml').find(
+    './OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]') is None, \
+    'the plugin must own no entry in the operator Unbound configuration'
+assert 'domain-insecure: "."' not in Path('/var/unbound/private_domains.conf').read_text()
+passed('Transparent DNS adds no trust anchor for the root of its own')
 route = command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
 assert b'tun_mihomo' in route, route
 passed('VNET traffic route is captured only after explicit activation')
@@ -185,6 +200,9 @@ action('start')
 action('disable-transparent')
 assert ET.parse('/conf/config.xml').find('./filter/rule') is None
 assert ET.parse('/conf/config.xml').find('./interfaces/opt0') is None
+# Left behind, this file would keep sending every query to a core that is no
+# longer forwarding, which is the whole network without DNS.
+assert not zone.exists(), 'the forward zone drop-in must be removed'
 passed('Disabling removes owned interface/firewall entries and keeps proxy ports running')
 Path('/root/settings.json').write_text(json.dumps({'router_dns': True}))
 action('set-settings', '/root/settings.json')

@@ -129,6 +129,21 @@ passed('Explicit activation creates the actual TUN and owned DNS/interface/firew
 route = command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
 assert b'tun_mihomo' in route, route
 passed('VNET traffic route is captured only after explicit activation')
+# dns_active reports that the plumbing was configured. It does not report that a
+# query survives the TUN, and on a router it did not: the resolver was listening
+# and answering nothing, which is a transport failure rather than an rcode.
+import socket as _socket
+import struct as _struct
+_query = _struct.pack('!HHHHHH', 0x4d49, 0x100, 1, 0, 0, 0) + b'\x07example\x07invalid\x00\x00\x01\x00\x01'
+_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+_sock.settimeout(5)
+try:
+    _sock.sendto(_query, ('127.0.0.1', 53))
+    _reply = _sock.recv(512)
+    assert len(_reply) >= 12 and _reply[:2] == _query[:2], _reply[:32]
+finally:
+    _sock.close()
+passed('A query reaches the resolver while transparent routing carries the network')
 # Reinstall through the native solver so upgrade suspension and hooks run again.
 before_settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
 assert before_settings['transparent_consent'] is True

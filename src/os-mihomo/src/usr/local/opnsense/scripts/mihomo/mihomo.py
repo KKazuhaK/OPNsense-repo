@@ -267,10 +267,19 @@ BASELINE_DNS = {
 
 
 def baseline(data):
-    """Fill in a DNS policy only when the subscription carries none of its own."""
-    if isinstance(data.get('dns'), dict) and data['dns']:
-        return {}
-    return {'dns': copy.deepcopy(BASELINE_DNS)}
+    """Fill in what the subscription leaves out, and nothing it states itself."""
+    result = {}
+    if not (isinstance(data.get('dns'), dict) and data['dns']):
+        result['dns'] = copy.deepcopy(BASELINE_DNS)
+    if not isinstance(data.get('profile'), dict) or 'store-selected' not in data['profile']:
+        # Without this the core forgets which proxy each group is set to every
+        # time it restarts, and a group falls back to whatever its provider
+        # listed first. Restarting happens on a subscription update, a reboot
+        # and every transparent routing change, and the first entry is usually
+        # DIRECT -- so the node the operator picked in the panel silently stops
+        # being used and everything goes out unproxied.
+        result.setdefault('profile', {})['store-selected'] = True
+    return result
 
 
 # DNS upstreams the user may state instead of the ones the subscription ships.

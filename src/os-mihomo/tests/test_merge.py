@@ -341,6 +341,26 @@ class BaselineTests(unittest.TestCase):
         return m.parse_yaml(m.render(data, {**self.settings, **settings},
             overlay=copy.deepcopy(self.preset)))
 
+    def test_group_selections_survive_a_restart(self):
+        # Without this the core forgets which proxy each group is set to, and a
+        # group falls back to whatever its provider listed first -- usually
+        # DIRECT. A subscription update, a reboot and every transparent routing
+        # change restart the core, so the node picked in the panel would
+        # silently stop being used.
+        self.assertIs(True, self.generated(m.parse_yaml(SUBSCRIPTION))['profile']['store-selected'])
+
+    def test_a_subscription_that_states_the_profile_keeps_it(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data['profile'] = {'store-selected': False}
+        self.assertIs(False, self.generated(data)['profile']['store-selected'])
+
+    def test_other_profile_keys_are_left_beside_it(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data['profile'] = {'store-fake-ip': True}
+        profile = self.generated(data)['profile']
+        self.assertIs(True, profile['store-fake-ip'])
+        self.assertIs(True, profile['store-selected'])
+
     def test_a_subscription_without_dns_is_given_the_baseline(self):
         data = m.parse_yaml(SUBSCRIPTION)
         data.pop('dns')

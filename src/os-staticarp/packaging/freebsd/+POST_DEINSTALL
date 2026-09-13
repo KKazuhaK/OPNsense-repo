@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# Package upgrades must keep the existing runtime configuration.
+[ -n "${PKG_UPGRADE+x}" ] && exit 0
+
 rm -f /etc/rc.conf.d/staticarp
 rm -rf /usr/local/etc/staticarp
 rm -f \

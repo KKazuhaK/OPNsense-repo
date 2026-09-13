@@ -1,3 +1,8 @@
+# These rules protect this repository only. A branch based on an upstream whose
+# .gitignore is smaller does not inherit them, so `git add -A` there will sweep
+# up build output, caches and local instruction files. Name the files explicitly
+# when committing against someone else's base.
+
 .DS_Store
 ._*
 .private/
@@ -6,8 +11,14 @@ work/
 # Signing private keys must never be committed.
 *.key
 *.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
 pkgsign/
 .secrets/
+.env
+.env.*
 
 # Keep AI instructions, memory, and tool configuration local.
 AGENT.md
@@ -37,17 +48,15 @@ handoff.md
 .windsurfrules
 .aider*
 .idea/
+.vscode/
 .github/copilot-instructions.md
 
 # Generated packages and repository catalogs are published separately.
 /repo/
 /SHA256SUMS.txt
 /.site/
-/src/os-mihomo/dist/
-/src/os-mihomo/work/
-/src/os-sing-box/dist/
-/src/os-kazuha-repo/dist/
-/src/os-kazuha-repo/dist-*/
+dist/
+dist-*/
 __pycache__/
 *.pyc
 *.pyo

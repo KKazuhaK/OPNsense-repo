@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-lang}"
-VERSION="${VERSION:-1.0.4}"
+VERSION="${VERSION:-1.1.0}"
 ORIGIN="${ORIGIN:-opnsense/os-lang}"
 COMMENT="${COMMENT:-Chinese localization updater for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -31,8 +31,14 @@ need_file() {
 command -v pkg >/dev/null 2>&1 || die "pkg command not found. Run this script on FreeBSD/OPNsense."
 command -v tar >/dev/null 2>&1 || die "tar command not found."
 
-need_file "src/usr/local/www/lang_update.php"
+need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/LangTool/index.volt"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/LangTool/Menu/Menu.xml"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/LangTool/IndexController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/LangTool/Api/ServiceController.php"
+need_file "src/usr/local/opnsense/scripts/langtool/manage.php"
+need_file "src/usr/local/opnsense/scripts/langtool/validate_archive.py"
+need_file "src/usr/local/opnsense/service/conf/actions.d/actions_langtool.conf"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/LangTool/ACL/ACL.xml"
 need_file "packaging/freebsd/+MANIFEST.in"
 need_file "packaging/freebsd/+POST_INSTALL"
 need_file "packaging/freebsd/+PRE_DEINSTALL"
@@ -41,7 +47,7 @@ need_file "packaging/freebsd/pkg-descr"
 
 case "$TARGET_ABI" in
 	native)
-		PKG_ABI="$(pkg config ABI 2>/dev/null || pkg -vv | awk -F'"' '/ABI =/ {print $2; exit}')"
+		PKG_ABI="$(env -u ABI pkg config ABI 2>/dev/null || env -u ABI pkg -vv | awk -F'"' '/ABI =/ {print $2; exit}')"
 		;;
 	FreeBSD:*:amd64)
 		PKG_ABI="$TARGET_ABI"
@@ -68,14 +74,14 @@ copy_tree() {
 	src="$1"
 	dst="$2"
 	mkdir -p "$dst"
-	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --no-xattrs -cf - .) | (cd "$dst" && tar -xf -)
+	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' --no-xattrs -cf - .) | (cd "$dst" && tar -xf -)
 }
 
 echo "==> Staging OPNsense integration files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
 
 chmod 0644 \
-	"$STAGEDIR/usr/local/www/lang_update.php" \
+	"$STAGEDIR/usr/local/opnsense/mvc/app/views/OPNsense/LangTool/index.volt" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/LangTool/Menu/Menu.xml"
 
 echo "==> Generating plist"
@@ -112,7 +118,7 @@ install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_DEINSTALL" "$METADIR/+PRE_DE
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_DEINSTALL" "$METADIR/+POST_DEINSTALL"
 
 echo "==> Creating package for $PKG_ABI"
-pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+env -u ABI pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 
 CREATED="$DISTDIR/$PKG_NAME-$VERSION.pkg"
 if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
@@ -120,7 +126,7 @@ if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
 fi
 
 echo "==> Package: $DISTDIR/$OUTPUT_NAME"
-pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
+env -u ABI pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
 echo "==> Verified package metadata"
 if command -v sha256 >/dev/null 2>&1; then
 	sha256 "$DISTDIR/$OUTPUT_NAME"

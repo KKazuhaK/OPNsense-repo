@@ -1,6 +1,7 @@
 """Exercise merge policy, transport pins, and real System error boundaries."""
 import copy
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -307,10 +308,11 @@ class ControllerTests(unittest.TestCase):
                          self.rendered(dict(overlay), controller=m.ANY_CONTROLLER)['external-controller'])
 
     def test_an_inert_controller_key_is_lifted_out_of_the_merge_yaml(self):
-        overlay = {'external-controller': m.ANY_CONTROLLER, 'mixed-port': 7890}
+        # 'log-level' is no switch of ours, so it must survive absorption.
+        overlay = {'external-controller': m.ANY_CONTROLLER, 'log-level': 'warning'}
         lifted = m.absorb_switches(overlay, self.settings)
         self.assertEqual(m.ANY_CONTROLLER, lifted['controller'])
-        self.assertEqual({'mixed-port': 7890}, overlay)
+        self.assertEqual({'log-level': 'warning'}, overlay)
         # An address the switch cannot express stays put rather than being rewritten.
         kept = {'external-controller': '192.0.2.1:9090'}
         self.assertNotIn('controller', m.absorb_switches(kept, self.settings))
@@ -328,6 +330,141 @@ class ControllerTests(unittest.TestCase):
             manager.check_settings(dict(self.settings, controller=m.ANY_CONTROLLER, secret=''))
 
 
+class DeviceDiscoveryTests(unittest.TestCase):
+    """What the picker offers, and what it must refuse to offer."""
+
+    ARP = (b'? (192.168.10.90) at d2:f3:58:35:50:e2 on vtnet0 expires in 1181 seconds [ethernet]\n'
+           b'? (192.168.10.39) at 28:c5:d2:d4:0c:4c on vtnet0 expires in 595 seconds [ethernet]\n'
+           b'? (50.98.231.1) at 20:e0:9c:03:e1:95 on vtnet1 expires in 900 seconds [ethernet]\n'
+           b'? (192.168.8.1) at bc:24:11:a2:3e:42 on vtnet0 permanent [ethernet]\n')
+    NDP = b'fe80::be24:11ff:fea2:3e42%vtnet0 bc:24:11:a2:3e:42 vtnet0 23h59m58s R\n'
+    IFCONFIG = b'vtnet0: flags=8843\n\tinet 192.168.8.1 netmask 0xffffff00\n'
+    ROUTE = b'   route to: default\n  interface: vtnet1\n'
+
+    def runner(self, args, **kwargs):
+        name = ' '.join(args)
+        payload = (self.ARP if 'arp' in name else self.NDP if 'ndp' in name
+                   else self.IFCONFIG if 'ifconfig' in name else self.ROUTE)
+        return subprocess.CompletedProcess(args, 0, payload, b'')
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'var/db').mkdir(parents=True)
+        (self.root / 'conf').mkdir()
+        (self.root / 'var/db/dnsmasq.leases').write_text(
+            '1789000000 d2:f3:58:35:50:e2 192.168.10.90 iPhone 01:d2:f3:58:35:50:e2\n'
+            '1789000000 28:c5:d2:d4:0c:4c 192.168.10.39 * *\n'
+            '00:01:00:01:32:37:be:ee:bc:24:11:a2:3e:42\n')
+        (self.root / 'conf/config.xml').write_text(
+            '<opnsense><dnsmasq><hosts><hwaddr>28:C5:D2:D4:0C:4C</hwaddr>'
+            '<ip>192.168.10.39</ip></hosts></dnsmasq></opnsense>')
+
+    def found(self):
+        return {d['address']: d for d in m.known_devices(self.runner, self.root)}
+
+    def test_only_devices_on_our_own_links_are_offered(self):
+        found = self.found()
+        # The uplink's neighbours are the ISP's, a link-local address names an
+        # interface rather than a device, and the router is not a device to steer.
+        self.assertEqual(['192.168.10.39', '192.168.10.90'], sorted(found))
+
+    def test_a_lease_names_the_device_and_a_reservation_pins_it(self):
+        found = self.found()
+        self.assertEqual('iPhone', found['192.168.10.90']['hostname'])
+        self.assertEqual('', found['192.168.10.39']['hostname'], 'the * placeholder is not a name')
+        self.assertIs(True, found['192.168.10.39']['reserved'])
+        self.assertIs(False, found['192.168.10.90']['reserved'])
+
+    def test_a_rotating_hardware_address_is_pointed_out(self):
+        # Phones present a different address per network and change it over
+        # time, so a rule written against whatever address it holds today is a
+        # rule that stops matching without saying so.
+        found = self.found()
+        self.assertIs(True, found['192.168.10.90']['randomised_mac'])
+        self.assertIs(False, found['192.168.10.39']['randomised_mac'])
+
+    def test_the_lease_file_survives_lines_that_are_not_leases(self):
+        self.assertEqual(2, len(m.read_leases(self.root)), 'the DUID line is not a lease')
+
+
+class ServiceSwitchTests(unittest.TestCase):
+    """The proxy ports, LAN binding and TUN parameters as first-class settings."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+
+    # The fixture subscription listens on :53, which render() refuses; the
+    # presets normally override it. These tests must not also state the keys
+    # under test, because a merge value deliberately beats a switch.
+    MINIMAL = {'dns': {'listen': '127.0.0.1:1053'}}
+
+    def generated(self, overlay=None, **settings):
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings},
+            overlay=copy.deepcopy(self.MINIMAL if overlay is None else overlay)))
+
+    def test_the_switches_reach_the_configuration(self):
+        generated = self.generated(mixed_port=8080, socks_port=8081, allow_lan=True,
+                                   bind_address='192.168.8.1', tun_stack='system', tun_mtu=1400)
+        self.assertEqual(8080, generated['mixed-port'])
+        self.assertEqual(8081, generated['socks-port'])
+        self.assertIs(True, generated['allow-lan'])
+        self.assertEqual('192.168.8.1', generated['bind-address'])
+        self.assertEqual('system', generated['tun']['stack'])
+        self.assertEqual(1400, generated['tun']['mtu'])
+
+    def test_a_merge_yaml_value_is_lifted_into_the_switch_it_belongs_to(self):
+        # Otherwise the form shows a value the running configuration contradicts,
+        # which is the whole reason these are absorbed rather than merely merged.
+        overlay = {'mixed-port': 8080, 'socks-port': 8081, 'allow-lan': True,
+                   'bind-address': '192.168.8.1', 'tun': {'stack': 'mixed', 'mtu': 1300}}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual(8080, lifted['mixed_port'])
+        self.assertEqual(8081, lifted['socks_port'])
+        self.assertIs(True, lifted['allow_lan'])
+        self.assertEqual('192.168.8.1', lifted['bind_address'])
+        self.assertEqual('mixed', lifted['tun_stack'])
+        self.assertEqual(1300, lifted['tun_mtu'])
+        self.assertEqual({}, overlay, 'an absorbed key must not keep overriding')
+        # And the lifted values render back to exactly what was written.
+        generated = m.parse_yaml(m.render(self.data, lifted, overlay=copy.deepcopy(self.MINIMAL)))
+        self.assertEqual(8080, generated['mixed-port'])
+        self.assertEqual('mixed', generated['tun']['stack'])
+
+    def test_a_value_the_switch_cannot_express_keeps_winning_and_is_reported(self):
+        overlay = {'tun': {'stack': 'nonesuch'}}
+        lifted = m.absorb_switches(copy.deepcopy(overlay), self.settings)
+        self.assertEqual('gvisor', lifted['tun_stack'], 'an unknown stack must not be adopted')
+        self.assertIn('tun_stack', m.switch_overrides(overlay))
+
+    def test_true_is_not_a_port(self):
+        # YAML booleans are ints in Python, so "mixed-port: true" would absorb
+        # as port 1 and quietly move the proxy.
+        overlay = {'mixed-port': True}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual(m.SWITCH_DEFAULTS['mixed_port'], lifted['mixed_port'])
+        self.assertEqual({'mixed-port': True}, overlay)
+
+    def test_an_upgrade_keeps_the_ports_it_was_running(self):
+        rendered = {'mixed-port': 8080, 'socks-port': 8081, 'allow-lan': True,
+                    'bind-address': '10.0.0.1', 'tun': {'enable': True, 'stack': 'system', 'mtu': 1300}}
+        seeded = m.adopt_switches(rendered, {})
+        self.assertEqual(8080, seeded['mixed_port'])
+        self.assertEqual('10.0.0.1', seeded['bind_address'])
+        self.assertEqual('system', seeded['tun_stack'])
+
+    def test_a_stopped_tun_states_no_intent_to_adopt(self):
+        # render() forces these off when transparent routing is off, so reading
+        # them back would record the enforcement as if it were a choice.
+        seeded = m.adopt_switches({'tun': {'enable': False, 'stack': 'system', 'mtu': 1300}}, {})
+        self.assertNotIn('tun_stack', seeded)
+        self.assertNotIn('tun_mtu', seeded)
+
+
 class BaselineTests(unittest.TestCase):
     """A bare subscription gets a DNS policy; a complete one is never blended."""
 
@@ -339,6 +476,26 @@ class BaselineTests(unittest.TestCase):
     def generated(self, data, **settings):
         return m.parse_yaml(m.render(data, {**self.settings, **settings},
             overlay=copy.deepcopy(self.preset)))
+
+    def test_group_selections_survive_a_restart(self):
+        # Without this the core forgets which proxy each group is set to, and a
+        # group falls back to whatever its provider listed first -- usually
+        # DIRECT. A subscription update, a reboot and every transparent routing
+        # change restart the core, so the node picked in the panel would
+        # silently stop being used.
+        self.assertIs(True, self.generated(m.parse_yaml(SUBSCRIPTION))['profile']['store-selected'])
+
+    def test_a_subscription_that_states_the_profile_keeps_it(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data['profile'] = {'store-selected': False}
+        self.assertIs(False, self.generated(data)['profile']['store-selected'])
+
+    def test_other_profile_keys_are_left_beside_it(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data['profile'] = {'store-fake-ip': True}
+        profile = self.generated(data)['profile']
+        self.assertIs(True, profile['store-fake-ip'])
+        self.assertIs(True, profile['store-selected'])
 
     def test_a_subscription_without_dns_is_given_the_baseline(self):
         data = m.parse_yaml(SUBSCRIPTION)
@@ -512,3 +669,311 @@ class OrphanPolicyTests(unittest.TestCase):
         self.assertEqual([], m.orphan_policy_keys(base, {'dns': {'nameserver-policy': {'geosite:private': ['system']}}}))
         self.assertEqual(['geosite:nowhere'],
                          m.orphan_policy_keys(base, {'dns': {'nameserver-policy': {'geosite:nowhere': ['1.1.1.1']}}}))
+
+
+class DevicePolicyTests(unittest.TestCase):
+    """Which sources the proxy may carry, expressed so matching order works."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+        m.absorb_switches(self.preset, self.settings)
+
+    def rendered(self, **settings):
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings},
+            overlay=copy.deepcopy(self.preset)))
+
+    def test_off_leaves_the_provider_rules_alone(self):
+        base = self.rendered()['rules']
+        self.assertEqual(base, self.rendered(device_mode='off',
+                                             device_list=['192.168.10.50'])['rules'])
+        # An empty list is the same as off, whatever the mode says.
+        self.assertEqual(base, self.rendered(device_mode='whitelist', device_list=[])['rules'])
+
+    def test_a_blacklist_sends_only_the_listed_sources_direct(self):
+        rules = self.rendered(device_mode='blacklist',
+                              device_list=['192.168.10.50', '192.168.10.0/24'])['rules']
+        self.assertEqual(['SRC-IP-CIDR,192.168.10.50/32,DIRECT',
+                          'SRC-IP-CIDR,192.168.10.0/24,DIRECT'], rules[:2])
+
+    def test_a_whitelist_matches_everything_it_does_not_list(self):
+        # Matching ends at the first hit, so the listed sources cannot be the
+        # ones matched: they are what is left over once everything else is out.
+        rules = self.rendered(device_mode='whitelist', device_list=['192.168.10.50'])['rules']
+        self.assertEqual('NOT,((SRC-IP-CIDR,192.168.10.50/32)),DIRECT', rules[0])
+        several = self.rendered(device_mode='whitelist',
+                                device_list=['192.168.10.50', '10.0.0.0/8'])['rules']
+        self.assertEqual('NOT,((OR,((SRC-IP-CIDR,192.168.10.50/32),'
+                         '(SRC-IP-CIDR,10.0.0.0/8)))),DIRECT', several[0])
+
+    def test_the_device_rules_sit_ahead_of_the_provider_rules(self):
+        rules = self.rendered(device_mode='blacklist', device_list=['192.168.10.50'])['rules']
+        self.assertEqual('SRC-IP-CIDR,192.168.10.50/32,DIRECT', rules[0])
+        self.assertIn('MATCH', rules[-1])
+
+    def test_the_router_dns_pins_stay_ahead_of_the_device_rules(self):
+        # Those pins keep the router's own encrypted DNS out of the tunnel; a
+        # device rule in front of them would decide that traffic instead.
+        settings = dict(self.settings, router_dns=True, device_mode='blacklist',
+                        device_list=['192.168.10.50'])
+        rules = m.parse_yaml(m.render(self.data, settings, overlay=copy.deepcopy(self.preset),
+            upstreams='forward-addr: 192.0.2.53@853'))['rules']
+        self.assertTrue(rules[0].startswith('IP-CIDR,192.0.2.53/32,DIRECT'), rules[0])
+        self.assertIn('SRC-IP-CIDR,192.168.10.50/32,DIRECT', rules[:6])
+
+    def test_entries_that_are_not_addresses_are_refused(self):
+        manager = m.Manager.__new__(m.Manager)
+        base = dict(self.settings, dns_fallback=True, service_enabled=True,
+                    device='router', subscription_url='')
+        manager.check_settings(dict(base, device_mode='whitelist',
+                                    device_list=['192.168.10.50', 'fd00::/64']))
+        for bad in (['not-an-ip'], ['192.168.10.50 '], [''], ['192.168.10.300'],
+                    ['1.2.3.4'] * (m.DEVICE_LIMIT + 1)):
+            with self.assertRaises(m.Error, msg=bad):
+                manager.check_settings(dict(base, device_mode='blacklist', device_list=bad))
+        with self.assertRaises(m.Error):
+            manager.check_settings(dict(base, device_mode='nonsense'))
+
+
+class StaleForwarderTests(unittest.TestCase):
+    """A generated file that still points at a stopped core must be rewritten."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.generated = Path(self.temp.name) / 'dot.conf'
+        self.system = m.System()
+        self.ran = []
+
+        def record(args, **kwargs):
+            self.ran.append(args)
+            stdout = b'Mihomo integration unchanged.' if args[0].endswith('php') else b''
+            return subprocess.CompletedProcess(args, 0, stdout, b'')
+
+        self.record = record
+        state = Path(self.temp.name) / 'state'
+        state.mkdir()
+        self.patches = [patch.object(m, 'UNBOUND_GENERATED', str(self.generated)),
+                        patch.object(m, 'STATE', str(state))]
+        for entry in self.patches:
+            entry.start()
+            self.addCleanup(entry.stop)
+
+    def reloaded(self):
+        return any('template' in [str(part) for part in args] for args in self.ran)
+
+    def test_an_agreeing_file_lets_an_unchanged_answer_skip_the_reload(self):
+        self.generated.write_text('forward-addr: 8.8.8.8@853\n')
+        with patch.object(self.system, 'run', side_effect=self.record):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertFalse(self.reloaded())
+
+    def test_a_stale_file_is_rewritten_even_when_the_answer_is_unchanged(self):
+        # This is the state that took DNS down twice: the configuration had
+        # already been reverted, so the helper reported nothing to do, while the
+        # file Unbound reads still forwarded to a core that was no longer there.
+        self.generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        with patch.object(self.system, 'run', side_effect=self.record):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+
+    def test_enabling_against_a_file_without_the_forwarder_also_reloads(self):
+        self.generated.write_text('forward-addr: 8.8.8.8@853\n')
+        with patch.object(self.system, 'run', side_effect=self.record):
+            self.system.dns(True, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+
+    def test_a_missing_file_counts_as_not_forwarding(self):
+        self.assertFalse(self.system.forwarded())
+
+
+class ConfigctlContractTests(unittest.TestCase):
+    """configctl answers in a vocabulary the caller has to read correctly."""
+
+    def test_a_bare_err_is_a_failure(self):
+        # It carries no other marker, so a check looking only for "Execute
+        # error" reads a failed reload as a success and carries on.
+        system = m.System()
+        with patch.object(m.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, b'ERR\n', b'')):
+            with self.assertRaises(m.Error):
+                system.run(['/usr/local/sbin/configctl', 'template', 'reload', 'x'])
+        with patch.object(m.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, b'OK\n', b'')):
+            system.run(['/usr/local/sbin/configctl', 'template', 'reload', 'x'])
+
+    def test_only_configctl_answers_are_read_this_way(self):
+        # Another program printing ERR is not making the same statement.
+        system = m.System()
+        with patch.object(m.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, b'ERR\n', b'')):
+            system.run(['/usr/local/sbin/unbound-checkconf', '/dev/null'])
+
+    def test_the_resolver_is_validated_by_its_own_start_script(self):
+        # OPNsense pairs unbound-checkconf with the repair its failure calls
+        # for: a corrupt root.key is deleted and re-fetched. Running the check
+        # here copies it without the repair, against a trust anchor file the
+        # running resolver rewrites on its own schedule.
+        source = (Path(m.__file__)).read_text()
+        self.assertNotIn('unbound-checkconf', source.split('# unbound-checkconf')[0])
+
+    def test_the_unbound_templates_are_reloaded_by_their_container(self):
+        # The templates live in sub-containers; the bare name matches nothing,
+        # generates no file, and answers ERR.
+        calls = []
+
+        def record(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(state), True)
+        generated = state / 'dot.conf'
+        generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        with patch.object(m, 'STATE', str(state)), patch.object(m, 'UNBOUND_GENERATED', str(generated)):
+            system = m.System()
+            with patch.object(system, 'run', side_effect=record):
+                system.dns(False, {'dns_fallback': True})
+        reloads = [args for args in calls if 'template' in args]
+        self.assertEqual(1, len(reloads), calls)
+        self.assertEqual('OPNsense/Unbound/*', reloads[0][-1])
+
+
+class AnchorOrderingTests(unittest.TestCase):
+    """The anchor must be read before the restart that can destroy it."""
+
+    MANAGED = b'; autotrust trust anchor file\n;;id: . 1\n'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.anchor = root / 'root.key'
+        self.anchor.write_bytes(self.MANAGED)
+        (root / 'state').mkdir()
+        (root / 'dot.conf').write_text('forward-addr: 8.8.8.8@853\n')
+        for entry in (patch.object(m, 'ROOT_ANCHOR', str(self.anchor)),
+                      patch.object(m, 'STATE', str(root / 'state')),
+                      patch.object(m, 'UNBOUND_GENERATED', str(root / 'dot.conf')),
+                      patch.object(m.os, 'chown')):
+            entry.start()
+            self.addCleanup(entry.stop)
+        self.system = m.System()
+
+    def test_the_anchor_read_precedes_the_restart(self):
+        # The start script deletes root.key whenever it cannot check the
+        # configuration, so a snapshot taken afterwards captures the damage
+        # rather than the file worth restoring.
+        seen = []
+
+        def record(args, **kwargs):
+            name = ' '.join(str(part) for part in args)
+            if 'unbound' in name and 'restart' in name:
+                seen.append(('restart', self.anchor.exists()))
+                if len([step for step, _ in seen if step == 'restart']) == 1:
+                    # The changeover fails one restart, unbound-checkconf says
+                    # so, and the start script answers by replacing the anchor
+                    # with what unbound-anchor writes when it cannot resolve.
+                    self.anchor.write_bytes(b'. IN DS 20326 8 2 E06D\n. IN DS 38696 8 2 683D\n')
+            if args[0].endswith('pgrep'):
+                # The resolver comes up only with an anchor it can read.
+                return subprocess.CompletedProcess(
+                    args, 0 if self.anchor.read_bytes().startswith(b'; autotrust') else 1, b'', b'')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+
+        real = m.System.anchor_snapshot
+
+        def watched():
+            seen.append(('read', self.anchor.exists()))
+            return real()
+
+        with patch.object(m.System, 'anchor_snapshot', staticmethod(watched)):
+            with patch.object(self.system, 'run', side_effect=record):
+                self.system.dns(True, {'dns_fallback': True})
+        self.assertEqual(['read', 'restart'], [step for step, _ in seen][:2])
+        self.assertTrue(seen[1][1], 'the restart must still have had the anchor to destroy')
+        self.assertTrue(self.anchor.exists(), 'the destroyed anchor must be restored')
+
+
+class ResolverRepairTests(unittest.TestCase):
+    """A router whose resolver refused to start has no DNS at all."""
+
+    MANAGED = b'; autotrust trust anchor file\n;;id: . 1\n. 86400 IN DNSKEY 257 3 8 AwEAAaz\n'
+    # What unbound-anchor writes when it cannot reach a resolver: the root DS
+    # records in plain form, with no autotrust header. auto-trust-anchor-file
+    # reports the anchor for '.' presented twice and the validator never
+    # initialises, so this shape is a resolver that can no longer start.
+    DAMAGED = b'. IN DS 20326 8 2 E06D\n. IN DS 38696 8 2 683D\n'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.anchor = Path(self.temp.name) / 'root.key'
+        self.anchor.write_bytes(self.MANAGED)
+        entry = patch.object(m, 'ROOT_ANCHOR', str(self.anchor))
+        entry.start()
+        self.addCleanup(entry.stop)
+        chown = patch.object(m.os, 'chown')
+        chown.start()
+        self.addCleanup(chown.stop)
+        self.system = m.System()
+
+    def runner(self, alive):
+        """alive is consulted per pgrep call, so a repair can change the answer."""
+        self.calls = []
+
+        def run(args, **kwargs):
+            self.calls.append(args)
+            if args[0].endswith('pgrep'):
+                return subprocess.CompletedProcess(args, 0 if alive.pop(0) else 1, b'', b'')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+        return run
+
+    def test_a_running_resolver_is_left_alone(self):
+        with patch.object(self.system, 'run', side_effect=self.runner([True])):
+            self.system.repair_resolver(self.MANAGED)
+        self.assertEqual(self.MANAGED, self.anchor.read_bytes())
+        self.assertEqual(1, len(self.calls))
+
+    def test_a_dead_resolver_has_its_anchor_put_back_and_is_restarted(self):
+        # The restart is what damaged it: the start script deletes the anchor
+        # whenever it cannot check the configuration, and re-fetches it with
+        # nothing able to answer.
+        self.anchor.write_bytes(self.DAMAGED)
+        with patch.object(self.system, 'run', side_effect=self.runner([False, True])):
+            self.system.repair_resolver(self.MANAGED)
+        self.assertEqual(self.MANAGED, self.anchor.read_bytes())
+        self.assertIn(['/usr/local/sbin/configctl', 'unbound', 'restart'], self.calls)
+
+    def test_the_anchor_is_never_deleted(self):
+        # Deleting it is what turns a failed restart into a resolver that can
+        # never start: the re-fetch has no resolver to ask.
+        with patch.object(self.system, 'run', side_effect=self.runner([False, True])):
+            self.system.repair_resolver(self.MANAGED)
+        self.assertTrue(self.anchor.exists())
+
+    def test_a_resolver_that_stays_down_is_reported(self):
+        # Silence here would leave the operator with a working-looking page and
+        # a network that cannot resolve anything.
+        with patch.object(self.system, 'run', side_effect=self.runner([False, False])):
+            with self.assertRaises(m.Error):
+                self.system.repair_resolver(self.MANAGED)
+
+    def test_a_managed_anchor_is_worth_snapshotting(self):
+        self.assertEqual(self.MANAGED, self.system.anchor_snapshot())
+
+    def test_an_already_damaged_anchor_is_not_snapshotted(self):
+        # Putting this shape back would only reinstate the damage.
+        self.anchor.write_bytes(self.DAMAGED)
+        self.assertIsNone(self.system.anchor_snapshot())
+
+    def test_a_missing_anchor_is_not_snapshotted(self):
+        self.anchor.unlink()
+        self.assertIsNone(self.system.anchor_snapshot())
+
+    def test_a_dead_resolver_with_no_good_anchor_is_still_restarted(self):
+        with patch.object(self.system, 'run', side_effect=self.runner([False, True])):
+            self.system.repair_resolver(None)
+        self.assertIn(['/usr/local/sbin/configctl', 'unbound', 'restart'], self.calls)

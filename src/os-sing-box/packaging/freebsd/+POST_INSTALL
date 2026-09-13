@@ -1,4 +1,5 @@
 #!/bin/sh
+set -eu
 
 CONFIG_FILE="/conf/config.xml"
 TMP_FILE="/tmp/config.xml.tmp"
@@ -11,10 +12,39 @@ pkg_timestamp() {
 
 echo "===> Configuring os-sing-box"
 
-mkdir -p /etc/rc.conf.d
-echo 'sing_box_enable="YES"' > /etc/rc.conf.d/sing_box
+BACKUP_DIR="/var/db/os-sing-box-upgrade"
+NEW_SETTINGS=""
+INITIAL_INSTALL="no"
+WAS_RUNNING="no"
+umask 077
+mkdir -p /etc/rc.conf.d /usr/local/etc/sing-box/sub
+chmod 0700 /usr/local/etc/sing-box /usr/local/etc/sing-box/sub
+if [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ]; then
+    for relative in config.json sub/env sub/template.json; do
+        destination="/usr/local/etc/sing-box/$relative"
+        if [ ! -f "$destination" ] && [ -f "$BACKUP_DIR/$relative" ]; then
+            install -m 0600 "$BACKUP_DIR/$relative" "$destination"
+        fi
+    done
+    if [ ! -f /etc/rc.conf.d/sing_box ] && [ -f "$BACKUP_DIR/sing_box" ]; then
+        install -m 0644 "$BACKUP_DIR/sing_box" /etc/rc.conf.d/sing_box
+    fi
+    [ ! -f "$BACKUP_DIR/running" ] || WAS_RUNNING="yes"
+fi
+for relative in config.json sub/env sub/template.json; do
+    destination="/usr/local/etc/sing-box/$relative"
+    if [ ! -f "$destination" ]; then
+        install -m 0600 "$destination.sample" "$destination"
+        NEW_SETTINGS="$NEW_SETTINGS $destination"
+    fi
+done
+if [ ! -f /etc/rc.conf.d/sing_box ]; then
+    install -m 0644 /etc/rc.conf.d/sing_box.sample /etc/rc.conf.d/sing_box
+    INITIAL_INSTALL="yes"
+fi
 touch /var/log/sing-box.log /var/log/sing-box_sub.log 2>/dev/null || true
 chmod 0755 /usr/local/etc/sing-box/sub/sub.sh 2>/dev/null || true
+rm -f /usr/local/www/sing-box.php /usr/local/www/sing-box_log.php /usr/local/www/sing-box_sub.php /usr/local/www/sing-box_sub_log.php
 rm -f /usr/local/www/services_sub.php /usr/local/www/status_sing_box_logs.php
 rm -f /usr/local/www/services_sing_box.php /usr/local/www/status_sing_box.php
 rm -f /usr/local/www/services_singboxsub.php /usr/local/www/status_singboxsub_log.php
@@ -28,15 +58,23 @@ elif command -v uuidgen >/dev/null 2>&1; then
 else
     CLASH_API_SECRET="$(date | cksum | awk '{print $1}')"
 fi
-for secret_file in /usr/local/etc/sing-box/config.json /usr/local/etc/sing-box/sub/template.json; do
-    if [ -f "$secret_file" ]; then
-        sed -i '' "s/\"secret\": \"CHANGE_ME\"/\"secret\": \"${CLASH_API_SECRET}\"/" "$secret_file" 2>/dev/null || true
-        sed -i '' "s/\"secret\": \"\"/\"secret\": \"${CLASH_API_SECRET}\"/" "$secret_file" 2>/dev/null || true
-        chmod 0600 "$secret_file" 2>/dev/null || true
-    fi
+for secret_file in $NEW_SETTINGS; do
+    case "$secret_file" in
+        */config.json|*/template.json)
+        secret_script="$(mktemp "${secret_file}.secret.XXXXXX")"
+        secret_temporary="$(mktemp "${secret_file}.XXXXXX")"
+        printf 's/"secret": "CHANGE_ME"/"secret": "%s"/\ns/"secret": ""/"secret": "%s"/\n' \
+            "$CLASH_API_SECRET" "$CLASH_API_SECRET" > "$secret_script"
+        sed -f "$secret_script" "$secret_file" > "$secret_temporary"
+        chmod 0600 "$secret_temporary"
+        mv "$secret_temporary" "$secret_file"
+        rm -f "$secret_script"
+        ;;
+    esac
 done
-chmod 0644 /usr/local/etc/sing-box/config.json 2>/dev/null || true
+chmod 0600 /usr/local/etc/sing-box/config.json 2>/dev/null || true
 chmod 0600 /usr/local/etc/sing-box/sub/env /usr/local/etc/sing-box/sub/template.json 2>/dev/null || true
+[ ! -d "$BACKUP_DIR" ] || rm -rf "$BACKUP_DIR"
 
 find_tun_interface() {
     awk '
@@ -114,4 +152,8 @@ fi
 echo "===> Reloading OPNsense services"
 service configd restart >/dev/null 2>&1 || true
 configctl filter reload >/dev/null 2>&1 || true
-service sing-box restart >/dev/null 2>&1 || true
+if [ "$WAS_RUNNING" = "yes" ]; then
+    service sing-box restart >/dev/null 2>&1 || true
+elif [ "$INITIAL_INSTALL" = "yes" ]; then
+    service sing-box start >/dev/null 2>&1 || true
+fi

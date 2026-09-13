@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-staticarp}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.1.0}"
 ORIGIN="${ORIGIN:-opnsense/os-staticarp}"
 COMMENT="${COMMENT:-Static ARP binding integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -31,14 +31,19 @@ need_file() {
 command -v pkg >/dev/null 2>&1 || die "pkg command not found. Run this script on FreeBSD/OPNsense."
 command -v tar >/dev/null 2>&1 || die "tar command not found."
 
-need_file "src/etc/rc.conf.d/staticarp"
+need_file "src/etc/rc.conf.d/staticarp.sample"
 need_file "src/usr/local/sbin/staticarpctl"
 need_file "src/usr/local/etc/rc.d/os-staticarp"
 need_file "src/usr/local/opnsense/service/conf/actions.d/actions_staticarp.conf"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Staticarp/Menu/Menu.xml"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Staticarp/ACL/ACL.xml"
-need_file "src/usr/local/www/services_staticarp.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp/IndexController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp/Api/ServiceController.php"
+need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Staticarp/index.volt"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp/Api/SettingsController.php"
+need_file "src/usr/local/opnsense/scripts/staticarp/settings.php"
 need_file "packaging/freebsd/+MANIFEST.in"
+need_file "packaging/freebsd/+PRE_INSTALL"
 need_file "packaging/freebsd/+POST_INSTALL"
 need_file "packaging/freebsd/+PRE_DEINSTALL"
 need_file "packaging/freebsd/+POST_DEINSTALL"
@@ -46,7 +51,7 @@ need_file "packaging/freebsd/pkg-descr"
 
 case "$TARGET_ABI" in
 	native)
-		PKG_ABI="$(pkg config ABI 2>/dev/null || pkg -vv | awk -F'"' '/ABI =/ {print $2; exit}')"
+		PKG_ABI="$(env -u ABI pkg config ABI 2>/dev/null || env -u ABI pkg -vv | awk -F'"' '/ABI =/ {print $2; exit}')"
 		;;
 	FreeBSD:*:amd64)
 		PKG_ABI="$TARGET_ABI"
@@ -73,18 +78,18 @@ copy_tree() {
 	src="$1"
 	dst="$2"
 	mkdir -p "$dst"
-	(cd "$src" && tar --exclude '.DS_Store' -cf - .) | (cd "$dst" && tar -xf -)
+	(cd "$src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' -cf - .) | (cd "$dst" && tar -xf -)
 }
 
 echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
 
-chmod 0644 "$STAGEDIR/etc/rc.conf.d/staticarp"
+chmod 0644 "$STAGEDIR/etc/rc.conf.d/staticarp.sample"
 chmod 0755 \
 	"$STAGEDIR/usr/local/sbin/staticarpctl" \
 	"$STAGEDIR/usr/local/etc/rc.d/os-staticarp"
 chmod 0644 \
-	"$STAGEDIR/usr/local/www/services_staticarp.php" \
+	"$STAGEDIR/usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp/IndexController.php" \
 	"$STAGEDIR/usr/local/opnsense/service/conf/actions.d/actions_staticarp.conf" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Staticarp/Menu/Menu.xml" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Staticarp/ACL/ACL.xml"
@@ -118,12 +123,13 @@ sed \
 	-e "/@DESC@/d" \
 	"$SCRIPT_DIR/packaging/freebsd/+MANIFEST.in" > "$METADIR/+MANIFEST"
 
+install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_INSTALL" "$METADIR/+PRE_INSTALL"
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_INSTALL" "$METADIR/+POST_INSTALL"
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+PRE_DEINSTALL" "$METADIR/+PRE_DEINSTALL"
 install -m 0644 "$SCRIPT_DIR/packaging/freebsd/+POST_DEINSTALL" "$METADIR/+POST_DEINSTALL"
 
 echo "==> Creating package for $PKG_ABI"
-pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+env -u ABI pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 
 CREATED="$DISTDIR/$PKG_NAME-$VERSION.pkg"
 if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
@@ -131,7 +137,7 @@ if [ -f "$CREATED" ] && [ "$(basename "$CREATED")" != "$OUTPUT_NAME" ]; then
 fi
 
 echo "==> Package: $DISTDIR/$OUTPUT_NAME"
-pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
+env -u ABI pkg info -F "$DISTDIR/$OUTPUT_NAME" >/dev/null
 echo "==> Verified package metadata"
 if command -v sha256 >/dev/null 2>&1; then
 	sha256 "$DISTDIR/$OUTPUT_NAME"

@@ -2,4 +2,4 @@ ttyd browser terminal integration for OPNsense.
 
 This package installs a private ttyd runtime under /usr/local/os-ttyd, an
 OPNsense Diagnostics menu entry, a WebGUI reverse proxy under /ttyd/, and an
-embedded terminal page at /diag_ttyd.php.
+embedded terminal page at /ui/ttyd.

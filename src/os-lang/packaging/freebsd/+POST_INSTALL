@@ -1,14 +1,19 @@
 #!/bin/sh
 
+# Remove the retired entry point when upgrading from the legacy page.
+rm -f /usr/local/www/lang_update.php
+
 echo "===> Preparing Localization Tool for OPNsense"
 chmod 0644 \
-	/usr/local/www/lang_update.php \
+	/usr/local/opnsense/mvc/app/views/OPNsense/LangTool/index.volt \
 	/usr/local/opnsense/mvc/app/models/OPNsense/LangTool/Menu/Menu.xml 2>/dev/null || true
 
 echo "===> Clearing OPNsense menu cache"
 rm -f \
 	/var/lib/php/tmp/opnsense_menu_cache.xml \
 	/var/lib/php/tmp/opnsense_acl_cache.json
+
+service configd restart >/dev/null 2>&1 || true
 
 echo "===> Reloading OPNsense WebGUI"
 configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true

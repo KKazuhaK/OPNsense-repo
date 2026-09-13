@@ -7,6 +7,7 @@ import fcntl
 import ipaddress
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import secrets
@@ -16,11 +17,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+from xml.etree import ElementTree
 import time
 
 import yaml
 
 MAX_CONFIG = 16 * 1024 * 1024
+UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
+FORWARDER = '127.0.0.1@1053'
+ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1
 SCRIPT = "/usr/local/opnsense/scripts/mihomo/mihomo.py"
 HELPER = "/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
@@ -191,6 +196,177 @@ GEO_SOURCE_DEFAULT = 'metacubex'
 GEO_UPDATE_HOURS = 24
 
 
+DEVICE_MODES = ('off', 'whitelist', 'blacklist')
+DEVICE_LIMIT = 64
+
+
+def device_networks(entries):
+    """Normalise each entry to a network, rejecting anything ambiguous."""
+    networks = []
+    for entry in entries or []:
+        if not isinstance(entry, str) or entry.strip() != entry or not entry:
+            raise Error('A device entry must be a single address or network.')
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            raise Error('Not an address or network: ' + entry) from None
+    if len(networks) > DEVICE_LIMIT:
+        raise Error('At most %d device entries may be listed.' % DEVICE_LIMIT)
+    return networks
+
+
+# Where each DHCP backend OPNsense can run keeps its reservations. A device
+# with one holds its address across leases, which is what makes an address
+# worth writing into a rule at all.
+RESERVATIONS = (('./dnsmasq/hosts', 'hwaddr', 'ip'),
+                ('./dhcpd/*/staticmap', 'mac', 'ipaddr'),
+                ('./OPNsense/Kea/dhcp4/reservations/reservation', 'hw_address', 'ip_address'))
+DHCP_LEASES = ('/var/db/dnsmasq.leases',)
+
+
+def randomised_mac(mac):
+    """Whether the address is locally administered rather than a real one.
+
+    Phones and laptops present a different address per network by default, and
+    rotate it. Such an address identifies nothing for long, so a reservation
+    made against it stops matching without warning.
+    """
+    try:
+        return bool(int(mac.split(':')[0], 16) & 0x02)
+    except (ValueError, AttributeError, IndexError):
+        return False
+
+
+def read_leases(root=Path('/')):
+    """Hostnames the DHCP server has handed out, keyed by address."""
+    found = {}
+    for name in DHCP_LEASES:
+        path = root / name.lstrip('/')
+        try:
+            text = path.read_text(errors='replace')
+        except OSError:
+            continue
+        for line in text.splitlines():
+            fields = line.split()
+            # <expiry> <mac> <address> <hostname> <client-id>; the file also
+            # carries a DUID line that parses as none of that.
+            if len(fields) < 4 or fields[1].count(':') != 5:
+                continue
+            try:
+                ipaddress.ip_address(fields[2])
+            except ValueError:
+                continue
+            found[fields[2]] = {'mac': fields[1].lower(),
+                                'hostname': '' if fields[3] == '*' else fields[3]}
+    return found
+
+
+def read_reservations(root=Path('/')):
+    """Addresses pinned to a device, whichever DHCP server is in use."""
+    pinned = set()
+    try:
+        tree = ElementTree.parse(str(root / 'conf/config.xml'))
+    except (OSError, ElementTree.ParseError):
+        return pinned
+    for path, _, address in RESERVATIONS:
+        for node in tree.getroot().findall(path):
+            value = (node.findtext(address) or '').strip()
+            if value:
+                pinned.add(value)
+    return pinned
+
+
+def uplink_interface(run):
+    """The interface the default route leaves by, whose neighbours are not ours."""
+    result = run(['/sbin/route', '-n', 'get', 'default'], check=False)
+    if result.returncode != 0:
+        return ''
+    found = re.search(r'interface:\s*(\S+)', result.stdout.decode(errors='replace'))
+    return found.group(1) if found else ''
+
+
+def local_addresses(run):
+    """The router's own addresses, which are never a device to steer."""
+    result = run(['/sbin/ifconfig', '-a'], check=False)
+    if result.returncode != 0:
+        return set()
+    text = result.stdout.decode(errors='replace')
+    return set(re.findall(r'\binet6?\s+([0-9a-fA-F.:]+)', text))
+
+
+def read_neighbours(run):
+    """Devices the router has spoken to on a link of its own.
+
+    Neighbours on the uplink are the ISP's, not the household's, and a
+    link-local address names an interface rather than a device: neither can
+    stand in a rule, and offering them would only invite a policy that matches
+    nothing or the wrong thing.
+    """
+    skip = uplink_interface(run)
+    found = {}
+    for args, pattern in ((['/usr/sbin/arp', '-an'],
+                           r'\((\S+?)\) at ([0-9a-fA-F:]{17}) on (\S+)'),
+                          (['/usr/sbin/ndp', '-an'],
+                           r'^(\S+?)\s+([0-9a-fA-F:]{17})\s+(\S+)')):
+        result = run(args, check=False)
+        if result.returncode != 0:
+            continue
+        for address, mac, interface in re.findall(pattern, result.stdout.decode(errors='replace'), re.M):
+            if interface == skip or '%' in address:
+                continue
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if parsed.is_link_local or parsed.is_loopback or parsed.is_multicast:
+                continue
+            found.setdefault(address, mac.lower())
+    return found
+
+
+def known_devices(run, root=Path('/')):
+    """What the router knows about the devices on it, for the policy picker.
+
+    Only the address ever reaches a rule: Mihomo matches source addresses, and
+    by the time a packet reaches it the link-layer address is long gone. The
+    hardware address is carried here so a device can be recognised, and so the
+    two ways an address stops identifying it can be pointed out.
+    """
+    leases = read_leases(root)
+    reserved = read_reservations(root)
+    neighbours = read_neighbours(run)
+    ours = local_addresses(run)
+    devices = []
+    for address in (set(leases) | set(neighbours)) - ours:
+        lease = leases.get(address, {})
+        mac = lease.get('mac') or neighbours.get(address, '')
+        devices.append({'address': address, 'mac': mac,
+                        'hostname': lease.get('hostname', ''),
+                        'reserved': address in reserved,
+                        'randomised_mac': randomised_mac(mac)})
+    devices.sort(key=lambda d: (ipaddress.ip_address(d['address']).version,
+                                ipaddress.ip_address(d['address'])))
+    return devices
+
+
+def device_rules(settings):
+    """Rules that decide which sources the proxy is allowed to carry.
+
+    Matching ends at the first rule that matches, so "listed devices follow the
+    provider rules" cannot be written as a match on the listed devices; it is
+    written as a match on everything else.
+    """
+    mode = settings.get('device_mode', 'off')
+    networks = device_networks(settings.get('device_list'))
+    if mode == 'off' or not networks:
+        return []
+    if mode == 'blacklist':
+        return ['SRC-IP-CIDR,%s,DIRECT' % net for net in networks]
+    matchers = ['(SRC-IP-CIDR,%s)' % net for net in networks]
+    inner = matchers[0] if len(matchers) == 1 else '(OR,(%s))' % ','.join(matchers)
+    return ['NOT,(%s),DIRECT' % inner]
+
+
 # What a subscription that ships no DNS policy gets instead of nothing. It sits
 # UNDER the subscription, so a provider that states its own dns block keeps it in
 # full: the two are never blended, because half of one policy and half of another
@@ -226,10 +402,19 @@ BASELINE_DNS = {
 
 
 def baseline(data):
-    """Fill in a DNS policy only when the subscription carries none of its own."""
-    if isinstance(data.get('dns'), dict) and data['dns']:
-        return {}
-    return {'dns': copy.deepcopy(BASELINE_DNS)}
+    """Fill in what the subscription leaves out, and nothing it states itself."""
+    result = {}
+    if not (isinstance(data.get('dns'), dict) and data['dns']):
+        result['dns'] = copy.deepcopy(BASELINE_DNS)
+    if not isinstance(data.get('profile'), dict) or 'store-selected' not in data['profile']:
+        # Without this the core forgets which proxy each group is set to every
+        # time it restarts, and a group falls back to whatever its provider
+        # listed first. Restarting happens on a subscription update, a reboot
+        # and every transparent routing change, and the first entry is usually
+        # DIRECT -- so the node the operator picked in the panel silently stops
+        # being used and everything goes out unproxied.
+        result.setdefault('profile', {})['store-selected'] = True
+    return result
 
 
 # DNS upstreams the user may state instead of the ones the subscription ships.
@@ -277,9 +462,17 @@ def check_dns_servers(field, values):
 # states one of these keys in its canonical form, absorb_switches() lifts it into
 # the switch instead, so the UI never shows a value the config contradicts.
 SWITCH_DEFAULTS = {'router_dns': False, 'ipv6': False, 'dns_hijack': True,
-                   'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT}
+                   'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT,
+                   'mixed_port': 7890, 'socks_port': 7891, 'allow_lan': False,
+                   'bind_address': '127.0.0.1', 'tun_stack': 'gvisor', 'tun_mtu': 1420}
 # Bumped only to re-seed the switches from an installation that predates them.
-SWITCH_SCHEMA = 2
+SWITCH_SCHEMA = 3
+# gVisor needs no kernel support and is what the presets ship; system is faster
+# where the host can carry it; mixed uses system for TCP and gVisor for UDP.
+TUN_STACKS = ('gvisor', 'system', 'mixed')
+PORT_LIMIT = 65535
+DNS_LISTEN_PORT = 1053
+MTU_RANGE = (576, 9000)
 CONTROLLER_PORT = 9090
 LOOPBACK_CONTROLLER = '127.0.0.1:%d' % CONTROLLER_PORT
 ANY_CONTROLLER = '0.0.0.0:%d' % CONTROLLER_PORT
@@ -290,9 +483,15 @@ def switch_overlay(settings):
     ipv6 = bool(settings.get('ipv6', False))
     overlay = {
         'ipv6': ipv6,
+        'mixed-port': int(settings.get('mixed_port', SWITCH_DEFAULTS['mixed_port'])),
+        'socks-port': int(settings.get('socks_port', SWITCH_DEFAULTS['socks_port'])),
+        'allow-lan': bool(settings.get('allow_lan', False)),
+        'bind-address': str(settings.get('bind_address') or SWITCH_DEFAULTS['bind_address']),
         'dns': {'ipv6': ipv6,
                 'enhanced-mode': settings.get('dns_mode', DNS_MODE_DEFAULT)},
-        'tun': {'dns-hijack': list(HIJACK_TARGETS) if settings.get('dns_hijack', True) else []},
+        'tun': {'dns-hijack': list(HIJACK_TARGETS) if settings.get('dns_hijack', True) else [],
+                'stack': settings.get('tun_stack') or SWITCH_DEFAULTS['tun_stack'],
+                'mtu': int(settings.get('tun_mtu', SWITCH_DEFAULTS['tun_mtu']))},
         'geox-url': dict(GEO_SOURCES[settings.get('geo_source') or GEO_SOURCE_DEFAULT]),
         'geodata-mode': True, 'geo-auto-update': True, 'geo-update-interval': GEO_UPDATE_HOURS,
     }
@@ -317,6 +516,15 @@ def switch_conflicts(rendered, settings):
         out.append('dns_mode')
     if bool(tun.get('dns-hijack')) is not bool(wanted['tun']['dns-hijack']):
         out.append('dns_hijack')
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port'),
+                       ('allow_lan', 'allow-lan'), ('bind_address', 'bind-address')):
+        if key in rendered and rendered[key] != wanted[key]:
+            out.append(field)
+    # A stopped TUN carries the inert values render() forces, not a conflict.
+    if tun.get('enable'):
+        for field, key in (('tun_stack', 'stack'), ('tun_mtu', 'mtu')):
+            if key in tun and tun[key] != wanted['tun'][key]:
+                out.append(field)
     return out
 
 
@@ -342,6 +550,22 @@ def absorb_switches(overlay, settings):
 
     if dns.get('enhanced-mode') in DNS_MODES:
         settings['dns_mode'] = dns.pop('enhanced-mode')
+
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port')):
+        port = overlay.get(key)
+        # bool is an int, and "allow-lan: true" next door makes that a live risk.
+        if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= PORT_LIMIT:
+            settings[field] = port
+            overlay.pop(key)
+    if isinstance(overlay.get('allow-lan'), bool):
+        settings['allow_lan'] = overlay.pop('allow-lan')
+    if isinstance(overlay.get('bind-address'), str) and overlay['bind-address']:
+        settings['bind_address'] = overlay.pop('bind-address')
+    if tun.get('stack') in TUN_STACKS:
+        settings['tun_stack'] = tun.pop('stack')
+    mtu = tun.get('mtu')
+    if isinstance(mtu, int) and not isinstance(mtu, bool) and MTU_RANGE[0] <= mtu <= MTU_RANGE[1]:
+        settings['tun_mtu'] = tun.pop('mtu')
 
     # The controller is settings policy now, so leaving it here would display a
     # value the rendered configuration ignores.
@@ -396,6 +620,19 @@ def adopt_switches(rendered, settings):
         settings['dns_mode'] = dns['enhanced-mode']
     if tun.get('enable') is True and isinstance(tun.get('dns-hijack'), list):
         settings['dns_hijack'] = bool(tun['dns-hijack'])
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port')):
+        if isinstance(rendered.get(key), int) and not isinstance(rendered.get(key), bool):
+            settings[field] = rendered[key]
+    if isinstance(rendered.get('allow-lan'), bool):
+        settings['allow_lan'] = rendered['allow-lan']
+    if isinstance(rendered.get('bind-address'), str) and rendered['bind-address']:
+        settings['bind_address'] = rendered['bind-address']
+    # An inert section carries what render() forces, not what was intended.
+    if tun.get('enable') is True:
+        if tun.get('stack') in TUN_STACKS:
+            settings['tun_stack'] = tun['stack']
+        if isinstance(tun.get('mtu'), int) and not isinstance(tun.get('mtu'), bool):
+            settings['tun_mtu'] = tun['mtu']
     for name, known in GEO_SOURCES.items():
         if rendered.get('geox-url') == known:
             settings['geo_source'] = name
@@ -434,6 +671,13 @@ def switch_overrides(overlay):
         out.append('dns_hijack')
     if 'geox-url' in probe:
         out.append('geo_source')
+    for field, key in (('mixed_port', 'mixed-port'), ('socks_port', 'socks-port'),
+                       ('allow_lan', 'allow-lan'), ('bind_address', 'bind-address')):
+        if key in probe:
+            out.append(field)
+    for field, key in (('tun_stack', 'stack'), ('tun_mtu', 'mtu')):
+        if key in tun:
+            out.append(field)
     out.extend(field for field, key in DNS_SERVER_FIELDS.items() if key in dns)
     return out
 
@@ -506,6 +750,7 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
         port = listener.get('port', 0)
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535 or port == 53:
             raise Error("Additional listeners cannot bind port 53.")
+    result['rules'] = device_rules(settings) + result.get('rules', [])
     if router_dns:
         if ipv6_advertised and not (result.get('ipv6') is True and dns.get('ipv6') is True):
             raise Error("Clients are being offered IPv6 while Mihomo IPv6 is disabled. Validate IPv6 before enabling router DNS.")
@@ -536,13 +781,15 @@ def atomic_write(path, content, mode=0o600):
 
 
 class System:
-    def run(self, args, timeout=45, check=True):
+    def run(self, args, timeout=45, check=True, cwd=None):
         try:
-            result = subprocess.run(args, capture_output=True, timeout=timeout)
+            result = subprocess.run(args, capture_output=True, timeout=timeout, cwd=cwd)
         except (subprocess.TimeoutExpired, OSError):
             raise Error("A system operation failed or timed out.") from None
         output = result.stdout + result.stderr
-        failed_action = args[0] == "/usr/local/sbin/configctl" and (b"Execute error" in output or b"Error (" in output)
+        # configctl reports failure as a bare ERR, which carries no other marker.
+        failed_action = args[0] == "/usr/local/sbin/configctl" and (
+            b"Execute error" in output or b"Error (" in output or output.strip() == b"ERR")
         if check and (result.returncode or failed_action):
             raise Error("A system operation failed; the previous configuration was retained.")
         return result
@@ -640,19 +887,85 @@ class System:
         if self.run(["/sbin/ifconfig", "tun_mihomo"], check=False).returncode == 0:
             self.run(["/sbin/ifconfig", "tun_mihomo", "destroy"])
 
+    def resolver_running(self):
+        return self.run(["/usr/bin/pgrep", "-q", "-x", "unbound"], check=False).returncode == 0
+
+    @staticmethod
+    def anchor_snapshot():
+        """The DNSSEC root anchor as it stands, if it is one we could put back.
+
+        Only the managed format is worth keeping: a file Unbound wrote itself,
+        carrying the key states it maintains. Anything else is already the
+        damaged shape described in restore_anchor(), and restoring it would
+        only reinstate the damage.
+        """
+        try:
+            content = Path(ROOT_ANCHOR).read_bytes()
+        except OSError:
+            return None
+        return content if content.startswith(b"; autotrust") else None
+
+    @staticmethod
+    def restore_anchor(anchor):
+        """Put the operator's DNSSEC root anchor back after a failed restart.
+
+        OPNsense's Unbound start script treats a configuration it cannot check
+        as a damaged anchor: it deletes root.key and has unbound-anchor fetch a
+        new one. That fetch needs a working resolver, which during a DNS change
+        is the one thing missing, so unbound-anchor falls back to writing the
+        two root DS records in its plain format. auto-trust-anchor-file cannot
+        read that -- it reports the anchor for '.' presented twice, the
+        validator fails to initialise, and the resolver never starts again, so
+        a restart that merely failed becomes a router with no DNS at all.
+        Writing the original file back makes the failure a transient one.
+        """
+        atomic_write(Path(ROOT_ANCHOR), anchor, mode=0o644)
+        with contextlib.suppress(OSError, KeyError):
+            entry = pwd.getpwnam("unbound")
+            os.chown(ROOT_ANCHOR, entry.pw_uid, entry.pw_gid)
+
+    def repair_resolver(self, anchor):
+        """Bring the resolver back if it refused to start, and say why it did."""
+        if self.resolver_running():
+            return
+        if anchor is not None:
+            self.restore_anchor(anchor)
+        self.run(["/usr/local/sbin/configctl", "unbound", "restart"], timeout=90)
+        if not self.resolver_running():
+            raise Error("The resolver did not come back. No DNS change was left in place.")
+
+    def forwarded(self):
+        """Whether the file Unbound actually reads sends queries to Mihomo."""
+        try:
+            return FORWARDER in Path(UNBOUND_GENERATED).read_text()
+        except OSError:
+            return False
+
     def dns(self, enabled, settings):
         pending = Path(STATE) / "dns-reload-pending"
         was_pending = pending.exists()
         atomic_write(pending, b"pending\n")
         result = self.run(["/usr/local/bin/php", HELPER, "enable" if enabled else "disable",
                   "1" if settings["dns_fallback"] else "0"], timeout=90)
-        if b"unchanged" in result.stdout and not was_pending:
+        # "unchanged" reports that the configuration already said this. It says
+        # nothing about the file Unbound reads, which is generated from that
+        # configuration separately and can still describe the previous state --
+        # a stale one pointing at a stopped core leaves the network without DNS.
+        if b"unchanged" in result.stdout and not was_pending and self.forwarded() == enabled:
             pending.unlink(missing_ok=True)
             return
-        self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound"], timeout=90)
-        self.run(["/usr/local/sbin/unbound-checkconf", "/var/unbound/unbound.conf"], timeout=30)
+        # The Unbound templates live in sub-containers, so the bare name matches
+        # nothing: it generates no file and answers ERR. Without the wildcard the
+        # configuration Unbound is about to be checked against is never rewritten.
+        self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound/*"], timeout=90)
+        # Taken before the restart, because the restart is what can destroy it:
+        # OPNsense's start script re-fetches the root anchor whenever
+        # unbound-checkconf is unhappy, and a fetch made while DNS is being
+        # changed has nothing to ask. See restore_anchor().
+        anchor = self.anchor_snapshot()
         for args in (["unbound", "restart"], ["unbound", "cache", "flush"], ["filter", "reload"]):
             self.run(["/usr/local/sbin/configctl", *args], timeout=90)
+        self.repair_resolver(anchor)
         pending.unlink(missing_ok=True)
 
     def remove(self):
@@ -785,7 +1098,8 @@ class Manager:
             raise Error("Mihomo settings are missing or invalid; run initialization first.") from None
 
     def check_settings(self, settings):
-        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns', 'ipv6', 'dns_hijack'):
+        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns', 'ipv6',
+                    'dns_hijack', 'allow_lan'):
             if key not in settings and key in SWITCH_DEFAULTS:
                 continue
             if not isinstance(settings.get(key), bool):
@@ -796,6 +1110,37 @@ class Manager:
             raise Error("The rule database must be one of: " + ", ".join(GEO_SOURCES) + ".")
         for field in DNS_SERVER_FIELDS:
             check_dns_servers(field, settings.get(field) or [])
+        ports = {}
+        for field, label in (('mixed_port', 'mixed'), ('socks_port', 'SOCKS')):
+            value = settings.get(field, SWITCH_DEFAULTS[field])
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= PORT_LIMIT:
+                raise Error('The %s port must be a number between 1 and %d.' % (label, PORT_LIMIT))
+            # 53 belongs to the resolver, 1053 to Mihomo's own, 9090 to the
+            # dashboard. Taking one of them stops the core starting, and the
+            # reason is buried in its log rather than shown here.
+            if value in (53, DNS_LISTEN_PORT, CONTROLLER_PORT):
+                raise Error('Port %d is already used by the router, so the %s port cannot take it.'
+                            % (value, label))
+            if value in ports:
+                raise Error('The mixed and SOCKS ports cannot both be %d.' % value)
+            ports[value] = field
+        stack = settings.get('tun_stack', SWITCH_DEFAULTS['tun_stack'])
+        if stack not in TUN_STACKS:
+            raise Error('The TUN stack must be one of: ' + ', '.join(TUN_STACKS) + '.')
+        mtu = settings.get('tun_mtu', SWITCH_DEFAULTS['tun_mtu'])
+        if isinstance(mtu, bool) or not isinstance(mtu, int) or not MTU_RANGE[0] <= mtu <= MTU_RANGE[1]:
+            raise Error('The TUN MTU must be a number between %d and %d.' % MTU_RANGE)
+        bind = settings.get('bind_address', SWITCH_DEFAULTS['bind_address'])
+        if not isinstance(bind, str) or not bind:
+            raise Error('The bind address is required; use * to accept every address.')
+        if bind != '*':
+            try:
+                ipaddress.ip_address(bind.strip('[]'))
+            except ValueError:
+                raise Error('The bind address must be an IP address, or * for every address.') from None
+        if settings.get('device_mode', 'off') not in DEVICE_MODES:
+            raise Error('The device policy must be one of: ' + ', '.join(DEVICE_MODES) + '.')
+        device_networks(settings.get('device_list'))
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
         controller = settings.get("controller", "127.0.0.1:9090")
@@ -1179,6 +1524,9 @@ class Manager:
             return {"cleared": True}
         if action == "init":
             return self.initialize(argument == "upgrade")
+        if action == 'devices':
+            return {'devices': known_devices(self.system.run, self.root),
+                    'rules': device_rules(self.settings())}
         if action == "queue-update":
             return self.queue_update()
         if action == "sub-update":
@@ -1200,7 +1548,7 @@ class Manager:
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
                         'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
-                        *DNS_SERVER_FIELDS):
+                        'device_mode', 'device_list', *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
             if 'dashboard_any' in value:

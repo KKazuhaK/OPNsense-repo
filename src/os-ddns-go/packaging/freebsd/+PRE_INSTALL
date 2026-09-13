@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+# Preserve settings before pkg removes the outgoing package's owned files.
+upgrade_state=/var/db/os-ddns-go
+upgrade_rc=/etc/rc.conf.d/ddnsgo
+if [ -f "$upgrade_rc" ]; then
+    install -d -m 0700 "$upgrade_state"
+    cp -p "$upgrade_rc" "$upgrade_state/rc.conf.upgrade"
+fi
+if [ -d /usr/local/etc/ddns-go ]; then
+    install -d -m 0700 "$upgrade_state"
+    rm -rf "$upgrade_state/state.upgrade.new"
+    cp -pR /usr/local/etc/ddns-go "$upgrade_state/state.upgrade.new"
+    rm -rf "$upgrade_state/state.upgrade"
+    mv "$upgrade_state/state.upgrade.new" "$upgrade_state/state.upgrade"
+fi

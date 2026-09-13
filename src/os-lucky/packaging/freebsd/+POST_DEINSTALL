@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# Package upgrades must keep the existing runtime configuration.
+[ -n "${PKG_UPGRADE+x}" ] && exit 0
+
 rm -f /etc/rc.conf.d/lucky /var/log/lucky.log
 rm -f \
 	/var/lib/php/tmp/opnsense_menu_cache.xml \

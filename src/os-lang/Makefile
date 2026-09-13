@@ -1,6 +1,6 @@
 PKG_NAME?=	os-lang
 OUTPUT_NAME?=	os-lang.pkg
-VERSION?=	1.0.4
+VERSION?=	1.1.0
 ABI?=		FreeBSD:*:amd64
 
 .PHONY: package clean

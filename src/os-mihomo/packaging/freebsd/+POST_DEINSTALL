@@ -1,5 +1,20 @@
 #!/bin/sh
 # Retain user configuration for recovery; never schedule background directory deletion.
+
+# The Unbound forward zone is written at runtime, so pkg does not own it and
+# will not delete it. The pre-deinstall hook normally removes it, but pkg
+# deletes the package whether or not that hook succeeded, and a copy left
+# behind points the router's root zone at a port nothing is listening on any
+# more -- the whole network without DNS and no plugin left to undo it. Remove
+# it here as well, along with the copy inside the chroot, and let the resolver
+# pick up the change.
+rm -f \
+    /usr/local/etc/unbound.opnsense.d/zz-mihomo.conf \
+    /usr/local/etc/unbound.opnsense.d/00-mihomo.conf \
+    /var/unbound/etc/zz-mihomo.conf \
+    /var/unbound/etc/00-mihomo.conf
+configctl unbound restart >/dev/null 2>&1 || true
+
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 service configd restart >/dev/null 2>&1 || true
 # Firmware removes the desired registration after an explicit GUI uninstall.

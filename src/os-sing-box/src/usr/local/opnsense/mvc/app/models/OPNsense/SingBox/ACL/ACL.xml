@@ -2,10 +2,8 @@
     <page-vpn-sing-box>
         <name>VPN: Proxy Suite: Sing-Box</name>
         <patterns>
-            <pattern>sing-box.php*</pattern>
-            <pattern>sing-box_log.php*</pattern>
-            <pattern>sing-box_sub.php*</pattern>
-            <pattern>sing-box_sub_log.php*</pattern>
+            <pattern>ui/singbox/*</pattern>
+            <pattern>api/singbox/*</pattern>
         </patterns>
     </page-vpn-sing-box>
 </acl>

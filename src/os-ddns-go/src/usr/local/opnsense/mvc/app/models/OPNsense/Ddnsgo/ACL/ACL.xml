@@ -2,7 +2,8 @@
     <page-services-ddnsgo>
         <name>Services: DDNS-Go</name>
         <patterns>
-            <pattern>services_ddnsgo.php*</pattern>
+            <pattern>ui/ddnsgo/*</pattern>
+            <pattern>api/ddnsgo/*</pattern>
         </patterns>
     </page-services-ddnsgo>
 </acl>

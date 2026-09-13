@@ -2,7 +2,8 @@
     <page-services-lucky>
         <name>Services: Lucky</name>
         <patterns>
-            <pattern>lucky.php*</pattern>
+            <pattern>ui/lucky/*</pattern>
+            <pattern>api/lucky/*</pattern>
         </patterns>
     </page-services-lucky>
 </acl>

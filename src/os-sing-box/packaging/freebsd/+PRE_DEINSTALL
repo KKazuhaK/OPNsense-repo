@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# Package upgrades keep live settings, interface assignments and runtime state.
+[ -n "${PKG_UPGRADE+x}" ] && exit 0
+
 CONFIG_FILE="/conf/config.xml"
 TMP_FILE="/tmp/config.xml.tmp"
 RULE_UUID="762b3ec8-79c2-48b4-9793-c653bb3d2265"

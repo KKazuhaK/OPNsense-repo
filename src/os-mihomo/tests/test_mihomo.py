@@ -428,19 +428,59 @@ class IntegrationHelperTests(unittest.TestCase):
         return subprocess.run([self.php, str(SCRIPT.with_name('setup_unbound.php')), action, fallback],
                               env=dict(os.environ, OS_MIHOMO_ROOT=str(self.root)), capture_output=True, text=True)
 
-    def test_enable_disable_remove_restores_owner_dot_and_only_removes_owned_interface(self):
+    def zone(self):
+        return self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
+
+    def test_disable_removes_the_forward_zone_even_when_the_rest_fails(self):
+        # Everything after this point can throw -- a restored configuration
+        # whose Unbound model no longer matches, a truncated state file -- and
+        # the caller stops the core regardless. A zone left behind points the
+        # router's root at a port with nothing behind it.
+        self.assertEqual(0, self.helper('enable').returncode)
+        self.assertTrue(self.zone().exists())
+        self.config.write_text('<opnsense><interfaces/><filter/><OPNsense/></opnsense>')
+        self.assertNotEqual(0, self.helper('disable').returncode)
+        self.assertFalse(self.zone().exists())
+
+    def test_a_validating_resolver_gets_no_forward_zone(self):
+        # Mihomo answers fake-ip records, which carry no signature, so every
+        # signed zone would fail validation. The only configuration that makes
+        # Unbound accept them is the one that stops it starting.
+        self.config.write_text(self.config.read_text().replace(
+            '<forwarding>', '<general><dnssec>1</dnssec></general><forwarding>'))
+        self.assertEqual(0, self.helper('enable').returncode)
+        self.assertFalse(self.zone().exists())
+
+    def test_the_legacy_forward_zone_name_is_cleared(self):
+        # It sorted ahead of the generated dot.conf and never won the root
+        # zone, so a copy left behind is dead weight.
+        legacy = self.root / 'usr/local/etc/unbound.opnsense.d/00-mihomo.conf'
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text('forward-zone:\n  name: "."\n  forward-addr: 127.0.0.1@1053\n')
+        self.assertEqual(0, self.helper('enable').returncode)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(self.zone().exists())
+
+    def test_enable_disable_remove_leaves_owner_dots_alone_and_only_removes_owned_interface(self):
         import xml.etree.ElementTree as ET
         self.assertEqual(0, self.helper('enable').returncode)
         root = ET.parse(self.config).getroot()
-        self.assertEqual('0', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled'))
+        # The operator's own upstreams are not ours to switch off, and the
+        # plugin no longer owns an entry here at all: an entry naming the root
+        # as its domain makes OPNsense generate domain-insecure: "." beside it,
+        # which stops the resolver starting. The forward zone is a drop-in file.
+        self.assertEqual('1', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled'))
         self.assertEqual('1', root.findtext('./OPNsense/unboundplus/dots/dot[@uuid="private-dot"]/enabled'))
-        own = root.find('./OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]')
-        self.assertEqual('1', own.findtext('forward_first'))
+        self.assertIsNone(root.find('./OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]'))
+        zone = self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
+        self.assertTrue(zone.exists(), 'the forward zone must be written under the test root')
+        self.assertIn('127.0.0.1@1053', zone.read_text())
         self.assertEqual(0, self.helper('enable').returncode)
         root = ET.parse(self.config).getroot()
         self.assertEqual(1, len(root.findall('./filter/rule')))
         self.assertEqual(0, self.helper('disable').returncode)
         self.assertEqual('1', ET.parse(self.config).getroot().findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled'))
+        self.assertFalse(zone.exists(), 'a forward zone left behind points at a core that is gone')
         self.assertEqual(0, self.helper('remove').returncode)
         self.assertEqual(self.original, self.xml())
         self.assertEqual('OWNER DNS OVER TLS CONFIGURATION', self.dot.read_text())
@@ -555,3 +595,32 @@ class ControllerMigrationTests(unittest.TestCase):
         self.assertEqual(m.ANY_CONTROLLER, self.manager.settings()['controller'])
         self.assertNotIn('external-controller',
                          m.parse_yaml(self.manager.merge_file.read_bytes()))
+
+
+class FreshDashboardTests(unittest.TestCase):
+    """A fresh install comes up reachable; the presets state no settings-owned key."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.manager = m.Manager(Path(self.temp.name), FakeSystem())
+
+    def test_a_fresh_install_binds_every_interface(self):
+        self.manager.initialize()
+        self.assertEqual(m.ANY_CONTROLLER, self.manager.settings()['controller'])
+
+    def test_no_preset_states_the_controller(self):
+        # A preset that named it would be absorbed and defeat the default above.
+        directory = Path(m.__file__).resolve().parents[3] / 'share/mihomo/presets'
+        for preset in sorted(directory.glob('*.yaml')):
+            self.assertNotIn('external-controller', m.parse_yaml(preset.read_bytes()), preset.name)
+
+    def test_an_upgrade_keeps_the_address_it_had(self):
+        self.manager.initialize()
+        settings = self.manager.settings()
+        settings['controller'] = m.LOOPBACK_CONTROLLER
+        settings.pop('switch_schema')
+        self.manager.write_settings(settings)
+        self.manager.dispatch('start')
+        self.manager.initialize(upgrade=True)
+        self.assertEqual(m.LOOPBACK_CONTROLLER, self.manager.settings()['controller'])

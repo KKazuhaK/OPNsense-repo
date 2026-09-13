@@ -1,0 +1,9 @@
+<acl>
+    <page-services-langtool>
+        <name>Services: Localization Tool</name>
+        <patterns>
+            <pattern>ui/langtool/*</pattern>
+            <pattern>api/langtool/*</pattern>
+        </patterns>
+    </page-services-langtool>
+</acl>

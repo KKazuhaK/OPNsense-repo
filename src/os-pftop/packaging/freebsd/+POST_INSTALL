@@ -2,16 +2,22 @@
 
 echo "===> Preparing pfTop for OPNsense"
 chmod 0644 \
-	/usr/local/www/diag_pftop.php \
+	/usr/local/opnsense/mvc/app/controllers/OPNsense/Pftop/IndexController.php \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Pftop/Menu/Menu.xml \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Pftop/ACL/ACL.xml 2>/dev/null || true
+
+find /usr/local/opnsense/mvc/app/controllers/OPNsense/Pftop /usr/local/opnsense/mvc/app/views/OPNsense/Pftop /usr/local/opnsense/scripts/pftop -type f -exec chmod 0644 {} \; 2>/dev/null || true
+
+# Remove the retired page when upgrading from a legacy package.
+rm -f /usr/local/www/diag_pftop.php
 
 echo "===> Clearing OPNsense menu and ACL cache"
 rm -f \
 	/var/lib/php/tmp/opnsense_menu_cache.xml \
 	/var/lib/php/tmp/opnsense_acl_cache.json
 
-echo "===> Reloading OPNsense WebGUI"
+echo "===> Reloading configd actions and OPNsense WebGUI"
+service configd restart >/dev/null 2>&1 || true
 configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 
 echo "===> pfTop for OPNsense installed. Refresh the browser and open System > Diagnostics > pfTop."

@@ -25,9 +25,9 @@ $(function () {
             ajaxCall('/api/unboundcustom/service/apply', {}, function (data) {
                 $progress.removeClass('fa fa-spinner fa-pulse');
                 if (data.status === 'ok') {
-                    BootstrapDialog.show({type: BootstrapDialog.TYPE_SUCCESS, title: '{{ lang._("Success") }}', message: data.message});
+                    BootstrapDialog.show({type: BootstrapDialog.TYPE_SUCCESS, title: '{{ lang._("Success") }}', message: $('<div/>').text(htmlDecode(data.message || '')).html()});
                 } else {
-                    BootstrapDialog.show({type: BootstrapDialog.TYPE_DANGER, title: '{{ lang._("Error") }}', message: $('<div/>').text(data.message).html().replace(/\n/g, '<br>')});
+                    BootstrapDialog.show({type: BootstrapDialog.TYPE_DANGER, title: '{{ lang._("Error") }}', message: $('<div/>').text(htmlDecode(data.message || '')).html().replace(/\n/g, '<br>')});
                 }
             });
         });

@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-sing-box}"
-VERSION="${VERSION:-1.0.3}"
+VERSION="${VERSION:-1.1.0}"
 ORIGIN="${ORIGIN:-opnsense/os-sing-box}"
 COMMENT="${COMMENT:-sing-box proxy integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -36,27 +36,30 @@ command -v pkg >/dev/null 2>&1 || die "pkg command not found. Run this script on
 command -v tar >/dev/null 2>&1 || die "tar command not found."
 command -v xz >/dev/null 2>&1 || die "xz command not found."
 command -v sha256 >/dev/null 2>&1 || die "sha256 command not found."
+command -v python3 >/dev/null 2>&1 || die "python3 command not found."
 if ! command -v fetch >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
     die "fetch or curl command not found."
 fi
 
-need_file "src/usr/local/etc/sing-box/config.json"
-need_file "src/usr/local/etc/sing-box/sub/env"
+need_file "src/usr/local/etc/sing-box/config.json.sample"
+need_file "src/usr/local/etc/sing-box/sub/env.sample"
 need_file "src/usr/local/etc/sing-box/sub/sub.sh"
-need_file "src/usr/local/etc/sing-box/sub/template.json"
+need_file "src/usr/local/etc/sing-box/sub/template.json.sample"
 need_file "src/usr/local/etc/rc.d/sing-box"
-need_file "src/etc/rc.conf.d/sing_box"
+need_file "src/etc/rc.conf.d/sing_box.sample"
 need_file "src/usr/local/opnsense/service/conf/actions.d/actions_sing-box.conf"
 need_file "src/usr/local/etc/inc/plugins.inc.d/sing_box.inc"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/SingBox/Menu/Menu.xml"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/SingBox/ACL/ACL.xml"
-need_file "src/usr/local/www/sing-box.php"
-need_file "src/usr/local/www/sing-box_log.php"
-need_file "src/usr/local/www/sing-box_sub.php"
-need_file "src/usr/local/www/sing-box_sub_log.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/IndexController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api/ServiceController.php"
+need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api/SettingsController.php"
+need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/SingBox/index.volt"
+need_file "src/usr/local/opnsense/scripts/singbox/singbox.php"
 need_file "src/usr/bin/sing_box_sub"
 need_file "src/usr/local/bin/$SING_BOX_ASSET"
 need_file "packaging/freebsd/+MANIFEST.in"
+need_file "packaging/freebsd/+PRE_INSTALL"
 need_file "packaging/freebsd/+POST_INSTALL"
 need_file "packaging/freebsd/+PRE_DEINSTALL"
 need_file "packaging/freebsd/+POST_DEINSTALL"
@@ -68,7 +71,7 @@ case "$ABI" in
         PKG_ARCH="freebsd:*:x86:64"
         ;;
     native)
-        PKG_ABI="$(pkg config ABI)"
+        PKG_ABI="$(env -u ABI pkg config ABI)"
         case "$PKG_ABI" in
             FreeBSD:*:amd64) ;;
             *) die "unsupported native ABI: $PKG_ABI" ;;
@@ -149,9 +152,9 @@ mkdir -p "$STAGEDIR/usr/local/bin"
 install -m 0755 "$DOWNLOADDIR/sing-box" "$STAGEDIR/usr/local/bin/sing-box"
 chmod 0700 "$STAGEDIR/usr/local/etc/sing-box" "$STAGEDIR/usr/local/etc/sing-box/sub"
 chmod 0600 \
-    "$STAGEDIR/usr/local/etc/sing-box/config.json" \
-    "$STAGEDIR/usr/local/etc/sing-box/sub/env" \
-    "$STAGEDIR/usr/local/etc/sing-box/sub/template.json"
+    "$STAGEDIR/usr/local/etc/sing-box/config.json.sample" \
+    "$STAGEDIR/usr/local/etc/sing-box/sub/env.sample" \
+    "$STAGEDIR/usr/local/etc/sing-box/sub/template.json.sample"
 chmod 0755 "$STAGEDIR/usr/local/etc/sing-box/sub/sub.sh"
 chmod 0755 "$STAGEDIR/usr/bin/sing_box_sub"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/sing-box"
@@ -166,43 +169,34 @@ while IFS= read -r file; do
 done < "$PLIST"
 
 echo "==> Generating metadata"
-{
-    printf 'name: "%s"\n' "$PKG_NAME"
-    printf 'origin: "%s"\n' "$ORIGIN"
-    printf 'version: "%s"\n' "$VERSION"
-    printf 'comment: "%s"\n' "$COMMENT"
-    printf 'maintainer: "%s"\n' "$MAINTAINER"
-    printf 'www: "%s"\n' "$WWW"
-    printf 'abi: "%s"\n' "$PKG_ABI"
-    printf 'arch: "%s"\n' "$PKG_ARCH"
-    printf 'prefix: "%s"\n' "$PREFIX"
-    printf 'flatsize: %s\n' "$FLATSIZE"
-    printf 'deps: {\n'
-    printf '    jq: { origin: "textproc/jq", version: ">=0" }\n'
-    printf '    curl: { origin: "ftp/curl", version: ">=0" }\n'
-    printf '}\n'
-    printf 'desc: <<EOD\n'
-    cat "$SCRIPT_DIR/packaging/freebsd/pkg-descr"
-    printf '\nEOD\n'
-    printf 'files: {\n'
-    while IFS= read -r file; do
-        checksum="$(sha256 -q "$STAGEDIR$file")"
-        printf '    "%s": "1$%s"\n' "$file" "$checksum"
-    done < "$PLIST"
-    printf '}\n'
-    printf 'scripts: {\n'
-    printf '    "post-install": <<EOS\n'
-    cat "$SCRIPT_DIR/packaging/freebsd/+POST_INSTALL"
-    printf '\nEOS\n'
-    printf '    "pre-deinstall": <<EOS\n'
-    cat "$SCRIPT_DIR/packaging/freebsd/+PRE_DEINSTALL"
-    printf '\nEOS\n'
-    printf '    "post-deinstall": <<EOS\n'
-    cat "$SCRIPT_DIR/packaging/freebsd/+POST_DEINSTALL"
-    printf '\nEOS\n'
-    printf '}\n'
-} > "$METADIR/+MANIFEST"
-cp "$METADIR/+MANIFEST" "$METADIR/+COMPACT_MANIFEST"
+# Pkg URL-decodes manifest scripts, so escape percent signs before serialization.
+python3 - "$SCRIPT_DIR" "$STAGEDIR" "$METADIR" "$PLIST" "$PKG_NAME" "$ORIGIN" "$VERSION" "$COMMENT" "$MAINTAINER" "$WWW" "$PKG_ABI" "$PKG_ARCH" "$PREFIX" "$FLATSIZE" <<'PYTHON'
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+source, stage, metadata, plist = map(Path, sys.argv[1:5])
+name, origin, version, comment, maintainer, www, abi, arch, prefix, flatsize = sys.argv[5:]
+manifest = {
+    'name': name, 'origin': origin, 'version': version, 'comment': comment,
+    'maintainer': maintainer, 'www': www, 'abi': abi, 'arch': arch,
+    'prefix': prefix, 'flatsize': int(flatsize),
+    'deps': {'jq': {'origin': 'textproc/jq', 'version': '>=0'},
+             'curl': {'origin': 'ftp/curl', 'version': '>=0'}},
+    'desc': (source / 'packaging/freebsd/pkg-descr').read_text(),
+    'files': {file: '1$' + hashlib.sha256((stage / file.lstrip('/')).read_bytes()).hexdigest()
+              for file in plist.read_text().splitlines()},
+    'scripts': {phase: (source / 'packaging/freebsd' / filename).read_text().replace('%', '%25')
+                for phase, filename in [('pre-install', '+PRE_INSTALL'),
+                                        ('post-install', '+POST_INSTALL'),
+                                        ('pre-deinstall', '+PRE_DEINSTALL'),
+                                        ('post-deinstall', '+POST_DEINSTALL')]},
+}
+serialized = json.dumps(manifest, indent=2) + '\n'
+(metadata / '+MANIFEST').write_text(serialized)
+(metadata / '+COMPACT_MANIFEST').write_text(serialized)
+PYTHON
 
 echo "==> Creating package for $PKG_ABI"
 pkg create -M "$METADIR/+MANIFEST" -r "$STAGEDIR" -o "$DISTDIR"

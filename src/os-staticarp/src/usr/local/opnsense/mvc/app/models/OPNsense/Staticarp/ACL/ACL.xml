@@ -2,7 +2,8 @@
     <page-services-staticarp>
         <name>Services: 静态绑定</name>
         <patterns>
-            <pattern>services_staticarp.php*</pattern>
+            <pattern>ui/staticarp/*</pattern>
+            <pattern>api/staticarp/*</pattern>
         </patterns>
     </page-services-staticarp>
 </acl>

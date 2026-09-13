@@ -126,9 +126,50 @@ assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
 assert action('status')['result']['dns_active']
 assert ET.parse('/conf/config.xml').find('./filter/rule') is not None
 passed('Explicit activation creates the actual TUN and owned DNS/interface/firewall configuration')
+# The forward zone is a drop-in file, not an entry in the operator's Unbound
+# configuration. An entry naming the root as its domain makes OPNsense generate
+# domain-insecure: "." beside it -- a negative trust anchor for a zone that
+# already has one from auto-trust-anchor-file -- and Unbound then reports the
+# anchor for '.' presented twice and refuses to start at all.
+zone = Path('/usr/local/etc/unbound.opnsense.d/zz-mihomo.conf')
+validating = ET.parse('/conf/config.xml').findtext(
+    './OPNsense/unboundplus/general/dnssec') == '1'
+if validating:
+    # Mihomo answers fake-ip records, which carry no signature. Handing those
+    # to a validating resolver only works if the root is marked insecure, and
+    # that is the configuration that stops Unbound starting.
+    assert not zone.exists(), 'no forward zone belongs next to a validating resolver'
+else:
+    assert zone.exists(), 'the forward zone drop-in must be written'
+    assert '127.0.0.1@1053' in zone.read_text()
+    assert sorted(f.name for f in zone.parent.glob('*.conf'))[-1] == zone.name, \
+        'Unbound keeps the last forward zone it reads for a name, so ours must sort last'
+assert not (zone.parent / '00-mihomo.conf').exists(), \
+    'the legacy name never won the root zone and must not be left behind'
+assert ET.parse('/conf/config.xml').find(
+    './OPNsense/unboundplus/dots/dot[@uuid="b126bf65-a985-49ca-a9d2-16f156aac198"]') is None, \
+    'the plugin must own no entry in the operator Unbound configuration'
+insecure = Path('/var/unbound/private_domains.conf')
+assert 'domain-insecure: "."' not in (insecure.read_text() if insecure.exists() else '')
+passed('Transparent DNS adds no trust anchor for the root of its own')
 route = command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
 assert b'tun_mihomo' in route, route
 passed('VNET traffic route is captured only after explicit activation')
+# dns_active reports that the plumbing was configured. It does not report that a
+# query survives the TUN, and on a router it did not: the resolver was listening
+# and answering nothing, which is a transport failure rather than an rcode.
+import socket as _socket
+import struct as _struct
+_query = _struct.pack('!HHHHHH', 0x4d49, 0x100, 1, 0, 0, 0) + b'\x07example\x07invalid\x00\x00\x01\x00\x01'
+_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+_sock.settimeout(5)
+try:
+    _sock.sendto(_query, ('127.0.0.1', 53))
+    _reply = _sock.recv(512)
+    assert len(_reply) >= 12 and _reply[:2] == _query[:2], _reply[:32]
+finally:
+    _sock.close()
+passed('A query reaches the resolver while transparent routing carries the network')
 # Reinstall through the native solver so upgrade suspension and hooks run again.
 before_settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
 assert before_settings['transparent_consent'] is True
@@ -170,6 +211,9 @@ action('start')
 action('disable-transparent')
 assert ET.parse('/conf/config.xml').find('./filter/rule') is None
 assert ET.parse('/conf/config.xml').find('./interfaces/opt0') is None
+# Left behind, this file would keep sending every query to a core that is no
+# longer forwarding, which is the whole network without DNS.
+assert not zone.exists(), 'the forward zone drop-in must be removed'
 passed('Disabling removes owned interface/firewall entries and keeps proxy ports running')
 Path('/root/settings.json').write_text(json.dumps({'router_dns': True}))
 action('set-settings', '/root/settings.json')

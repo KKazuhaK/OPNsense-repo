@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# Package upgrades keep live settings, interface assignments and runtime state.
+[ -n "${PKG_UPGRADE+x}" ] && exit 0
+
 echo "===> Refreshing OPNsense menu cache"
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 rm -f /usr/local/opnsense/service/conf/actions.d/actions_sing-box.conf

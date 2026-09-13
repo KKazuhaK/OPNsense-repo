@@ -1,5 +1,7 @@
 <menu>
     <Services>
-        <Staticarp VisibleName="Static Binding" order="91" url="/services_staticarp.php" cssClass="fa fa-link fa-fw"/>
+        <Staticarp VisibleName="Static Binding" order="91" url="/ui/staticarp" cssClass="fa fa-link fa-fw">
+            <item url="/ui/staticarp/*" visibility="hidden"/>
+        </Staticarp>
     </Services>
 </menu>

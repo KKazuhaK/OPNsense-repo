@@ -1,4 +1,17 @@
 #!/bin/sh
+set -eu
+
+# Begin upgrade state restore.
+mkdir -p /etc/rc.conf.d
+if [ ! -f /etc/rc.conf.d/lucky ]; then
+    if [ -f /var/db/os-lucky/rc.conf.upgrade ]; then
+        cp -p /var/db/os-lucky/rc.conf.upgrade /etc/rc.conf.d/lucky
+    else
+        install -m 0644 /etc/rc.conf.d/lucky.sample /etc/rc.conf.d/lucky
+    fi
+fi
+rm -f /var/db/os-lucky/rc.conf.upgrade
+# End upgrade state restore.
 
 ABI="$(pkg config ABI 2>/dev/null || pkg -vv 2>/dev/null | awk -F'"' '/ABI =/ {print $2; exit}')"
 
@@ -17,17 +30,17 @@ echo "===> Preparing Lucky runtime"
 mkdir -p /etc/rc.conf.d /usr/local/etc/lucky
 chmod 0755 /usr/local/bin/lucky /usr/local/etc/rc.d/os-lucky 2>/dev/null || true
 chmod 0644 \
-	/usr/local/www/lucky.php \
+	/usr/local/opnsense/mvc/app/controllers/OPNsense/Lucky/IndexController.php \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Lucky/Menu/Menu.xml \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Lucky/ACL/ACL.xml \
 	/usr/local/opnsense/service/conf/actions.d/actions_lucky.conf 2>/dev/null || true
-printf '%s\n' \
-	'lucky_enable="YES"' \
-	'lucky_conf_dir="/usr/local/etc/lucky"' \
-	'lucky_http_port="16601"' \
-	> /etc/rc.conf.d/lucky
 touch /var/log/lucky.log 2>/dev/null || true
 chmod 0600 /var/log/lucky.log 2>/dev/null || true
+
+find /usr/local/opnsense/mvc/app/controllers/OPNsense/Lucky /usr/local/opnsense/mvc/app/views/OPNsense/Lucky /usr/local/opnsense/scripts/lucky -type f -exec chmod 0644 {} \; 2>/dev/null || true
+
+# Remove the retired page when upgrading from a legacy package.
+rm -f /usr/local/www/lucky.php
 
 echo "===> Clearing OPNsense menu and ACL cache"
 rm -f \
@@ -39,7 +52,7 @@ service configd restart >/dev/null 2>&1 || true
 configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 
 echo "===> Starting Lucky service"
-service os-lucky onerestart >/dev/null 2>&1 || service os-lucky onestart >/dev/null 2>&1 || true
+service os-lucky restart >/dev/null 2>&1 || true
 
 if service os-lucky onestatus >/dev/null 2>&1; then
 	echo "===> Lucky for OPNsense installed. Refresh the browser and open Services > Lucky."

@@ -30,6 +30,16 @@ function check($condition, $what)
 if (!function_exists('gettext')) {
     function gettext($text) { return $text; }
 }
+/* Its three requires resolve through include_path, which only exists on a
+   firewall. Empty stand-ins come first everywhere, on the firewall too: what
+   these checks cover are pure functions, and they should not quietly behave
+   one way here and another way on a machine that has the real tree. */
+$stubs = sys_get_temp_dir() . '/staticarp-test-includes';
+@mkdir($stubs, 0755, true);
+foreach (['config.inc', 'interfaces.inc', 'util.inc'] as $stub) {
+    file_put_contents($stubs . '/' . $stub, "<?php\n");
+}
+set_include_path($stubs . PATH_SEPARATOR . get_include_path());
 /* The file is a CLI entry point as well as a library: including it runs its
    default action and prints the settings JSON. Swallow that; the functions are
    what is under test. */

@@ -125,7 +125,7 @@
     "os-unboundcustom": {
       "staging": "tree",
       "abi": "independent",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "stage": {"src/opnsense": "/usr/local/opnsense"},
       "deps": {},
       "generated": {

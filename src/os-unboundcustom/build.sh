@@ -3,7 +3,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-unboundcustom}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.0.3}"
 ORIGIN="${ORIGIN:-opnsense/os-unboundcustom}"
 COMMENT="${COMMENT:-Safe custom options for Unbound DNS}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"

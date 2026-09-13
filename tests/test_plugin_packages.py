@@ -376,7 +376,7 @@ class StagingRecordTests(SourceTree):
         package = build_package(self.dist, REPO, 'os-lang', version=version, files=staged)
         manifest = json.loads(next(iter(read_members(package, ['+MANIFEST']))))
         manifest['annotations'] = metadata
-        package = repack(package, self.dist / 'os-lang-9.9.9.pkg', manifest)
+        package = repack(package, self.dist / 'lang-repository-shape.pkg', manifest)
         with self.assertRaisesRegex(ValueError, 'differs from the committed staging record'):
             verify.verify_source_package(package, source, plugin='os-lang')
 
@@ -403,14 +403,43 @@ class PublishedSiteTests(SourceTree):
         verify.verify_source_package(package, REPO, plugin='os-ddclient-opnwall')
 
     def test_source_changed_without_a_version_bump_is_reported_and_refused(self):
+        # Against a real published package, not a fixture: a source tree still
+        # claiming 1.0.2 while one committed byte has moved. Pinning a plugin
+        # that happens to be drifted today would turn the next bump into a
+        # failure of this test rather than of the thing it checks.
+        root = self.drifted_source('os-unboundcustom', '1.0.2')
         package = SITE / 'repo/FreeBSD:15:amd64/All/os-unboundcustom-1.0.2.pkg'
         with self.assertRaisesRegex(ValueError, 'Package content differs from source'):
-            verify.verify_source_package(package, REPO, plugin='os-unboundcustom')
+            verify.verify_source_package(package, root, plugin='os-unboundcustom')
         with patch('builtins.print'):
-            findings = dict((plugin, state) for plugin, state, _ in verify.audit_versions(SITE, REPO))
+            findings = dict((plugin, state) for plugin, state, _ in verify.audit_versions(SITE, root))
         self.assertEqual('changed without a version bump', findings['os-unboundcustom'])
         self.assertEqual('unchanged', findings['os-ddclient-opnwall'])
         self.assertEqual('rejected', findings['os-ttyd'])
+
+    def drifted_source(self, plugin, version):
+        """The repository, with one plugin held at an older version and edited."""
+        root = Path(tempfile.mkdtemp(dir=self.temp.name))
+        (root / 'src').mkdir()
+        for entry in (REPO / 'src').iterdir():
+            if entry.name == plugin:
+                shutil.copytree(entry, root / 'src' / entry.name, symlinks=True)
+            else:
+                (root / 'src' / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+        registry = json.loads((REPO / 'packaging/plugins.json').read_text())
+        record = registry['plugins'][plugin]
+        record['version'] = version
+        metadata = root / 'src' / plugin / 'src/opnsense/version' / plugin.removeprefix('os-')
+        metadata.write_text(re.sub(r'"product_version": "[^"]+"',
+                                   '"product_version": "' + version + '"', metadata.read_text()))
+        # A file the record actually stages; src/os-unboundcustom also keeps an
+        # unstaged upstream copy under original/, and editing that proves nothing.
+        controller = (root / 'src' / plugin
+                      / 'src/opnsense/mvc/app/controllers/OPNsense/Unboundcustom/Api/ServiceController.php')
+        controller.write_text(controller.read_text() + '\n')
+        (root / 'packaging').mkdir()
+        (root / 'packaging/plugins.json').write_text(json.dumps(registry))
+        return root
 
 
 class ReleasePreparationTests(SourceTree):
@@ -625,19 +654,32 @@ class TamperedPackageTests(SourceTree):
                 verify.verify_source_package(package, root, plugin='os-lang')
 
 
+def members_of(package):
+    """Read a package fully before anything writes.
+
+    Every copy helper below reads through this. Holding the source open while
+    truncating the destination works or does not work depending on whose tarfile
+    is running, which is not a difference any of these tests are about.
+    """
+    with tarfile.open(package) as archive:
+        return [(item.replace(), archive.extractfile(item).read()) for item in archive.getmembers()]
+
+
 def rewrite(package, destination, changes):
     """Copy a package with some member bytes replaced verbatim."""
-    with tarfile.open(package) as source, tarfile.open(destination, 'w') as target:
-        for item in source.getmembers():
-            add_member(target, item.name, changes.get(item.name, source.extractfile(item).read()))
+    members = members_of(package)
+    with tarfile.open(destination, 'w') as target:
+        for item, data in members:
+            add_member(target, item.name, changes.get(item.name, data))
     return destination
 
 
 def repack_members(package, destination, change):
     """Copy a package, letting the caller alter one member's type or mode."""
-    with tarfile.open(package) as source, tarfile.open(destination, 'w') as target:
-        for item in source.getmembers():
-            item, data = change(item.replace(), source.extractfile(item).read())
+    members = members_of(package)
+    with tarfile.open(destination, 'w') as target:
+        for item, data in members:
+            item, data = change(item, data)
             item.size = len(data)
             target.addfile(item, io.BytesIO(data) if item.isreg() else None)
     return destination
@@ -650,10 +692,10 @@ def read_members(package, names):
 
 def repack(package, destination, manifest):
     payload = json.dumps(manifest).encode()
-    with tarfile.open(package) as source, tarfile.open(destination, 'w') as target:
-        for item in source.getmembers():
-            data = payload if item.name in ('+MANIFEST', '+COMPACT_MANIFEST') else source.extractfile(item).read()
-            add_member(target, item.name, data)
+    members = members_of(package)
+    with tarfile.open(destination, 'w') as target:
+        for item, data in members:
+            add_member(target, item.name, payload if item.name in ('+MANIFEST', '+COMPACT_MANIFEST') else data)
     return destination
 
 

@@ -130,6 +130,28 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(re.findall(r'data-toggle="tab" href="#([a-z]+)"', view),
                          re.findall(r'<div id="([a-z]+)" class="tab-pane', view))
 
+    def test_every_pane_sits_inside_the_tab_container(self):
+        # Comparing the tab list with the pane list says nothing about nesting.
+        # One stray closing tag ends the container early, and every pane after
+        # it renders on whichever tab is open -- which is how the device policy
+        # came to appear at the bottom of Status.
+        view = VIEW.read_text()
+        body = view[view.index('<ul class="nav nav-tabs'):]
+        self.assertEqual(len(re.findall(r'<div\b', body)), len(re.findall(r'</div>', body)),
+                         'the pane markup does not balance')
+        depth = 0
+        depths = []
+        for token in re.findall(r'<div\b[^>]*>|</div>', body):
+            if token == '</div>':
+                depth -= 1
+            else:
+                if 'class="tab-pane' in token:
+                    depths.append(depth)
+                depth += 1
+        self.assertTrue(depths, 'no panes found')
+        self.assertEqual(1, len(set(depths)),
+                         'panes sit at differing depths: %s' % depths)
+
     def test_ids_are_unique(self):
         ids = re.findall(r'id="([^"{]+)"', VIEW.read_text())
         self.assertEqual([], sorted({i for i in ids if ids.count(i) > 1}))

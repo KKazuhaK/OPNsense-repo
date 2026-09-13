@@ -584,8 +584,6 @@ $(function () {
         </table>
     </div>
 
-    </div>
-
     <div id="devices" class="tab-pane fade in">
         <table class="table table-striped opnsense_standard_table_form">
             <thead><tr><td style="width:22%"><strong>{{ lang._('Device policy') }}</strong></td><td style="width:78%"></td></tr></thead>

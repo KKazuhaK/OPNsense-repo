@@ -30,8 +30,12 @@ jobs:
           python -B -m unittest discover -s src/os-easytier/tests/native -v
           python -B -m unittest discover -s src/os-ttyd/tests/native -v
           python -B -m unittest discover -s src/os-lang/tests/native -p test_archive.py -v
-          php src/os-speedtest/tests/native/test-api.php
-          php src/os-sing-box/tests/native/test-api-contract.php
+          # These two default to the installed controller tree; on a runner
+          # there is none, so point them at the source they are checking.
+          php src/os-speedtest/tests/native/test-api.php \
+            src/os-speedtest/src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/Api
+          php src/os-sing-box/tests/native/test-api-contract.php \
+            src/os-sing-box/src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api
           php tests/native/test-utility-api-contract.php
           php tests/native/test-small-api-contract.php
       - name: Check PHP syntax

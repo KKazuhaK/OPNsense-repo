@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "plugins": {
+    "os-kazuha-repo": {
+      "staging": "repository",
+      "abi": "independent",
+      "version": "1.0.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "version_file": {"path": "/usr/local/opnsense/version/kazuha-repo", "format": "json"},
+      "notes": "The build rewrites the version metadata from the signed product series; verify-repo.py reproduces that rewrite. The rewrite is the only thing this shape adds: the version pin, the declared dependencies and the rest are enforced exactly as they are for every other plugin."
+    },
+    "os-staticarp": {
+      "staging": "tree",
+      "abi": "target",
+      "version": "1.1.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "version_file": {"path": "/usr/local/opnsense/version/staticarp", "format": "json"}
+    },
+    "os-pftop": {
+      "staging": "tree",
+      "abi": "independent",
+      "version": "1.1.0",
+      "stage": {"src/usr": "/usr"},
+      "deps": {},
+      "version_file": {"path": "/usr/local/opnsense/version/pftop", "format": "json"},
+      "notes": "The build stages src/usr only, so anything committed outside src/usr must be added here before it can be published."
+    },
+    "os-lang": {
+      "staging": "tree",
+      "abi": "independent",
+      "version": "1.1.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "version_file": {"path": "/usr/local/opnsense/version/lang", "format": "json"}
+    },
+    "os-easytier": {
+      "staging": "tree",
+      "abi": "target",
+      "version": "1.1.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "version_file": {"path": "/usr/local/opnsense/version/easytier", "format": "json"},
+      "notes": "Both executables are committed under src/, so their bytes are covered by the per-file digests."
+    },
+    "os-ddns-go": {
+      "staging": "tree",
+      "abi": "target",
+      "version": "1.1.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "version_file": {"path": "/usr/local/opnsense/version/ddns-go", "format": "json"},
+      "notes": "The binary is committed under src/; the release download fallback in build.sh can never satisfy this record."
+    },
+    "os-lucky": {
+      "staging": "tree",
+      "abi": "target",
+      "version": "1.1.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "vendored": [
+        {
+          "artifact": "src/usr/local/bin/lucky_2.27.2_freebsd_x86_64.tar.gz",
+          "sha256": "d300262b98e6a1cbc76da853e13ecb76df763460b5b9aa3215dc00a93057d221",
+          "archive": "tar.gz",
+          "members": {"lucky": "/usr/local/bin/lucky"}
+        }
+      ],
+      "version_file": {"path": "/usr/local/opnsense/version/lucky", "format": "json"}
+    },
+    "os-speedtest": {
+      "staging": "tree",
+      "abi": "target",
+      "version": "1.1.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "vendored": [
+        {
+          "artifact": "src/usr/local/bin/speedtest-go_1.7.10_Freebsd_x86_64.tar.gz",
+          "sha256": "648ea262297aff61dbe8569f8b719b40f7eb928cc9b17d13927282365a857f80",
+          "archive": "tar.gz",
+          "members": {"speedtest-go": "/usr/local/bin/opnsense-speedtest"}
+        }
+      ],
+      "version_file": {"path": "/usr/local/opnsense/version/speedtest", "format": "text"}
+    },
+    "os-sing-box": {
+      "staging": "tree",
+      "abi": "target",
+      "version": "1.1.0",
+      "stage": {"src": "/"},
+      "deps": {"jq": "textproc/jq", "curl": "ftp/curl"},
+      "vendored": [
+        {
+          "artifact": "src/usr/local/bin/bsd-box-reF1nd-freebsd-amd64.xz",
+          "sha256": "3ba254d792964cd1005946354e0c8250a05955381bdcbd19f57265a339b199d7",
+          "archive": "xz",
+          "install": "/usr/local/bin/sing-box"
+        }
+      ],
+      "version_file": {"path": "/usr/local/opnsense/version/sing-box", "format": "json"}
+    },
+    "os-frp": {
+      "staging": "tree",
+      "abi": "target",
+      "version": "1.0.0",
+      "stage": {"src": "/"},
+      "deps": {},
+      "vendored": [
+        {
+          "artifact": "vendor/frp_0.71.0_freebsd_amd64.tar.gz",
+          "sha256": "207c85353dd66e9ef1125a8ee60e4fd4a562f364bc584c4a5ff55e7ac7355bb8",
+          "sha256_file": "vendor/frp_0.71.0_freebsd_amd64.tar.gz.sha256",
+          "checksums_file": "vendor/frp_sha256_checksums.txt",
+          "archive": "tar.gz",
+          "members": {
+            "frp_0.71.0_freebsd_amd64/frps": "/usr/local/sbin/frps",
+            "frp_0.71.0_freebsd_amd64/frpc": "/usr/local/sbin/frpc"
+          }
+        }
+      ],
+      "version_file": {"path": "/usr/local/opnsense/version/frp", "format": "json"}
+    },
+    "os-unboundcustom": {
+      "staging": "tree",
+      "abi": "independent",
+      "version": "1.0.2",
+      "stage": {"src/opnsense": "/usr/local/opnsense"},
+      "deps": {},
+      "generated": {
+        "/usr/local/opnsense/version/unboundcustom": {
+          "literal": "{\n    \"product_abi\": \"26.7\",\n    \"product_arch\": \"amd64\",\n    \"product_email\": \"https://github.com/Opnwall/\",\n    \"product_id\": \"os-unboundcustom\",\n    \"product_name\": \"unboundcustom\",\n    \"product_tier\": \"4\",\n    \"product_version\": \"@VERSION@\",\n    \"product_website\": \"https://pfchina.org/\"\n}\n"
+        }
+      },
+      "version_file": {"path": "/usr/local/opnsense/version/unboundcustom", "format": "json"}
+    },
+    "os-ddclient-opnwall": {
+      "staging": "tree",
+      "abi": "independent",
+      "version": "1.0.2",
+      "stage": {"src": "/"},
+      "deps": {"ddclient": "dns/ddclient", "py313-boto3": "devel/py-boto3@py313"},
+      "generated": {
+        "/usr/local/opnsense/version/ddclient-opnwall": {
+          "literal": "{\"product_abi\":\"26.7\",\"product_arch\":\"amd64\",\"product_email\":\"https://github.com/Opnwall/\",\"product_id\":\"os-ddclient-opnwall\",\"product_name\":\"ddclient-opnwall\",\"product_tier\":\"4\",\"product_version\":\"@VERSION@\",\"product_website\":\"https://github.com/Opnwall/OPNsense-dyndns\"}\n"
+        }
+      },
+      "version_file": {"path": "/usr/local/opnsense/version/ddclient-opnwall", "format": "json"}
+    },
+    "os-ttyd": {
+      "staging": "unsupported",
+      "reason": "The six vendored FreeBSD runtime packages under src/os-ttyd/vendor/ carry no committed digest, the staged inventory depends on which shared library the vendored archive happens to contain, and three staged paths are symlinks that no per-file digest can describe."
+    }
+  }
+}

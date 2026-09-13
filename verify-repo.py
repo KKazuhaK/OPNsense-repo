@@ -2,16 +2,31 @@
 """Verify signed catalogs, every listed package, and the tested release report."""
 import argparse
 import hashlib
+import io
 import json
-from pathlib import Path
+import lzma
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import tarfile
 import tempfile
 import importlib.util
 import os
 import shutil
 
 ABI_PATTERN = r'FreeBSD:[0-9]+:amd64'
+INDEPENDENT_ABI = 'FreeBSD:*:amd64'
+VERSION_PATTERN = r'[0-9][0-9A-Za-z._,+]*'
+PHASES = ('pre-install', 'post-install', 'pre-deinstall', 'post-deinstall')
+REGISTRY = 'packaging/plugins.json'
+RECORD_FIELDS = {'staging', 'abi', 'version', 'stage', 'deps', 'vendored', 'generated',
+                 'version_file', 'reason', 'notes'}
+VENDOR_FIELDS = {'artifact', 'sha256', 'sha256_file', 'checksums_file', 'archive',
+                 'members', 'install'}
+SOURCE_NOISE = {'.pyc', '.pyo'}
+# Manifest keys that make libpkg act beyond the files{} this verifier reconstructs:
+# a second (Lua) hook interpreter, filesystem objects, accounts and config handling.
+MANIFEST_SIDE_EFFECTS = ('lua_scripts', 'directories', 'dirs', 'config', 'users', 'groups')
 
 
 def target_module(source):
@@ -33,8 +48,76 @@ def release_path(site, value):
     return path
 
 
-def manifest_of(package):
-    return json.loads(subprocess.check_output(['tar', '-xOf', str(package), '+MANIFEST']))
+def unique_keys(pairs):
+    """libpkg parses a manifest with UCL, which keeps a repeated key this reader drops."""
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('Package manifest repeats the key: ' + str(key))
+        value[key] = item
+    return value
+
+
+def manifest_of(package, member='+MANIFEST'):
+    try:
+        payload = subprocess.check_output(['tar', '-xOf', str(package), '-P', '--', member],
+                                          stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as error:
+        raise ValueError('Package has no readable ' + member + ': ' + str(package)) from error
+    try:
+        return json.loads(payload, object_pairs_hook=unique_keys)
+    except json.JSONDecodeError as error:
+        raise ValueError('Package manifest is not the JSON form this verifier reads: ' + str(package)) from error
+
+
+def check_manifest_shape(package, manifest):
+    """Refuse manifest machinery no committed source can describe.
+
+    scripts{} is compared against the committed hooks below, but libpkg runs more
+    than that: lua_scripts is a second hook interpreter, and directories, config,
+    users and groups create things on the client that files{} never mentions.
+    +COMPACT_MANIFEST is not decoration either -- 'pkg repo' copies it into the
+    signed catalog, so a package whose two manifests disagree publishes one story
+    to the catalog and another to the installer.
+    """
+    for key in MANIFEST_SIDE_EFFECTS:
+        if manifest.get(key):
+            raise ValueError('Package manifest carries ' + key + ', which no committed source describes.')
+    compact = manifest_of(package, '+COMPACT_MANIFEST')
+    for key, value in compact.items():
+        if key not in manifest or manifest[key] != value:
+            raise ValueError('Catalog manifest differs from the package manifest: ' + str(key))
+    if any(compact.get(key) != manifest.get(key) for key in ('name', 'version', 'abi')):
+        raise ValueError('Catalog manifest does not carry the package identity.')
+
+
+def archive_members(package):
+    """Read the archive twice and refuse anything but plain files.
+
+    tar -tf is libarchive, the same reader libpkg installs with; tarfile is this
+    verifier's own. Requiring both to see the same members closes the gap between
+    what is inventoried and what is extracted. Only regular files may carry
+    content, and none of them may carry a setuid, setgid or sticky bit, which the
+    committed source has no way to ask for.
+    """
+    listed = subprocess.check_output(['tar', '-tf', str(package)], text=True).splitlines()
+    with tarfile.open(package) as archive:
+        items = archive.getmembers()
+    if [item.name for item in items] != listed:
+        raise ValueError('Package archive does not read the same way twice.')
+    paths = {}
+    for item in items:
+        if item.isdir():
+            continue
+        if not item.isreg():
+            raise ValueError('Package archive member is not a regular file: ' + item.name)
+        if item.mode & 0o7000:
+            raise ValueError('Package archive member carries a setuid, setgid or sticky bit: ' + item.name)
+        path = '/' + item.name.removeprefix('./').lstrip('/')
+        if path in paths:
+            raise ValueError('Package archive lists a member twice: ' + path)
+        paths[path] = item.name
+    return paths
 
 
 def validate_attestation(entry, manifest, target=None):
@@ -65,6 +148,297 @@ def validate_attestation(entry, manifest, target=None):
             raise ValueError('Repository differs from the committed target recipe.')
 
 
+def plugin_records(source):
+    """Read the committed staging records that describe what each package may contain.
+
+    Every publishable plugin except os-mihomo -- which is described by its own
+    committed recipe module, src/os-mihomo/packaging/target.py -- has a record in
+    packaging/plugins.json:
+
+      staging      "tree" reconstructs the package from src/, "repository" adds the
+                   signed product-series rewrite of os-kazuha-repo, "unsupported"
+                   names a plugin this verifier refuses to publish and why.
+      abi          "target" requires FreeBSD:<major>:amd64, "independent" requires
+                   FreeBSD:*:amd64.
+      version      the version this source publishes; a package may carry no other.
+      stage        {source directory under the plugin: install directory}. Every
+                   committed file under src/ must fall inside one of them.
+      deps         {package: origin} the manifest must declare, exactly.
+      vendored     artifacts unpacked into the stage. Each one pins a sha256 that
+                   this verifier recomputes before it unpacks anything.
+      generated    {install path: {"literal": text}} for files the build writes
+                   instead of copying; @VERSION@ becomes the package version.
+      version_file the product version metadata, cross-checked against the package.
+
+    A record is committed source. It cannot make the verifier trust a build: it can
+    only say which committed bytes end up where, and every byte is still hashed.
+    """
+    path = source / REGISTRY
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_bytes())
+    if value.get('schema_version') != 1 or not isinstance(value.get('plugins'), dict):
+        raise ValueError('Committed plugin staging records are required.')
+    for plugin, record in value['plugins'].items():
+        if not re.fullmatch(r'os-[a-z0-9][a-z0-9-]*', plugin) or not isinstance(record, dict):
+            raise ValueError('Invalid committed plugin staging record: ' + str(plugin))
+        if set(record) - RECORD_FIELDS:
+            raise ValueError('Unknown fields in the staging record for ' + plugin + ': ' + ', '.join(sorted(set(record) - RECORD_FIELDS)))
+        if record.get('staging') not in {'tree', 'repository', 'unsupported'}:
+            raise ValueError('Unsupported staging shape for ' + plugin + '.')
+    return value['plugins']
+
+
+def plugin_record(source, plugin):
+    """Refuse anything the committed records do not describe."""
+    record = plugin_records(source).get(plugin)
+    if record is None:
+        raise ValueError('Unsupported additional release package: ' + plugin)
+    if record['staging'] == 'unsupported':
+        raise ValueError('Unsupported additional release package: ' + plugin + ': ' + str(record.get('reason', '')))
+    if record.get('abi') not in {'target', 'independent'}:
+        raise ValueError('The staging record for ' + plugin + ' declares no ABI policy.')
+    return record
+
+
+def package_version(manifest):
+    version = manifest.get('version')
+    if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+        raise ValueError('Release package has no usable version.')
+    return version
+
+
+def abi_allowed(record, abi):
+    if record['abi'] == 'independent':
+        return abi == INDEPENDENT_ABI
+    return bool(re.fullmatch(ABI_PATTERN, abi))
+
+
+def source_path(root, value):
+    """Resolve a path a staging record names, without leaving the plugin."""
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.+,@-]+(?:/[A-Za-z0-9_.+,@-]+)*', value) or '..' in PurePosixPath(value).parts:
+        raise ValueError('Unsafe committed source path: ' + str(value))
+    path = root / value
+    if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError('Committed source file is missing or unsafe: ' + value)
+    return path
+
+
+def install_path(value, directory=False):
+    if not isinstance(value, str) or not value.startswith('/') or '..' in PurePosixPath(value).parts:
+        raise ValueError('Unsafe install path: ' + str(value))
+    if value != '/' and (value.endswith('/') or not re.fullmatch(r'(?:/[A-Za-z0-9_.+,@-]+)+', value)):
+        raise ValueError('Unsafe install path: ' + value)
+    if not directory and value == '/':
+        raise ValueError('Unsafe install path: ' + value)
+    return value
+
+
+def hook_source(src, phase):
+    """A lifecycle hook is committed source: a regular file inside the plugin.
+
+    Without this a hook can be a symbolic link, and the bytes the package runs
+    then come from wherever the link points on the build host rather than from
+    anything the repository carries.
+    """
+    relative = 'packaging/freebsd/+' + phase.upper().replace('-', '_')
+    path = src / relative
+    if not path.exists() and not path.is_symlink():
+        return None
+    return source_path(src, relative)
+
+
+def checksum_entry(path, name):
+    """Read one 'digest  filename' line out of a committed checksum list."""
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1].lstrip('*') == name:
+            return fields[0]
+    raise ValueError('Committed checksum list does not cover ' + name + '.')
+
+
+def vendored_files(root, record):
+    """Unpack only artifacts whose committed digest this verifier has just checked."""
+    staged, artifacts = {}, set()
+    for item in record.get('vendored', []):
+        if not isinstance(item, dict) or set(item) - VENDOR_FIELDS:
+            raise ValueError('Invalid vendored artifact record.')
+        pin = item.get('sha256')
+        if not isinstance(pin, str) or not re.fullmatch('[0-9a-f]{64}', pin):
+            raise ValueError('A vendored artifact may only be unpacked with a pinned digest: ' + str(item.get('artifact')))
+        artifact = source_path(root, item.get('artifact'))
+        data = artifact.read_bytes()
+        if hashlib.sha256(data).hexdigest() != pin:
+            raise ValueError('Vendored artifact differs from its committed digest: ' + item['artifact'])
+        for field in ('sha256_file', 'checksums_file'):
+            if item.get(field) and checksum_entry(source_path(root, item[field]), artifact.name) != pin:
+                raise ValueError('Committed checksum file disagrees with the pinned digest: ' + item[field])
+        artifacts.add(artifact.resolve())
+        if item.get('archive') == 'xz':
+            if item.get('members'):
+                raise ValueError('A compressed stream has no members to select.')
+            members = {None: install_path(item.get('install'))}
+            contents = {None: lzma.decompress(data)}
+        elif item.get('archive') == 'tar.gz':
+            if item.get('install') or not isinstance(item.get('members'), dict) or not item['members']:
+                raise ValueError('A vendored archive must name the members it stages.')
+            members = {name: install_path(value) for name, value in item['members'].items()}
+            contents = {}
+            with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+                for name in members:
+                    try:
+                        member = archive.getmember(name)
+                    except KeyError as error:
+                        raise ValueError('The vendored archive has no such member: ' + name) from error
+                    if not member.isreg():
+                        raise ValueError('A vendored archive may only stage regular files: ' + name)
+                    contents[name] = archive.extractfile(member).read()
+        else:
+            raise ValueError('Unsupported vendored archive format: ' + str(item.get('archive')))
+        for name, install in members.items():
+            if install in staged:
+                raise ValueError('Two vendored members claim the same install path: ' + install)
+            staged[install] = contents[name]
+    return staged, artifacts
+
+
+def staged_tree(root, record, artifacts=frozenset()):
+    """Map every committed file under src/ onto the path the build installs it at."""
+    stage = record.get('stage')
+    if not isinstance(stage, dict) or not stage:
+        raise ValueError('The staging record names no source directory.')
+    entries = []
+    for prefix, destination in stage.items():
+        if not isinstance(prefix, str) or not re.fullmatch(r'src(?:/[A-Za-z0-9_.+,@-]+)*', prefix):
+            raise ValueError('A staged source directory must live under src/: ' + str(prefix))
+        base = root / prefix
+        if base.is_symlink() or not base.is_dir():
+            raise ValueError('Staged source directory is missing: ' + prefix)
+        entries.append((base, install_path(destination, directory=True).rstrip('/')))
+    entries.sort(key=lambda entry: -len(str(entry[0])))
+    result = {}
+    for path in sorted((root / 'src').rglob('*')):
+        relative = path.relative_to(root)
+        if path.is_symlink():
+            raise ValueError('Committed source must not contain symbolic links: ' + relative.as_posix())
+        if not path.is_file():
+            continue
+        parts = relative.parts
+        if '__pycache__' in parts or path.suffix in SOURCE_NOISE or any(p == '.DS_Store' or p.startswith('._') for p in parts):
+            continue
+        if path.resolve() in artifacts:
+            continue
+        for base, destination in entries:
+            if path.is_relative_to(base):
+                install = install_path(destination + '/' + path.relative_to(base).as_posix())
+                if install in result:
+                    raise ValueError('Two committed files stage onto the same install path: ' + install)
+                result[install] = path.read_bytes()
+                break
+        else:
+            raise ValueError('Committed source file is outside every staged directory: /' + relative.as_posix())
+    return result
+
+
+def record_files(root, record, manifest, plugin):
+    """Rebuild, from committed source alone, what the package is allowed to contain."""
+    version = package_version(manifest)
+    staged, artifacts = vendored_files(root, record)
+    expected = staged_tree(root, record, artifacts)
+    for install, content in staged.items():
+        if install in expected:
+            raise ValueError('A vendored member replaces a committed file: ' + install)
+        expected[install] = content
+    for install, item in (record.get('generated') or {}).items():
+        if not isinstance(item, dict) or set(item) != {'literal'} or not isinstance(item['literal'], str):
+            raise ValueError('Invalid generated file record: ' + str(install))
+        content = item['literal'].replace('@VERSION@', version).encode()
+        install = install_path(install)
+        if install in expected and expected[install] != content:
+            raise ValueError('Generated file differs from the committed copy: ' + install)
+        expected[install] = content
+    if record['staging'] == 'repository':
+        # The repository plugin rewrites its own product metadata; everything the
+        # other shapes must satisfy still applies to it.
+        expected = repository_files(expected, manifest, record)
+    if record.get('version') != version:
+        raise ValueError('Package version differs from the committed staging record: ' + version)
+    declared = record.get('deps')
+    dependencies = manifest.get('deps') or {}
+    if not isinstance(declared, dict) or set(dependencies) != set(declared) or any(
+            (dependencies[name] or {}).get('origin') != origin for name, origin in declared.items()):
+        raise ValueError('Package dependencies differ from the committed staging record.')
+    annotations = manifest.get('annotations') or {}
+    if annotations.get('product_version', version) != version or annotations.get('product_id', plugin) != plugin:
+        raise ValueError('Package annotations differ from the package identity.')
+    check_version_file(expected, record, manifest, plugin)
+    if manifest['abi'] == INDEPENDENT_ABI and any(content.startswith(b'\x7fELF') for content in expected.values()):
+        raise ValueError('An ABI independent package must not contain native executables.')
+    return expected
+
+
+def check_version_file(expected, record, manifest, plugin):
+    """The product metadata a package installs must describe the package."""
+    item = record.get('version_file')
+    if not isinstance(item, dict) or set(item) != {'path', 'format'}:
+        raise ValueError('The staging record names no product version file.')
+    content = expected.get(install_path(item['path']))
+    if content is None:
+        raise ValueError('The package installs no product version file: ' + item['path'])
+    if item['format'] == 'json':
+        value = json.loads(content)
+        if value.get('product_version') != manifest['version'] or value.get('product_id') != plugin:
+            raise ValueError('Product version metadata differs from the package: ' + item['path'])
+    elif item['format'] == 'text':
+        if content.decode().strip() != manifest['version']:
+            raise ValueError('Product version metadata differs from the package: ' + item['path'])
+    else:
+        raise ValueError('Unsupported product version format: ' + str(item['format']))
+
+
+def repository_files(expected, manifest, record):
+    """The repository plugin republishes its own metadata for the signed series."""
+    version_path = install_path(record['version_file']['path'])
+    if version_path not in expected:
+        raise ValueError('The package installs no product version file: ' + version_path)
+    metadata = json.loads(expected[version_path])
+    product_abi = manifest.get('annotations', {}).get('product_abi', '')
+    if not re.fullmatch(r'[0-9]{2}\.[17]', product_abi):
+        raise ValueError('Repository plugin has an invalid product series.')
+    metadata.update(product_abi=product_abi, product_version=manifest['version'])
+    expected[version_path] = (json.dumps(metadata, separators=(',', ':')) + '\n').encode()
+    if manifest.get('annotations') != metadata or manifest.get('deps', {}):
+        raise ValueError('Repository plugin annotations or dependencies differ from source.')
+    return expected
+
+
+def manifest_script(text):
+    """libpkg percent-encodes '%' and every non-ASCII byte when it serializes a hook."""
+    return ''.join('%25' if byte == 0x25 else chr(byte) if byte < 0x80 else '%%%02x' % byte
+                   for byte in text.encode())
+
+
+def published_versions(site, name, version):
+    for path in sorted((site / 'repo').rglob(name + '-' + version + '.pkg')):
+        if path.parent.name == 'All' and path.is_file():
+            yield path
+
+
+def check_published_version(site, manifest):
+    """A version that is already published may never be republished with new content."""
+    name, version = manifest.get('name'), package_version(manifest)
+    if not isinstance(name, str) or not re.fullmatch(r'os-[a-z0-9][a-z0-9-]*', name):
+        raise ValueError('Release package has incorrect identity or ABI.')
+    for published in published_versions(site, name, version):
+        try:
+            earlier = manifest_of(published)
+        except (subprocess.CalledProcessError, ValueError) as error:
+            raise ValueError('Published ' + name + ' ' + version + ' cannot be compared with this build.') from error
+        if earlier.get('files') != manifest.get('files') or earlier.get('scripts') != manifest.get('scripts'):
+            raise ValueError('Source changed without a version bump: ' + name + ' ' + version
+                             + ' is already published with different content.')
+
+
 def prepare_release(site, source, commit, packages):
     """Collect individually tested native targets before local signing."""
     if not re.fullmatch('[0-9a-f]{40}', commit):
@@ -82,6 +456,10 @@ def prepare_release(site, source, commit, packages):
         manifest = manifest_of(candidate)
         abi, name = manifest['abi'], manifest['name']
         digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        check_published_version(site, manifest)
+        # Publish under the identity the package carries, never under the file name a
+        # build happened to leave it with: os-lang.pkg must not land on another package.
+        filename = name + '-' + package_version(manifest) + '.pkg'
         if name == 'os-mihomo':
             key = (abi, manifest.get('annotations', {}).get('product_abi'))
             if key not in by_tuple or key in seen:
@@ -92,24 +470,24 @@ def prepare_release(site, source, commit, packages):
             value = json.loads(report_path.read_bytes())
             if value.get('package_sha256') != digest:
                 raise ValueError('Package changed after native lifecycle testing.')
-            value.update(path=target['repository'] + '/All/' + candidate.name, sha256=digest, abi=abi)
+            value.update(path=target['repository'] + '/All/' + filename, sha256=digest, abi=abi)
             validate_attestation(value, manifest, target)
             verify_source_package(candidate, source, target=target)
             released.append(value)
             destinations = [value['path']]
-        elif name == 'os-kazuha-repo' and abi == 'FreeBSD:*:amd64':
-            verify_source_package(candidate, source, plugin=name, binary=None, asset=None)
-            repositories = {t['repository'] for t in targets}
-            repositories.update('repo/' + p.name for p in (site / 'repo').glob('FreeBSD:*:amd64'))
-            destinations = [repository + '/All/' + candidate.name for repository in sorted(repositories)]
-        elif name == 'os-sing-box' and re.fullmatch(ABI_PATTERN, abi):
-            matching = [t for t in targets if t['abi'] == abi]
-            if len(matching) != 1:
-                raise ValueError('Additional package needs one unambiguous target repository.')
-            verify_source_package(candidate, source, name, 'sing-box', 'bsd-box-reF1nd-freebsd-amd64.xz')
-            destinations = [matching[0]['repository'] + '/All/' + candidate.name]
         else:
-            raise ValueError('Unsupported additional release package.')
+            # Every other plugin is published through its committed staging record.
+            plugin_record(source, name)
+            verify_source_package(candidate, source, plugin=name)
+            if abi == INDEPENDENT_ABI:
+                repositories = {t['repository'] for t in targets}
+                repositories.update('repo/' + p.name for p in (site / 'repo').glob('FreeBSD:*:amd64'))
+                destinations = [repository + '/All/' + filename for repository in sorted(repositories)]
+            else:
+                matching = [t for t in targets if t['abi'] == abi]
+                if len(matching) != 1:
+                    raise ValueError('Additional package needs one unambiguous target repository.')
+                destinations = [matching[0]['repository'] + '/All/' + filename]
         for destination in destinations:
             path = release_path(site, destination)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,67 +586,101 @@ def verify(site, source=None):
         if extra.resolve() not in listed or hashlib.sha256(extra.read_bytes()).hexdigest() != entry['sha256']:
             raise ValueError('Additional release package differs from the signed report.')
         if source:
-            if entry.get('name', 'os-sing-box') == 'os-kazuha-repo':
-                verify_source_package(extra, source, 'os-kazuha-repo', None, None)
-            else:
-                verify_source_package(extra, source, 'os-sing-box', 'sing-box', 'bsd-box-reF1nd-freebsd-amd64.xz')
+            verify_source_package(extra, source, plugin=entry.get('name', 'os-sing-box'))
     print('Catalog signatures, ' + str(count) + ' package digests and FreeBSD release report verified.')
     return report
 
 
 def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', asset='clash-meta-freebsd-amd64.xz', target=None):
-    import lzma
-    manifest = json.loads(subprocess.check_output(['tar', '-xOf', str(package), '+MANIFEST']))
+    """Rebuild the package from committed source and compare every byte of it."""
+    manifest = manifest_of(package)
+    check_manifest_shape(package, manifest)
     src = source / 'src' / plugin
-    if manifest['name'] != plugin or not (re.fullmatch(ABI_PATTERN, manifest['abi']) or plugin == 'os-kazuha-repo' and manifest['abi'] == 'FreeBSD:*:amd64'):
-        raise ValueError('Release package has incorrect identity or ABI.')
-    expected = {'/' + str(p.relative_to(src / 'src')): p.read_bytes() for p in (src / 'src').rglob('*')
-                if p.is_file() and p.suffix not in {'.xz', '.pyc', '.pyo'} and '__pycache__' not in p.parts
-                and not any(part == '.DS_Store' or part.startswith('._') for part in p.parts)}
     module = target_module(source) if plugin == 'os-mihomo' else None
-    if module:
-        python_package = next((name for name in manifest.get('deps', {}) if re.fullmatch(r'python3[0-9]+', name)), 'python313')
-        target = target or module.resolve_target(src, {'TARGET_ABI': manifest['abi'], 'TARGET_PRODUCT_ABI': manifest.get('annotations', {}).get('product_abi', ''), 'TARGET_PYTHON': '3.' + python_package[7:]})
-        expected = module.staged_files(src, target, manifest['version'])
-        if manifest.get('annotations') != module.product_metadata(src, target, manifest['version']) or manifest.get('arch') != target['arch']:
-            raise ValueError('Product annotations or architecture differ from the target recipe.')
-        origins = {'curl': 'ftp/curl', target['python_package']: 'lang/' + target['python_package'], target['pyyaml_package']: 'devel/py-pyyaml'}
-        dependencies = manifest.get('deps', {})
-        if set(dependencies) != set(origins) or any(dependencies[name].get('origin') != origin for name, origin in origins.items()):
-            raise ValueError('Package dependencies differ from the target recipe.')
-    elif plugin == 'os-kazuha-repo':
-        version_path = '/usr/local/opnsense/version/kazuha-repo'
-        metadata = json.loads(expected[version_path])
-        product_abi = manifest.get('annotations', {}).get('product_abi', '')
-        if not re.fullmatch(r'[0-9]{2}\.[17]', product_abi):
-            raise ValueError('Repository plugin has an invalid product series.')
-        metadata.update(product_abi=product_abi, product_version=manifest['version'])
-        expected[version_path] = (json.dumps(metadata, separators=(',', ':')) + '\n').encode()
-        if manifest.get('annotations') != metadata or manifest.get('deps', {}):
-            raise ValueError('Repository plugin annotations or dependencies differ from source.')
-    elif binary:
-        expected['/usr/local/bin/' + binary] = lzma.decompress((src / 'src/usr/local/bin' / asset).read_bytes())
+    record = None
+    if plugin == 'os-mihomo':
+        allowed = bool(re.fullmatch(ABI_PATTERN, manifest['abi']))
+    else:
+        record = plugin_record(source, plugin)
+        allowed = abi_allowed(record, manifest['abi'])
+    if manifest['name'] != plugin or not allowed:
+        raise ValueError('Release package has incorrect identity or ABI.')
+    if record is None:
+        expected = {'/' + str(p.relative_to(src / 'src')): p.read_bytes() for p in (src / 'src').rglob('*')
+                    if p.is_file() and p.suffix not in {'.xz', '.pyc', '.pyo'} and '__pycache__' not in p.parts
+                    and not any(part == '.DS_Store' or part.startswith('._') for part in p.parts)}
+        if module:
+            python_package = next((name for name in manifest.get('deps', {}) if re.fullmatch(r'python3[0-9]+', name)), 'python313')
+            target = target or module.resolve_target(src, {'TARGET_ABI': manifest['abi'], 'TARGET_PRODUCT_ABI': manifest.get('annotations', {}).get('product_abi', ''), 'TARGET_PYTHON': '3.' + python_package[7:]})
+            expected = module.staged_files(src, target, manifest['version'])
+            if manifest.get('annotations') != module.product_metadata(src, target, manifest['version']) or manifest.get('arch') != target['arch']:
+                raise ValueError('Product annotations or architecture differ from the target recipe.')
+            origins = {'curl': 'ftp/curl', target['python_package']: 'lang/' + target['python_package'], target['pyyaml_package']: 'devel/py-pyyaml'}
+            dependencies = manifest.get('deps', {})
+            if set(dependencies) != set(origins) or any(dependencies[name].get('origin') != origin for name, origin in origins.items()):
+                raise ValueError('Package dependencies differ from the target recipe.')
+        elif binary:
+            expected['/usr/local/bin/' + binary] = lzma.decompress((src / 'src/usr/local/bin' / asset).read_bytes())
+    else:
+        expected = record_files(src, record, manifest, plugin)
     actual = manifest['files']
-    members = subprocess.check_output(['tar', '-tf', str(package)], text=True).splitlines()
-    archive_paths = { '/' + name.removeprefix('./').lstrip('/'): name for name in members }
-    if any('__pycache__' in Path(name).parts or Path(name).suffix in {'.pyc', '.pyo'} for name in members):
+    archive_paths = archive_members(package)
+    if any('__pycache__' in Path(name).parts or Path(name).suffix in {'.pyc', '.pyo'} for name in archive_paths.values()):
         raise ValueError('Python bytecode must not be packaged.')
-    archived_files = [ '/' + name.removeprefix('./').lstrip('/') for name in members if not name.endswith('/') ]
-    if len(archived_files) != len(set(archived_files)) or set(archived_files) != set(actual) | {'/+MANIFEST', '/+COMPACT_MANIFEST'}:
+    if set(archive_paths) != set(actual) | {'/+MANIFEST', '/+COMPACT_MANIFEST'}:
         raise ValueError('Package archive inventory differs from its manifest.')
     if set(expected) != set(actual):
         raise ValueError('Package file inventory does not match the tested source.')
+    for path in sorted(expected):
+        # A reconstructed path is also a tar pattern below; keep it a plain path.
+        install_path(path)
     for path, content in expected.items():
         if actual[path] != '1$' + hashlib.sha256(content).hexdigest():
             raise ValueError('Package content differs from source: ' + path)
-        archived = subprocess.check_output(['tar', '-xOf', str(package), '-P', archive_paths[path]])
+        archived = subprocess.check_output(['tar', '-xOf', str(package), '-P', '--', archive_paths[path]])
         if archived != content:
             raise ValueError('Package archive differs from its manifest: ' + path)
-    for phase in ('pre-install', 'post-install', 'pre-deinstall', 'post-deinstall'):
-        hook = src / 'packaging/freebsd' / ('+' + phase.upper().replace('-', '_'))
-        content = module.transform_hook(src, phase, target) if module else hook.read_text() if hook.exists() else None
-        if content is not None and manifest['scripts'][phase].rstrip() != content.rstrip():
+    scripts = manifest.get('scripts') or {}
+    if set(scripts) - set(PHASES):
+        raise ValueError('Package lifecycle hook differs from source.')
+    for phase in PHASES:
+        hook = hook_source(src, phase)
+        content = None if hook is None else module.transform_hook(src, phase, target) if module else hook.read_text()
+        if content is None:
+            if phase in scripts:
+                raise ValueError('Package lifecycle hook differs from source.')
+            continue
+        # libpkg url-decodes a hook it is handed and percent-encodes the one it
+        # writes, so a build may escape before serialization or not at all.
+        if scripts.get(phase, '').rstrip() not in {content.rstrip(), manifest_script(content).rstrip()}:
             raise ValueError('Package lifecycle hook differs from source.')
+
+
+def audit_versions(site, source):
+    """Report plugins whose committed source no longer matches a published version."""
+    findings = []
+    for plugin, record in sorted(plugin_records(source).items()):
+        if record['staging'] == 'unsupported':
+            findings.append((plugin, 'rejected', str(record.get('reason', ''))))
+            continue
+        version = record.get('version')
+        if version is None:
+            # Every shape pins its version; fall back to the committed metadata anyway.
+            metadata = source / 'src' / plugin / 'src' / record['version_file']['path'].lstrip('/')
+            version = json.loads(metadata.read_text()).get('product_version') if metadata.is_file() else None
+        published = list(published_versions(site, plugin, version or ''))
+        if not published:
+            findings.append((plugin, 'unpublished', str(version)))
+            continue
+        for package in published:
+            try:
+                verify_source_package(package, source, plugin=plugin)
+                findings.append((plugin, 'unchanged', str(version)))
+            except (ValueError, subprocess.CalledProcessError) as error:
+                findings.append((plugin, 'changed without a version bump', str(version) + ': ' + str(error)))
+    for plugin, state, detail in findings:
+        print(plugin + ': ' + state + (' (' + detail + ')' if detail else ''))
+    return findings
 
 
 if __name__ == '__main__':
@@ -276,10 +688,13 @@ if __name__ == '__main__':
     parser.add_argument('site', type=Path)
     parser.add_argument('--source', type=Path)
     parser.add_argument('--prepare', action='store_true')
+    parser.add_argument('--audit', action='store_true', help='report plugins whose source changed without a version bump')
     parser.add_argument('--source-commit')
     parser.add_argument('packages', nargs='*', type=Path)
     args = parser.parse_args()
     if args.prepare:
         prepare_release(args.site.resolve(), args.source.resolve(), args.source_commit or '', args.packages)
+    elif args.audit:
+        audit_versions(args.site.resolve(), args.source.resolve())
     else:
         verify(args.site.resolve(), args.source.resolve() if args.source else None)

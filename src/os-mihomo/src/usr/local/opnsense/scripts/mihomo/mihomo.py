@@ -191,6 +191,43 @@ GEO_SOURCE_DEFAULT = 'metacubex'
 GEO_UPDATE_HOURS = 24
 
 
+DEVICE_MODES = ('off', 'whitelist', 'blacklist')
+DEVICE_LIMIT = 64
+
+
+def device_networks(entries):
+    """Normalise each entry to a network, rejecting anything ambiguous."""
+    networks = []
+    for entry in entries or []:
+        if not isinstance(entry, str) or entry.strip() != entry or not entry:
+            raise Error('A device entry must be a single address or network.')
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            raise Error('Not an address or network: ' + entry) from None
+    if len(networks) > DEVICE_LIMIT:
+        raise Error('At most %d device entries may be listed.' % DEVICE_LIMIT)
+    return networks
+
+
+def device_rules(settings):
+    """Rules that decide which sources the proxy is allowed to carry.
+
+    Matching ends at the first rule that matches, so "listed devices follow the
+    provider rules" cannot be written as a match on the listed devices; it is
+    written as a match on everything else.
+    """
+    mode = settings.get('device_mode', 'off')
+    networks = device_networks(settings.get('device_list'))
+    if mode == 'off' or not networks:
+        return []
+    if mode == 'blacklist':
+        return ['SRC-IP-CIDR,%s,DIRECT' % net for net in networks]
+    matchers = ['(SRC-IP-CIDR,%s)' % net for net in networks]
+    inner = matchers[0] if len(matchers) == 1 else '(OR,(%s))' % ','.join(matchers)
+    return ['NOT,(%s),DIRECT' % inner]
+
+
 # What a subscription that ships no DNS policy gets instead of nothing. It sits
 # UNDER the subscription, so a provider that states its own dns block keeps it in
 # full: the two are never blended, because half of one policy and half of another
@@ -506,6 +543,7 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
         port = listener.get('port', 0)
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535 or port == 53:
             raise Error("Additional listeners cannot bind port 53.")
+    result['rules'] = device_rules(settings) + result.get('rules', [])
     if router_dns:
         if ipv6_advertised and not (result.get('ipv6') is True and dns.get('ipv6') is True):
             raise Error("Clients are being offered IPv6 while Mihomo IPv6 is disabled. Validate IPv6 before enabling router DNS.")
@@ -536,9 +574,9 @@ def atomic_write(path, content, mode=0o600):
 
 
 class System:
-    def run(self, args, timeout=45, check=True):
+    def run(self, args, timeout=45, check=True, cwd=None):
         try:
-            result = subprocess.run(args, capture_output=True, timeout=timeout)
+            result = subprocess.run(args, capture_output=True, timeout=timeout, cwd=cwd)
         except (subprocess.TimeoutExpired, OSError):
             raise Error("A system operation failed or timed out.") from None
         output = result.stdout + result.stderr
@@ -650,7 +688,11 @@ class System:
             pending.unlink(missing_ok=True)
             return
         self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound"], timeout=90)
-        self.run(["/usr/local/sbin/unbound-checkconf", "/var/unbound/unbound.conf"], timeout=30)
+        # Unbound resolves python-script and similar settings relative to its own
+        # directory, so a check run from anywhere else rejects a working config.
+        # OPNsense's own start.sh changes into it for the same reason.
+        self.run(["/usr/local/sbin/unbound-checkconf", "/var/unbound/unbound.conf"],
+                 timeout=30, cwd="/var/unbound")
         for args in (["unbound", "restart"], ["unbound", "cache", "flush"], ["filter", "reload"]):
             self.run(["/usr/local/sbin/configctl", *args], timeout=90)
         pending.unlink(missing_ok=True)
@@ -796,6 +838,9 @@ class Manager:
             raise Error("The rule database must be one of: " + ", ".join(GEO_SOURCES) + ".")
         for field in DNS_SERVER_FIELDS:
             check_dns_servers(field, settings.get(field) or [])
+        if settings.get('device_mode', 'off') not in DEVICE_MODES:
+            raise Error('The device policy must be one of: ' + ', '.join(DEVICE_MODES) + '.')
+        device_networks(settings.get('device_list'))
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
         controller = settings.get("controller", "127.0.0.1:9090")
@@ -1200,7 +1245,7 @@ class Manager:
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
                         'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
-                        *DNS_SERVER_FIELDS):
+                        'device_mode', 'device_list', *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
             if 'dashboard_any' in value:

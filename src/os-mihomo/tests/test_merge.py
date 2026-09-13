@@ -512,3 +512,69 @@ class OrphanPolicyTests(unittest.TestCase):
         self.assertEqual([], m.orphan_policy_keys(base, {'dns': {'nameserver-policy': {'geosite:private': ['system']}}}))
         self.assertEqual(['geosite:nowhere'],
                          m.orphan_policy_keys(base, {'dns': {'nameserver-policy': {'geosite:nowhere': ['1.1.1.1']}}}))
+
+
+class DevicePolicyTests(unittest.TestCase):
+    """Which sources the proxy may carry, expressed so matching order works."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+        m.absorb_switches(self.preset, self.settings)
+
+    def rendered(self, **settings):
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings},
+            overlay=copy.deepcopy(self.preset)))
+
+    def test_off_leaves_the_provider_rules_alone(self):
+        base = self.rendered()['rules']
+        self.assertEqual(base, self.rendered(device_mode='off',
+                                             device_list=['192.168.10.50'])['rules'])
+        # An empty list is the same as off, whatever the mode says.
+        self.assertEqual(base, self.rendered(device_mode='whitelist', device_list=[])['rules'])
+
+    def test_a_blacklist_sends_only_the_listed_sources_direct(self):
+        rules = self.rendered(device_mode='blacklist',
+                              device_list=['192.168.10.50', '192.168.10.0/24'])['rules']
+        self.assertEqual(['SRC-IP-CIDR,192.168.10.50/32,DIRECT',
+                          'SRC-IP-CIDR,192.168.10.0/24,DIRECT'], rules[:2])
+
+    def test_a_whitelist_matches_everything_it_does_not_list(self):
+        # Matching ends at the first hit, so the listed sources cannot be the
+        # ones matched: they are what is left over once everything else is out.
+        rules = self.rendered(device_mode='whitelist', device_list=['192.168.10.50'])['rules']
+        self.assertEqual('NOT,((SRC-IP-CIDR,192.168.10.50/32)),DIRECT', rules[0])
+        several = self.rendered(device_mode='whitelist',
+                                device_list=['192.168.10.50', '10.0.0.0/8'])['rules']
+        self.assertEqual('NOT,((OR,((SRC-IP-CIDR,192.168.10.50/32),'
+                         '(SRC-IP-CIDR,10.0.0.0/8)))),DIRECT', several[0])
+
+    def test_the_device_rules_sit_ahead_of_the_provider_rules(self):
+        rules = self.rendered(device_mode='blacklist', device_list=['192.168.10.50'])['rules']
+        self.assertEqual('SRC-IP-CIDR,192.168.10.50/32,DIRECT', rules[0])
+        self.assertIn('MATCH', rules[-1])
+
+    def test_the_router_dns_pins_stay_ahead_of_the_device_rules(self):
+        # Those pins keep the router's own encrypted DNS out of the tunnel; a
+        # device rule in front of them would decide that traffic instead.
+        settings = dict(self.settings, router_dns=True, device_mode='blacklist',
+                        device_list=['192.168.10.50'])
+        rules = m.parse_yaml(m.render(self.data, settings, overlay=copy.deepcopy(self.preset),
+            upstreams='forward-addr: 192.0.2.53@853'))['rules']
+        self.assertTrue(rules[0].startswith('IP-CIDR,192.0.2.53/32,DIRECT'), rules[0])
+        self.assertIn('SRC-IP-CIDR,192.168.10.50/32,DIRECT', rules[:6])
+
+    def test_entries_that_are_not_addresses_are_refused(self):
+        manager = m.Manager.__new__(m.Manager)
+        base = dict(self.settings, dns_fallback=True, service_enabled=True,
+                    device='router', subscription_url='')
+        manager.check_settings(dict(base, device_mode='whitelist',
+                                    device_list=['192.168.10.50', 'fd00::/64']))
+        for bad in (['not-an-ip'], ['192.168.10.50 '], [''], ['192.168.10.300'],
+                    ['1.2.3.4'] * (m.DEVICE_LIMIT + 1)):
+            with self.assertRaises(m.Error, msg=bad):
+                manager.check_settings(dict(base, device_mode='blacklist', device_list=bad))
+        with self.assertRaises(m.Error):
+            manager.check_settings(dict(base, device_mode='nonsense'))

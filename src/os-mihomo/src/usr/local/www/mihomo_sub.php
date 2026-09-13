@@ -60,7 +60,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'dns_hijack' => isset($_POST['dns_hijack']),
                         'dns_mode' => (string)($_POST['dns_mode'] ?? 'fake-ip'),
                         'dashboard_any' => isset($_POST['dashboard_any']),
-                        'geo_source' => (string)($_POST['geo_source'] ?? 'metacubex')];
+                        'geo_source' => (string)($_POST['geo_source'] ?? 'metacubex'),
+                        'device_mode' => (string)($_POST['device_mode'] ?? 'off'),
+                        'device_list' => array_values(preg_split('/[\s,]+/', (string)($_POST['device_list'] ?? ''), -1, PREG_SPLIT_NO_EMPTY))];
             foreach (['dns_default' => 'default-nameserver', 'dns_nameserver' => 'nameserver',
                       'dns_proxy_nameserver' => 'proxy-server-nameserver'] as $field => $_key) {
                 /* Commas and newlines both separate; an empty field inherits. */
@@ -279,6 +281,43 @@ include('fbegin.inc');
               <input type="checkbox" name="router_dns" value="1" <?=!empty($settings['router_dns']) ? 'checked="checked"' : ''?>>
               <div class="hidden" data-for="help_for_routerdns">
                 <?=gettext('Default off. Uses the router resolver and pins its DNS transport DIRECT. It leaves DNS hijacking, enhanced mode, and the router AAAA policy unchanged. Activation is refused if clients are offered IPv6 while Mihomo IPv6 is disabled.')?>
+              </div>
+            </td>
+          </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="content-box tab-content table-responsive __mb">
+        <table class="table table-striped opnsense_standard_table_form">
+          <thead>
+            <tr>
+              <td style="width:22%"><strong><?=gettext('Device policy')?></strong></td>
+              <td style="width:78%"></td>
+            </tr>
+          </thead>
+          <tbody>
+          <tr>
+            <td><a id="help_for_devmode" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Mode')?></td>
+            <td>
+              <select name="device_mode" class="selectpicker" data-style="btn-default" data-width="320px">
+                <?php foreach (['off' => gettext('Every device follows the subscription rules'),
+                                'whitelist' => gettext('Only the listed devices may use the proxy'),
+                                'blacklist' => gettext('The listed devices never use the proxy')] as $value => $label): ?>
+                  <option value="<?=mihomo_escape($value)?>" <?=($settings['device_mode'] ?? 'off') === $value ? 'selected="selected"' : ''?>><?=mihomo_escape($label)?></option>
+                <?php endforeach; ?>
+              </select>
+              <div class="hidden" data-for="help_for_devmode">
+                <?=gettext('Decides which sources the proxy is allowed to carry once transparent routing is on. Everything not covered goes out the ordinary way, so a device left off a whitelist keeps working -- it simply is not proxied. The router itself is never on the list, so with a whitelist its own traffic stays direct as well.')?>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td><a id="help_for_devlist" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Devices')?></td>
+            <td>
+              <textarea name="device_list" rows="4" class="form-control" spellcheck="false" style="font-family:monospace;font-size:12px" placeholder="192.168.10.50&#10;192.168.20.0/24"><?=mihomo_escape(implode("\n", $settings['device_list'] ?? []))?></textarea>
+              <div class="hidden" data-for="help_for_devlist">
+                <?=gettext('One address or network per line; a bare address means that host alone. Both IPv4 and IPv6 are accepted. An empty list leaves every device on the subscription rules whatever the mode says, so a half-finished list cannot cut the network off.')?>
               </div>
             </td>
           </tr>

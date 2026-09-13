@@ -388,3 +388,63 @@ class BaselineTests(unittest.TestCase):
         manager.check_settings(dict(base, geo_source='loyalsoldier'))
         with self.assertRaises(m.Error):
             manager.check_settings(dict(base, geo_source='nonexistent'))
+
+
+class DnsServerFieldTests(unittest.TestCase):
+    """Stated upstreams replace the subscription's; an empty field inherits them."""
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.data['dns'].update(nameserver=['https://provider.invalid/dns-query'],
+                                **{'default-nameserver': ['9.9.9.9'],
+                                   'proxy-server-nameserver': ['https://provider.invalid/dns-query']})
+        self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+            / 'share/mihomo/presets/full.yaml').read_bytes())
+
+    def generated(self, **settings):
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings},
+            overlay=copy.deepcopy(self.preset), upstreams='forward-addr: 192.0.2.53@853'))
+
+    def test_an_empty_field_leaves_the_subscription_servers_alone(self):
+        dns = self.generated()['dns']
+        self.assertEqual(['https://provider.invalid/dns-query'], dns['nameserver'])
+        self.assertEqual(['9.9.9.9'], dns['default-nameserver'])
+
+    def test_a_stated_field_replaces_them(self):
+        dns = self.generated(dns_nameserver=['tls://223.5.5.5', 'https://doh.pub/dns-query'],
+                             dns_default=['223.6.6.6'])['dns']
+        self.assertEqual(['tls://223.5.5.5', 'https://doh.pub/dns-query'], dns['nameserver'])
+        self.assertEqual(['223.6.6.6'], dns['default-nameserver'])
+        # Untouched fields still come from the subscription.
+        self.assertEqual(['https://provider.invalid/dns-query'], dns['proxy-server-nameserver'])
+
+    def test_router_dns_keeps_every_upstream_even_when_fields_are_stated(self):
+        dns = self.generated(router_dns=True, dns_nameserver=['tls://223.5.5.5'],
+                             dns_default=['223.6.6.6'])['dns']
+        for key in ('nameserver', 'proxy-server-nameserver', 'default-nameserver'):
+            self.assertEqual(['127.0.0.1'], dns[key], key)
+
+    def test_a_bootstrap_server_addressed_by_name_is_refused(self):
+        manager = m.Manager.__new__(m.Manager)
+        base = dict(self.settings, dns_fallback=True, service_enabled=True,
+                    device='router', subscription_url='')
+        manager.check_settings(dict(base, dns_default=['223.5.5.5', 'https://1.1.1.1/dns-query']))
+        # Nothing can resolve the name of the server that resolves names.
+        for bad in (['https://dns.alidns.com/dns-query'], ['tls://dot.pub'], ['system']):
+            with self.assertRaises(m.Error, msg=bad):
+                manager.check_settings(dict(base, dns_default=bad))
+        # Other fields accept names and the system resolver.
+        manager.check_settings(dict(base, dns_nameserver=['https://dns.alidns.com/dns-query', 'system']))
+        for bad in (['1.1.1.1 2.2.2.2'], [''], ['a'] * 9, 'not-a-list'):
+            with self.assertRaises(m.Error, msg=bad):
+                manager.check_settings(dict(base, dns_nameserver=bad))
+
+    def test_servers_written_by_hand_are_absorbed_into_the_fields(self):
+        overlay = {'dns': {'nameserver': ['tls://223.5.5.5'], 'enhanced-mode': 'fake-ip'}}
+        lifted = m.absorb_switches(overlay, self.settings)
+        self.assertEqual(['tls://223.5.5.5'], lifted['dns_nameserver'])
+        self.assertNotIn('dns', overlay)
+        self.assertEqual([], m.switch_overrides({'dns': {}}))
+        self.assertEqual(['dns_nameserver'],
+                         m.switch_overrides({'dns': {'nameserver': 'not-a-list'}}))

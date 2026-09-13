@@ -227,6 +227,46 @@ def baseline(data):
     return {'dns': copy.deepcopy(BASELINE_DNS)}
 
 
+# DNS upstreams the user may state instead of the ones the subscription ships.
+# An empty list means "whatever the subscription provides", never "none".
+DNS_SERVER_FIELDS = {'dns_default': 'default-nameserver', 'dns_nameserver': 'nameserver',
+                     'dns_proxy_nameserver': 'proxy-server-nameserver'}
+DNS_SERVER_LIMIT = 8
+# Accepted beside an address: mihomo resolves these through the host itself.
+DNS_SERVER_ALIASES = ('system', 'dhcp')
+
+
+def dns_server_host(value):
+    """The host a DNS upstream points at, whatever syntax states it."""
+    text = value.split('#', 1)[0]
+    if '://' in text:
+        text = text.split('://', 1)[1].split('/', 1)[0]
+    if text.startswith('['):
+        return text[1:].split(']', 1)[0]
+    # A single colon is a port; several mean the address itself is IPv6.
+    return text.rsplit(':', 1)[0] if text.count(':') == 1 else text
+
+
+def check_dns_servers(field, values):
+    if not isinstance(values, list) or len(values) > DNS_SERVER_LIMIT:
+        raise Error("At most %d DNS servers may be listed per field." % DNS_SERVER_LIMIT)
+    for value in values:
+        if (not isinstance(value, str) or not value.strip() or value != value.strip()
+                or any(char in value for char in " \t\r\n\x00")):
+            raise Error("A DNS server must be a single address without spaces.")
+        if value in DNS_SERVER_ALIASES and field != 'dns_default':
+            continue
+        if field != 'dns_default':
+            continue
+        # Bootstrap servers resolve the other servers, so nothing can resolve them,
+        # and mihomo itself rejects anything here that is not a bare address.
+        try:
+            ipaddress.ip_address(dns_server_host(value))
+        except ValueError:
+            raise Error("Default nameservers must be addressed by literal IP, because "
+                        "they are what resolves every other server: " + value) from None
+
+
 # Simple switches for the settings a user changes most often. They are applied
 # UNDER the merge YAML, so a hand-written override always wins. When an overlay
 # states one of these keys in its canonical form, absorb_switches() lifts it into
@@ -243,7 +283,7 @@ ANY_CONTROLLER = '0.0.0.0:%d' % CONTROLLER_PORT
 def switch_overlay(settings):
     """Base overlay produced by the simple switches."""
     ipv6 = bool(settings.get('ipv6', False))
-    return {
+    overlay = {
         'ipv6': ipv6,
         'dns': {'ipv6': ipv6,
                 'enhanced-mode': settings.get('dns_mode', DNS_MODE_DEFAULT)},
@@ -251,6 +291,13 @@ def switch_overlay(settings):
         'geox-url': dict(GEO_SOURCES[settings.get('geo_source') or GEO_SOURCE_DEFAULT]),
         'geodata-mode': True, 'geo-auto-update': True, 'geo-update-interval': GEO_UPDATE_HOURS,
     }
+    # Router DNS owns every upstream, so a stated server would contradict it.
+    if not settings.get('router_dns'):
+        for field, key in DNS_SERVER_FIELDS.items():
+            stated = settings.get(field)
+            if stated:
+                overlay['dns'][key] = list(stated)
+    return overlay
 
 
 def switch_conflicts(rendered, settings):
@@ -299,6 +346,12 @@ def absorb_switches(overlay, settings):
         if host in ('127.0.0.1', '0.0.0.0') and port.isdigit():
             settings['controller'] = controller
             overlay.pop('external-controller')
+
+    for field, key in DNS_SERVER_FIELDS.items():
+        stated = dns.get(key)
+        if isinstance(stated, list) and all(isinstance(v, str) for v in stated):
+            settings[field] = list(stated)
+            dns.pop(key)
 
     urls = overlay.get('geox-url')
     if isinstance(urls, dict):
@@ -360,6 +413,7 @@ def switch_overrides(overlay):
         out.append('dns_hijack')
     if 'geox-url' in probe:
         out.append('geo_source')
+    out.extend(field for field, key in DNS_SERVER_FIELDS.items() if key in dns)
     return out
 
 
@@ -710,6 +764,8 @@ class Manager:
             raise Error("The DNS mode must be one of: " + ", ".join(DNS_MODES) + ".")
         if settings.get('geo_source', GEO_SOURCE_DEFAULT) not in GEO_SOURCES:
             raise Error("The rule database must be one of: " + ", ".join(GEO_SOURCES) + ".")
+        for field in DNS_SERVER_FIELDS:
+            check_dns_servers(field, settings.get(field) or [])
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
         controller = settings.get("controller", "127.0.0.1:9090")
@@ -1104,7 +1160,8 @@ class Manager:
             value = json.loads(Path(argument).read_bytes())
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
-                        'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source'):
+                        'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
+                        *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
             if 'dashboard_any' in value:

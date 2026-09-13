@@ -61,6 +61,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'dns_mode' => (string)($_POST['dns_mode'] ?? 'fake-ip'),
                         'dashboard_any' => isset($_POST['dashboard_any']),
                         'geo_source' => (string)($_POST['geo_source'] ?? 'metacubex')];
+            foreach (['dns_default' => 'default-nameserver', 'dns_nameserver' => 'nameserver',
+                      'dns_proxy_nameserver' => 'proxy-server-nameserver'] as $field => $_key) {
+                /* Commas and newlines both separate; an empty field inherits. */
+                $entries = preg_split('/[\s,]+/', (string)($_POST[$field] ?? ''), -1, PREG_SPLIT_NO_EMPTY);
+                $payload[$field] = array_values($entries);
+            }
             $result = mihomo_action($action, json_encode($payload));
         } elseif ($action === 'sub-update' || $action === 'clear-sub-log') {
             $result = mihomo_action($action);
@@ -73,6 +79,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 $settings = mihomo_settings();
 $overrides = mihomo_overrides();
+$effective = mihomo_effective_dns();
 include('head.inc');
 include('fbegin.inc');
 ?>
@@ -179,6 +186,42 @@ include('fbegin.inc');
               <?=mihomo_override_badge($overrides, 'dns_hijack')?>
               <div class="hidden" data-for="help_for_hijack">
                 <?=gettext('Default on. Redirects DNS queries that enter the tunnel to Mihomo. Required for fake-ip. Turn it off to leave client DNS entirely to the router resolver. This switch only takes effect while transparent routing is enabled.')?>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td><a id="help_for_dns_default" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Bootstrap servers')?></td>
+            <td>
+              <input type="text" class="form-control" name="dns_default" autocomplete="off" spellcheck="false"
+                     value="<?=mihomo_escape(implode(', ', $settings['dns_default'] ?? []))?>"
+                     placeholder="<?=mihomo_escape(implode(', ', $effective['default-nameserver']) ?: gettext('from the subscription'))?>">
+              <?=mihomo_override_badge($overrides, 'dns_default')?>
+              <div class="hidden" data-for="help_for_dns_default">
+                <?=gettext('Resolves the other servers below, so every entry must be a literal IP address: a name here has nothing left to resolve it. Mihomo refuses anything else. Leave empty to use what the subscription provides.')?>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td><a id="help_for_dns_nameserver" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Nameservers')?></td>
+            <td>
+              <input type="text" class="form-control" name="dns_nameserver" autocomplete="off" spellcheck="false"
+                     value="<?=mihomo_escape(implode(', ', $settings['dns_nameserver'] ?? []))?>"
+                     placeholder="<?=mihomo_escape(implode(', ', $effective['nameserver']) ?: gettext('from the subscription'))?>">
+              <?=mihomo_override_badge($overrides, 'dns_nameserver')?>
+              <div class="hidden" data-for="help_for_dns_nameserver">
+                <?=gettext('The upstreams used for names no per-domain policy matches. Accepts a plain address, https:// for DoH, tls:// for DoT, quic://, or system to hand the query to the router resolver. Leave empty to use what the subscription provides.')?>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td><a id="help_for_dns_proxy_nameserver" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> <?=gettext('Proxy node servers')?></td>
+            <td>
+              <input type="text" class="form-control" name="dns_proxy_nameserver" autocomplete="off" spellcheck="false"
+                     value="<?=mihomo_escape(implode(', ', $settings['dns_proxy_nameserver'] ?? []))?>"
+                     placeholder="<?=mihomo_escape(implode(', ', $effective['proxy-server-nameserver']) ?: gettext('from the subscription'))?>">
+              <?=mihomo_override_badge($overrides, 'dns_proxy_nameserver')?>
+              <div class="hidden" data-for="help_for_dns_proxy_nameserver">
+                <?=gettext('Resolves the proxy nodes themselves. This lookup has to succeed over the direct path before any proxy can be reached, so keep it on an upstream that works without the tunnel. Leave empty to use what the subscription provides.')?>
               </div>
             </td>
           </tr>

@@ -2,7 +2,7 @@
 
 An independent `os-mihomo` fork for **OPNsense 26.7 / FreeBSD:15:amd64**, distributed through a signed package repository.
 
-Fresh installation and unrecognized legacy migration run loopback proxy ports without taking over LAN routing or DNS. After 1.1.2 establishes managed state, upgrades and reinstalls preserve explicit transparent consent and administrative Stop. Older unmarked state requires one explicit re-enable. Complete subscription YAML is fetched directly, keeping nodes, groups, rules and dashboard credentials. Local merge YAML and full/tun-only/proxy-only presets control routing and DNS; automatic recovery is configurable per router.
+Fresh installation and unrecognized legacy migration run loopback proxy ports without taking over LAN routing or DNS. After 1.1.2 establishes managed state, upgrades and reinstalls preserve explicit transparent consent and administrative Stop. Older unmarked state requires one explicit re-enable. Complete subscription YAML is fetched directly, keeping nodes, groups, rules and dashboard credentials. The settings changed most often are switches on the page: IPv6, DNS mode, whether client DNS is captured, which rule database is downloaded, and the three sets of DNS upstreams, each inheriting the subscription's own value when left empty. Hand-written YAML still wins and is reported where it does. Local merge YAML and full/tun-only/proxy-only presets control the rest of routing and DNS; automatic recovery is configurable per router.
 
 - [Plugin configuration and build guide](src/os-mihomo/README.US.md)
 - [Design and verification](src/os-mihomo/DESIGN.md)

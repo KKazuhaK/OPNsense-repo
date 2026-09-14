@@ -28,8 +28,8 @@ Preserve a local legacy repo tree for compatibility downloads. Use the exact cle
 SOURCE_COMMIT=<tested-40-character-commit> \
   LEGACY_REPO=/path/to/legacy/repo \
   sh build-repo.sh src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.2.3.pkg \
-    src/os-sing-box/dist/os-sing-box-1.0.3.pkg \
-    src/os-kazuha-repo/dist/os-kazuha-repo-1.0.0.pkg
+    src/os-sing-box/dist/os-sing-box-1.1.1.pkg \
+    src/os-kazuha-repo/dist/os-kazuha-repo-1.0.1.pkg
 python3 verify-repo.py .site --source .
 ```
 

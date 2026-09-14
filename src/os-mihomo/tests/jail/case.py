@@ -105,6 +105,10 @@ Path('/usr/local/etc/mihomo/config.yaml').write_bytes(source)
 Path('/usr/local/etc/mihomo/sub/env').write_text("mihomo_URL='https://example.invalid/private/SENTINEL_TOKEN'\nmihomo_secret='legacy-secret'\n")
 Path('/var/unbound/etc/dot.conf').write_text('forward-zone:\n name: "."\n forward-addr: 192.0.2.53@853#gateway.test\n forward-addr: 2001:db8::53@853#gateway.test\n')
 Path('/root/actions.log').write_text('')
+# A cached prepared filesystem may retain DNS from an earlier failed core.
+# Reset the generated private XML's resolver before any package starts a core.
+command(['/usr/local/sbin/configctl', 'dns', 'reload'])
+assert host_dns_restored()
 # Execute the real upgrade; the old published removal hooks remain unmodified.
 # The repository solver sets PKG_UPGRADE and executes the old removal hooks.
 new_manifest = json.loads(command(['/usr/bin/tar', '-xOf', '/root/new.pkg', '+MANIFEST']).stdout)

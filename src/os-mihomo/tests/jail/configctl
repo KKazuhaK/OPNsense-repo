@@ -2,6 +2,7 @@
 """Run the real resolver with synthetic templates inside the VNET jail."""
 from pathlib import Path
 import ipaddress
+import json
 import os
 import re
 import subprocess
@@ -14,6 +15,39 @@ with Path('/root/actions.log').open('a') as stream:
     stream.write('configctl ' + ' '.join(args) + '\n')
 if Path('/root/fail-configctl').exists():
     print('Execute error')
+    sys.exit(0)
+if args == ['filter', 'reload']:
+    # Only configd's context/template plumbing is synthetic. Invoke the
+    # packaged context parser against genuine jail ifconfig output, and let
+    # the manager invoke the unchanged native routing.py separately.
+    root = ET.parse('/conf/config.xml').getroot()
+    mapping = {node.tag: {child.tag: child.text or '' for child in node}
+               for node in root.findall('./interfaces/*')}
+    php = '''require_once('/usr/local/etc/inc/plugins.inc.d/mihomo.inc');
+        echo json_encode(mihomo_routing_context(json_decode(stream_get_contents(STDIN), true),
+            explode("\\n", shell_exec('/sbin/ifconfig -a'))), JSON_THROW_ON_ERROR);'''
+    result = subprocess.run(['/usr/local/bin/php', '-r', php], input=json.dumps(mapping).encode(),
+                            capture_output=True, check=True)
+    context = json.loads(result.stdout)
+    descriptor, temporary = tempfile.mkstemp(prefix='.routing-context-test-', dir='/var/db/os-mihomo')
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(context, stream)
+        os.replace(temporary, '/var/db/os-mihomo/routing-context.json')
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    # A non-quick head anchor selects a FIB without granting permission.
+    # This lifecycle-only jail has no LAN clients; packet policy is tested
+    # separately with the three-party native PF/Core fixture.
+    rules = ['set skip on lo0', 'anchor "mihomo" all']
+    if any(mapping.get(rule.findtext('interface'), {}).get('if') == 'tun_mihomo'
+           for rule in root.findall('./filter/rule')):
+        rules.append('pass in on tun_mihomo inet from any to any keep state')
+    rules.extend(['pass in all keep state', 'pass out all keep state'])
+    Path('/root/filter-test.conf').write_text('\n'.join(rules) + '\n')
+    subprocess.run(['/sbin/pfctl', '-nf', '/root/filter-test.conf'], check=True)
+    subprocess.run(['/sbin/pfctl', '-f', '/root/filter-test.conf'], check=True)
     sys.exit(0)
 if args == ['dns', 'reload']:
     # This adapter models only the generated private fixture's DNS settings.

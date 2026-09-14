@@ -12,17 +12,21 @@
 
 当前内置 FreeBSD 核心的 TUN 仅支持 `gvisor`。`system` 和 `mixed` 的 TCP 路径会错误地将流量判为广播，因此插件拒绝用这两种栈启用透明代理；启用前选择 gVisor。此限制针对当前内置核心，后续核心需重新验证。
 
-启用 `auto-route` 的 TUN 也可能接走 WAN 端口转发（DNAT）按普通路由返回的流量。多 WAN 部署须验证入站连接的 PF 状态将回包通过 `reply-to` 送回正确 WAN 网关。NAT 的内联 **Pass** 会跳过后续过滤规则，不能依靠 LAN 源设备策略保证回程。**Register rule** 创建关联 WAN 过滤规则；只有正确配置该 WAN 网关、且未全局或单条禁用 `reply-to` 时，才能依赖其默认回程绑定。若禁用了 `reply-to`，须由管理员配置并确认具有状态及正确回程绑定的 WAN 规则。详见官方 [NAT 规则关联](https://docs.opnsense.org/manual/nat.html#filter-rule-association)、[WAN 回程规则](https://docs.opnsense.org/manual/firewall.html)和 [Disable reply-to](https://docs.opnsense.org/manual/firewall_settings.html#disable-reply-to)。
+设备策略在流量进入 TUN 前按 LAN 源地址选择 TCP/UDP：黑名单中的地址绕过 TUN，白名单只有列出的地址进入 TUN；关闭设备筛选或列表为空时，所有符合接管条件的 LAN 源的 TCP/UDP 进入 TUN。ICMP 及其他控制流量沿用普通路由。绕过的设备沿用现有路由，不经过 Mihomo 的 `DIRECT` 转发。进入 TUN 的流量再遵循订阅和合并规则。用户已有防火墙允许/阻止规则及路由策略仍生效；路由器自身流量和 WAN 入站流量不接管。正常有状态防火墙/NAT 规则下，已建立 DNAT 连接的回包沿用既有状态和正确配置的回程路由。手动配置 HTTP/SOCKS 代理的客户端不受此设备筛选限制。
 
-NAT 与 WAN 网关由管理员维护，插件不自动重写；1.2.2 未修复或改变上述回程策略。排查时查看路由、有效 PF 规则和状态，并同时抓取 WAN、LAN、TUN 的新连接；必要时仅清除受影响的旧状态。命令与示例见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。
+插件关闭核心 `auto-route`，通过独立的源策略选择 LAN 流量，避免用 TUN 路由接管普通路由表中的公网目的地址。设备识别依据 IP 地址；请使用稳定地址或 DHCP 保留，并覆盖设备实际使用的全部地址。当前支持范围仍为 IPv4 客户端，IPv6 需要独立端到端验证；私有 jail 的 IPv6 检查不代表客户端端到端支持。部署前验证黑名单、白名单、空列表、用户阻止规则及自定义路由策略；这项修复不代替目标原生环境的验收。
 
-合并文件不能改变 `tun_mihomo` 设备名、覆盖持久化 secret、让任何监听器占用 53，或绕过未启用的 TUN 守卫。DNS 集成支持 `127.0.0.1:1053`，自定义监听器由管理员管理。
+多 WAN 的 DNAT 回程仍由管理员维护，系统中的 WAN 回程路由需正确。插件不重写 NAT、WAN 网关或 `reply-to`；不会修复原本错误的回程配置。需要固定回程 WAN 的连接应有正确的有状态 WAN 规则及 `reply-to`。NAT 内联 **Pass** 跳过后续过滤规则；**Register rule** 的默认回程绑定要求正确的 WAN 网关，且未全局或单条禁用 `reply-to`。详见官方 [NAT 规则关联](https://docs.opnsense.org/manual/nat.html#filter-rule-association)、[WAN 回程规则](https://docs.opnsense.org/manual/firewall.html)和 [Disable reply-to](https://docs.opnsense.org/manual/firewall_settings.html#disable-reply-to)。排查时查看路由、有效 PF 规则和状态，并抓取 WAN、LAN、TUN 的新连接。策略变更后已有连接可继续使用旧状态；必要时仅清除受影响的旧状态，不清空整个状态表。命令与示例见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。
 
-“通过路由器 DNS 解析”默认关闭。开启时仅覆盖 nameserver、proxy-server-nameserver、default-nameserver、nameserver-policy 四项；不改变 DNS 劫持、增强模式和 Unbound 的 AAAA 策略。根据本机 DoT 配置为 IPv4/IPv6 上游地址和 853 端口注入优先 DIRECT 规则，上游改变时自动刷新，避免节点解析死锁。该模式不把 Unbound 再转发给 Mihomo；必须移除订阅的 DNS fallback，上游不可用时明确失败。
+透明模式必须使用返回真实地址的 DNS。默认并推荐 `redir-host`，也支持 `normal`；绕过 TUN 的设备无法依赖 Mihomo 处理 fake-IP 占位地址。透明模式关闭时可以保留旧的 `fake-ip` 选择；启用透明模式或在透明模式下应用配置时，最终生效的 `fake-ip`（包括合并文件覆盖）会自动转换为 `redir-host`，并将该选择保存回设置。绕过设备继续使用原有 DNS 路径，共享解析器也必须返回真实地址；已有 fake-IP 缓存可能需要清除或等待过期。
+
+合并文件不能改变 `tun_mihomo` 设备名、覆盖持久化 secret、让任何监听器占用 53，或绕过透明模式的启用守卫与真实 DNS 约束。DNS 集成支持 `127.0.0.1:1053`，自定义监听器由管理员管理。
+
+“通过路由器 DNS 解析”默认关闭。开关本身仅覆盖 nameserver、proxy-server-nameserver、default-nameserver、nameserver-policy 四项，不改变 DNS 劫持或 Unbound 的 AAAA 策略；透明模式另行强制真实 DNS。根据本机 DoT 配置为 IPv4/IPv6 上游地址和 853 端口注入优先 DIRECT 规则，上游改变时自动刷新，避免节点解析死锁。该模式不把 Unbound 再转发给 Mihomo；必须移除订阅的 DNS fallback，上游不可用时明确失败。
 
 当前发布范围是 IPv4 客户端。若 RA/DHCPv6 已向客户端提供 IPv6，而 Mihomo IPv6 关闭，插件拒绝启用；运行中出现这种变化会提示。未来启用客户端 IPv6 应作为独立项目完成端到端验证。
 
-核心异常退出后总会清除 TUN 路由；默认自动恢复原有直连 DNS，每台可配置。显式 Stop 即使 DNS 恢复失败也停止核心和 TUN，随后重试 DNS 恢复。WAN 事件不会重新启动手动停止的服务。关闭透明模式仅清除插件创建的接口和规则。
+核心异常退出后清除插件的透明接管策略和 TUN 路由；默认自动恢复原有直连 DNS，每台可配置。显式 Stop 即使 DNS 恢复失败也停止核心和透明接管，随后重试 DNS 恢复。WAN 事件不会重新启动手动停止的服务。关闭透明模式仅清除插件创建的接口、策略和路由，不清空防火墙状态表。
 
 启动时在本机记录核心写入的系统 DNS 指纹。异常退出后通过 OPNsense 原生 DNS 重载恢复系统解析，失败会重试；用户后来修改的解析文件或显式配置的 DNS 不会被覆盖。这份临时恢复记录不进入 XML 备份。
 
@@ -30,4 +34,4 @@ NAT 与 WAN 网关由管理员维护，插件不自动重写；1.2.2 未修复�
 
 构建使用目标 Python minor，并核对实际版本与声明的依赖一致；当前为 `python3.13` / `python313`。排除 `__pycache__`、`.pyc`、`.pyo`，且在暂存区和最终归档再次检查。
 
-在目标原生环境运行 `sh build.sh`，当前生成 `dist/FreeBSD:15:amd64/os-mihomo-1.2.2.pkg`。`TARGET_ABI`、`TARGET_PRODUCT_ABI`、`TARGET_PYTHON` 可显式指定，实际内核、用户空间、Python 和依赖必须匹配；不能在 FreeBSD 15 上给包换标签冒充 16。已启用配方定义发布目录，未公布的下一版保持禁用。发布必须具备每个目标与包摘要匹配的真实 VNET jail 报告，Pages 再验证源码、测试和包内容。安装后调用官方窄范围插件登记。1.1.2 管理状态建立后的重装保留显式 TUN 选择和行政 Stop；未知旧状态仍安全关闭 TUN。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。
+在目标原生环境运行 `sh build.sh`，当前生成 `dist/FreeBSD:15:amd64/os-mihomo-1.2.3.pkg`。`TARGET_ABI`、`TARGET_PRODUCT_ABI`、`TARGET_PYTHON` 可显式指定，实际内核、用户空间、Python 和依赖必须匹配；不能在 FreeBSD 15 上给包换标签冒充 16。已启用配方定义发布目录，未公布的下一版保持禁用。发布必须具备每个目标与包摘要匹配的真实 VNET jail 报告，Pages 再验证源码、测试和包内容。安装后调用官方窄范围插件登记。1.1.2 管理状态建立后的重装保留显式 TUN 选择和行政 Stop；未知旧状态仍安全关闭 TUN。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。

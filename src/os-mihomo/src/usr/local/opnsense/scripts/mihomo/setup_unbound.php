@@ -199,6 +199,22 @@ function mihomoConsentScope(DOMXPath $xpath): string
         ? hash('sha256', implode('|', $identity)) : '';
 }
 
+function mihomoPristineTunRule(DOMXPath $xpath, DOMElement $rule, string $target): bool
+{
+    if ($xpath->query('./*', $rule)->length !== 6
+        || $xpath->query('./source/*', $rule)->length !== 1
+        || $xpath->query('./destination/*', $rule)->length !== 1
+        || trim($xpath->evaluate('string(./type)', $rule)) !== 'pass'
+        || trim($xpath->evaluate('string(./interface)', $rule)) !== $target
+        || trim($xpath->evaluate('string(./descr)', $rule)) !== 'Mihomo TUN Allow'
+        || $xpath->query('./destination/any', $rule)->length !== 1) {
+        return false;
+    }
+    $family = trim($xpath->evaluate('string(./ipprotocol)', $rule));
+    return ($family === 'inet' && trim($xpath->evaluate('string(./source/network)', $rule)) === $target)
+        || ($family === 'inet46' && $xpath->query('./source/any', $rule)->length === 1);
+}
+
 function mihomoEnsureTun(DOMDocument $doc, DOMXPath $xpath, string $statePath): void
 {
     $saved = mihomoState($statePath);
@@ -247,12 +263,25 @@ function mihomoEnsureTun(DOMDocument $doc, DOMXPath $xpath, string $statePath): 
         $filter->appendChild($rule);
         mihomoChild($doc, $rule, 'type', 'pass');
         mihomoChild($doc, $rule, 'interface', $target);
-        mihomoChild($doc, $rule, 'ipprotocol', 'inet');
+        mihomoChild($doc, $rule, 'ipprotocol', 'inet46');
         $source = mihomoChild($doc, $rule, 'source');
-        mihomoChild($doc, $source, 'network', $target);
+        mihomoChild($doc, $source, 'any');
         $destination = mihomoChild($doc, $rule, 'destination');
         mihomoChild($doc, $destination, 'any');
         mihomoChild($doc, $rule, 'descr', 'Mihomo TUN Allow');
+    } elseif ($saved !== null && $saved['created_rule']
+        && mihomoPristineTunRule($xpath, $existingRule, $target)
+        && trim($xpath->evaluate('string(./ipprotocol)', $existingRule)) === 'inet') {
+        /* Core-injected replies have remote source addresses, including IPv6.
+           Migrate only the original plugin-owned rule; edited rules remain
+           administrator-owned. Ordinary LAN pass/block rules still decide
+           whether a new connection can reach the core in the first place. */
+        $existingRule->getElementsByTagName('ipprotocol')->item(0)->nodeValue = 'inet46';
+        $source = $existingRule->getElementsByTagName('source')->item(0);
+        while ($source->firstChild !== null) {
+            $source->removeChild($source->firstChild);
+        }
+        mihomoChild($doc, $source, 'any');
     }
 }
 
@@ -264,19 +293,33 @@ function mihomoCronCommand(string $command): bool
 
 function mihomoRemoveTun(DOMXPath $xpath, ?array $tun): void
 {
-    $node = $tun !== null ? $xpath->query('/opnsense/interfaces/' . $tun['interface'])->item(0) : null;
-    $assigned = !$node instanceof DOMElement || trim($xpath->evaluate('string(./if)', $node)) === 'tun_mihomo';
-    if ($tun !== null && $tun['created_interface']) {
-        if ($node instanceof DOMElement && $assigned) {
-            $node->parentNode->removeChild($node);
-        }
+    if ($tun === null) {
+        return;
     }
-    if ($tun !== null && $tun['created_rule'] && $assigned) {
-        foreach ($xpath->query('/opnsense/filter/rule[@uuid="' . RULE_UUID . '"]') as $node) {
-            if (trim($xpath->evaluate('string(./interface)', $node)) === $tun['interface']) {
-                $node->parentNode->removeChild($node);
+    $node = $xpath->query('/opnsense/interfaces/' . $tun['interface'])->item(0);
+    $assigned = !$node instanceof DOMElement || trim($xpath->evaluate('string(./if)', $node)) === 'tun_mihomo';
+    if (!$assigned) {
+        return;
+    }
+    if ($tun['created_rule']) {
+        foreach ($xpath->query('/opnsense/filter/rule[@uuid="' . RULE_UUID . '"]') as $rule) {
+            if (mihomoPristineTunRule($xpath, $rule, $tun['interface'])) {
+                $rule->parentNode->removeChild($rule);
             }
         }
+    }
+    /* An edited rule or another service can now depend on the assignment.
+       Relinquish ownership instead of deleting the administrator's settings. */
+    foreach ($xpath->query('/opnsense/filter/rule/interface | /opnsense/nat/rule/interface') as $reference) {
+        if (in_array($tun['interface'], preg_split('/[\s,]+/', trim($reference->textContent)), true)) {
+            return;
+        }
+    }
+    if ($tun['created_interface'] && $node instanceof DOMElement
+        && $xpath->query('./*', $node)->length === 3
+        && trim($xpath->evaluate('string(./descr)', $node)) === 'Mihomo TUN'
+        && trim($xpath->evaluate('string(./enable)', $node)) === '1') {
+        $node->parentNode->removeChild($node);
     }
 }
 

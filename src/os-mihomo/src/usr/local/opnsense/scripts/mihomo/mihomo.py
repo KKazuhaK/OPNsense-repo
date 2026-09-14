@@ -45,6 +45,7 @@ ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1
 SCRIPT = "/usr/local/opnsense/scripts/mihomo/mihomo.py"
 HELPER = "/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
+ROUTING_HELPER = "/usr/local/opnsense/scripts/mihomo/routing.py"
 MIRROR_HELPER = "/usr/local/opnsense/scripts/mihomo/config_mirror.php"
 STATE = "/var/db/os-mihomo"
 HOME = STATE + "/home"
@@ -190,12 +191,7 @@ def advertises_ipv6(content):
 
 
 DNS_MODES = ('fake-ip', 'redir-host', 'normal')
-DNS_MODE_DEFAULT = 'fake-ip'
-# Mihomo defaults fake-ip-range but not its IPv6 counterpart, and builds no IPv6
-# pool without one: AAAA answers then have no fake address to return, silently,
-# because a valid IPv4 pool is enough to pass its own validation. The default
-# mirrors the IPv4 side by using the benchmarking range reserved for this.
-FAKE_IP_RANGE6_DEFAULT = '2001:2::/64'
+DNS_MODE_DEFAULT = 'redir-host'
 HIJACK_TARGETS = ['any:53', 'tcp://any:53']
 # Rule databases, as verified reachable sets. A category that one source does not
 # publish makes every rule naming it fail, so the sets are never mixed.
@@ -392,6 +388,29 @@ def device_rules(settings):
     matchers = ['(SRC-IP-CIDR,%s)' % net for net in networks]
     inner = matchers[0] if len(matchers) == 1 else '(OR,(%s))' % ','.join(matchers)
     return ['NOT,(%s),DIRECT' % inner]
+
+
+def routing_settings(settings):
+    """Bypassed clients need DNS answers usable on their ordinary route."""
+    result = dict(settings)
+    if result.get('transparent') and result.get('dns_mode') == 'fake-ip':
+        result['dns_mode'] = 'redir-host'
+    return result
+
+
+def device_routing_policy(settings):
+    """Describe source selection without exposing firewall implementation."""
+    if not settings.get('transparent'):
+        return []
+    mode = settings.get('device_mode', 'off')
+    networks = device_networks(settings.get('device_list'))
+    if mode == 'off' or not networks:
+        return ['Internal devices may enter TUN.',
+                'Router traffic and WAN connections bypass TUN.']
+    action = 'Enter TUN' if mode == 'whitelist' else 'Bypass TUN'
+    other = 'Other devices bypass TUN.' if mode == 'whitelist' else 'Other internal devices may enter TUN.'
+    return [action + ': ' + str(net) for net in networks] + [other,
+            'Router traffic and WAN connections bypass TUN.']
 
 
 # What a subscription that ships no DNS policy gets instead of nothing. It sits
@@ -738,21 +757,12 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
         tun.update(enable=False, **{'auto-route': False, 'strict-route': False, 'dns-hijack': []})
         dns.update(enable=False, listen='')
     tun['device'] = 'tun_mihomo'
-    if enabled and tun.get('enable') and dns.get('enable') and dns.get("enhanced-mode") == "fake-ip":
-        try:
-            network = ipaddress.ip_network(dns.get("fake-ip-range", "198.18.0.1/16"), strict=False)
-        except ValueError:
-            raise Error("The fake-IP range is invalid.") from None
-        if network.version != 4 or not network.subnet_of(ipaddress.ip_network("198.18.0.0/15")):
-            raise Error("The fake-IP range must stay within 198.18.0.0/15.")
-        if dns.get('ipv6') is True:
-            dns.setdefault('fake-ip-range6', FAKE_IP_RANGE6_DEFAULT)
-            try:
-                network6 = ipaddress.ip_network(dns['fake-ip-range6'], strict=False)
-            except ValueError:
-                raise Error("The IPv6 fake-IP range is invalid.") from None
-            if network6.version != 6 or network6.is_global:
-                raise Error("The IPv6 fake-IP range must not be globally routable.")
+    # Transparent routing belongs to the plugin's source policy, never FIB0.
+    # Enforce this after merging so subscription/merge YAML cannot re-enable
+    # the global routes that also capture unrelated DNAT replies.
+    tun.update(**{'auto-route': False, 'strict-route': False, 'auto-redirect': False})
+    if tun.get('enable') and dns.get('enable') and dns.get('enhanced-mode') == 'fake-ip':
+        dns['enhanced-mode'] = 'redir-host'
     result["dns"] = dns
     result['tun'] = tun
     result.update({
@@ -777,7 +787,7 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
         port = listener.get('port', 0)
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535 or port == 53:
             raise Error("Additional listeners cannot bind port 53.")
-    result['rules'] = device_rules(settings) + result.get('rules', [])
+    result['rules'] = ([] if tun.get('enable') else device_rules(settings)) + result.get('rules', [])
     if router_dns:
         if ipv6_advertised and not (result.get('ipv6') is True and dns.get('ipv6') is True):
             raise Error("Clients are being offered IPv6 while Mihomo IPv6 is disabled. Validate IPv6 before enabling router DNS.")
@@ -808,6 +818,9 @@ def atomic_write(path, content, mode=0o600):
 
 
 class System:
+    def routing(self, action):
+        return self.run(['/usr/local/bin/python3', ROUTING_HELPER, action], timeout=90)
+
     def run(self, args, timeout=45, check=True, cwd=None, input=None):
         try:
             options = {'input': input} if input is not None else {}
@@ -873,8 +886,7 @@ class System:
                 if transparent:
                     interface = self.run(['/sbin/ifconfig', 'tun_mihomo'], check=False)
                     present = interface.returncode == 0
-                    routed = not data.get('tun', {}).get('auto-route') or b'tun_mihomo' in self.run(['/sbin/route', '-n', 'get', '8.8.8.8'], check=False).stdout
-                    if not (present and routed):
+                    if not present:
                         time.sleep(0.5)
                         continue
                     # FreeBSD clears TUN addresses as soon as the last core
@@ -897,6 +909,11 @@ class System:
         raise Error("Mihomo did not become ready.")
 
     def stop(self):
+        routing_error = None
+        try:
+            self.routing('disable')
+        except (Error, OSError) as error:
+            routing_error = error
         pids = [self.valid_pid(PID, "/usr/local/bin/mihomo"), self.valid_pid(DAEMON_PID, "daemon")]
         for pid in pids:
             if pid:
@@ -923,8 +940,15 @@ class System:
         for path in (PID, DAEMON_PID):
             Path(path).unlink(missing_ok=True)
         self.destroy_tun()
+        if routing_error is not None:
+            raise routing_error
 
     def destroy_tun(self):
+        routing_error = None
+        try:
+            self.routing('disable')
+        except (Error, OSError) as error:
+            routing_error = error
         interface = self.run(["/sbin/ifconfig", "tun_mihomo"], check=False)
         recovery = None
         try:
@@ -939,6 +963,8 @@ class System:
                 self.run(["/sbin/ifconfig", "tun_mihomo", "destroy"])
         if recovery is not None:
             self._host_dns_recover(recovery)
+        if routing_error is not None:
+            raise routing_error
 
     @staticmethod
     def _host_dns_paths():
@@ -1141,6 +1167,7 @@ class System:
     def tun(self):
         self.run(['/usr/local/bin/php', HELPER, 'enable-tun'], timeout=90)
         self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
+        self.routing('enable')
 
     def restore_integration(self, settings, payload):
         # Early boot restores only configuration; normal boot starts services.
@@ -1809,11 +1836,17 @@ class Manager:
 
     def publish_status(self, settings=None, dns_active=False, error=""):
         settings = settings or self.settings()
+        running = self.system.running()
+        routing_active = False
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            routing = json.loads((self.state / 'routing-state.json').read_bytes())
+            routing_active = running and settings['transparent'] and isinstance(routing, dict) and routing.get('active') is True
         overrides = []
         if self.merge_file.exists():
             with contextlib.suppress(Error, OSError):
                 overrides = switch_overrides(parse_yaml(self.merge_file.read_bytes()))
-        status = {"running": self.system.running(), "transparent": settings["transparent"],
+        status = {"running": running, "transparent": settings["transparent"],
+                  "routing_active": routing_active,
                   "dns_active": dns_active, "dns_fallback": settings["dns_fallback"],
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
                   "error": error, "backup_warning": self.backup_warning_file.read_text()
@@ -1902,6 +1935,7 @@ class Manager:
                 settings['controller'] = rendered['external-controller']
             settings.setdefault('controller', ANY_CONTROLLER)
             settings['switch_schema'] = SWITCH_SCHEMA
+        settings = routing_settings(settings)
         self.write_settings(settings)
         runtime_home = self.path(HOME)
         runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1970,15 +2004,26 @@ class Manager:
             raise Error('DNS restoration failed; the core and TUN were stopped. Recovery will be retried.') from None
 
     def start(self, settings=None):
-        settings = settings or self.settings()
+        original = settings or self.settings()
+        settings = routing_settings(original)
         if not settings["service_enabled"]:
             self.publish_status(settings)
             return {"running": False, "message": "The service is administratively stopped."}
         data = parse_yaml(self.source_file.read_bytes()) if self.source_file.exists() else {'proxies': [], 'proxy-groups': [], 'rules': ['MATCH,DIRECT']}
-        candidate = self.candidate(data, settings)
+        overlay = parse_yaml(self.merge_file.read_bytes())
+        cleaned = copy.deepcopy(overlay)
+        dns = cleaned.get('dns')
+        if settings.get('transparent') and isinstance(dns, dict) and dns.get('enhanced-mode') == 'fake-ip':
+            dns.pop('enhanced-mode')
+            settings = dict(settings, dns_mode='redir-host')
+        candidate = self.candidate(data, settings, overlay=cleaned)
         try:
             self.system.validate(candidate)
             generated = parse_yaml(candidate.read_bytes())
+            if settings != original:
+                self.write_settings(settings)
+            if cleaned != overlay:
+                atomic_write(self.merge_file, yaml.safe_dump(cleaned, sort_keys=False, allow_unicode=True).encode())
             atomic_write(self.config_file, candidate.read_bytes())
         finally:
             candidate.unlink(missing_ok=True)
@@ -1988,8 +2033,8 @@ class Manager:
         self.system.dns(False, settings)
         if settings.get('router_dns'):
             self.system.check_router_dns()
-        self.system.start(self.config_file, tun)
         try:
+            self.system.start(self.config_file, tun)
             if tun:
                 self.system.tun()
             if dns_active:
@@ -1998,7 +2043,7 @@ class Manager:
                 atomic_write(self.replay_file, b'pending\n')
             self.proxy_tick()
             self.system.watch()
-        except Error:
+        except (Error, OSError):
             self.stop(settings)
             raise
         return self.publish_status(settings, dns_active)
@@ -2008,6 +2053,7 @@ class Manager:
         settings = settings or self.settings()
         if overlay is not None:
             settings = absorb_switches(overlay, settings)
+        settings = routing_settings(settings)
         self.check_settings(settings)
         data = parse_yaml(content)
         if subscription:
@@ -2026,9 +2072,9 @@ class Manager:
                     before[path] = None
             running = self.system.running()
             previous = self.settings()
-            if running:
-                self.stop(previous)
             try:
+                if running:
+                    self.stop(previous)
                 atomic_write(self.config_file, candidate.read_bytes())
                 if subscription:
                     atomic_write(self.source_file, content)
@@ -2159,7 +2205,10 @@ class Manager:
                 active = bool(json.loads(self.status_file.read_bytes()).get('dns_active'))
             rescue_error = ''
             if not self.system.running():
-                self.system.destroy_tun()
+                try:
+                    self.system.destroy_tun()
+                except (Error, OSError):
+                    rescue_error = 'Routing cleanup failed and will be retried. '
                 pending_dns = (self.state / 'dns-reload-pending').exists()
                 if pending_dns or (active and (settings['dns_fallback'] or not settings['service_enabled'])):
                     try:
@@ -2169,7 +2218,7 @@ class Manager:
                             self.system.dns(False, settings)
                         active = False
                     except (Error, OSError):
-                        rescue_error = 'Direct DNS recovery failed and will be retried. '
+                        rescue_error += 'Direct DNS recovery failed and will be retried. '
             if isinstance(error, BackupIntegrityError):
                 atomic_write(self.backup_warning_file, BACKUP_INTEGRITY_WARNING.encode())
             return self.publish_status(settings, active, error=rescue_error + str(error))
@@ -2188,10 +2237,25 @@ class Manager:
             status = {}
         active = bool(status.get("dns_active"))
         if not self.system.running():
-            self.system.destroy_tun()
+            routing_error = ''
+            try:
+                self.system.destroy_tun()
+            except (Error, OSError):
+                routing_error = 'Routing cleanup failed and will be retried. '
             if active and (settings['dns_fallback'] or not settings['service_enabled'] or (self.state / 'dns-reload-pending').exists()):
-                self.system.dns(False, settings)
-                return self.publish_status(settings, error="Mihomo exited. Direct DNS and routing were restored automatically.")
+                try:
+                    self.system.dns(False, settings)
+                    active = False
+                except (Error, OSError):
+                    return self.publish_status(settings, active, error=routing_error + 'Direct DNS recovery failed and will be retried.')
+                return self.publish_status(settings, error=routing_error or "Mihomo exited. Direct DNS and routing were restored automatically.")
+            if routing_error:
+                return self.publish_status(settings, active, error=routing_error)
+        elif settings.get('transparent') and hasattr(self.system, 'routing'):
+            try:
+                self.system.routing('refresh')
+            except (Error, OSError):
+                return self.publish_status(settings, active, error='Transparent routing recovery failed and will be retried.')
         if settings.get('router_dns'):
             upstreams, ipv6 = self.router_context(settings)
             data = parse_yaml(self.config_file.read_bytes())
@@ -2200,7 +2264,7 @@ class Manager:
             pins = dns_transport_rules(upstreams)
             if self.system.running() and data.get('rules', [])[:len(pins)] != pins:
                 self.apply(self.source_file.read_bytes(), settings)
-                return self.publish_status(settings, active)
+            return self.publish_status(settings, active)
         return self.publish_status(settings, active)
 
     def _restore_for_start(self):
@@ -2258,7 +2322,8 @@ class Manager:
             return self.initialize(argument == "upgrade")
         if action == 'devices':
             return {'devices': known_devices(self.system.run, self.root),
-                    'rules': device_rules(self.settings())}
+                    'rules': device_rules(self.settings()),
+                    'routing': device_routing_policy(self.settings())}
         if action == "queue-update":
             return self.queue_update()
         if action == "sub-update":

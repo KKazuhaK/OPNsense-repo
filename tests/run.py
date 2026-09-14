@@ -20,7 +20,9 @@ PORTABLE_PHP = {
                      'src/os-speedtest/src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/Api')],
     'os-sing-box': [('src/os-sing-box/tests/native/test-api-contract.php',
                     'src/os-sing-box/src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api')],
-    'os-mihomo': [('src/os-mihomo/tests/native/test-backup-fields.php',)],
+    'os-mihomo': [('src/os-mihomo/tests/native/test-backup-fields.php',),
+                  ('src/os-mihomo/tests/native/test-routing-context.php',),
+                  ('src/os-mihomo/tests/native/test-tun-rule-ownership.php',)],
     'os-frp': [('src/os-frp/tests/native/test-backup-fields.php',)],
 }
 NATIVE_PHP = {

@@ -7,8 +7,8 @@ tun:
   enable: true
   stack: gvisor
   mtu: 1420
-  auto-route: true
-  strict-route: true
+  auto-route: false
+  strict-route: false
   auto-detect-interface: true
   dns-hijack: []
 dns:

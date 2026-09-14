@@ -517,6 +517,21 @@ class IntegrationHelperTests(unittest.TestCase):
     def zone(self):
         return self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
 
+    def helper_state(self, result):
+        lines = [line for line in result.stdout.splitlines() if line.startswith('Mihomo integration state: ')]
+        self.assertEqual(1, len(lines))
+        return json.loads(lines[0].split(': ', 1)[1])
+
+    def real_dns_mode(self, mode):
+        self.config.write_text(self.original.replace(
+            '<forwarding><enabled>1</enabled>', '<general><dnssec>1</dnssec></general><forwarding><enabled>0</enabled>'))
+        state = self.root / 'var/db/os-mihomo'
+        state.mkdir(parents=True, exist_ok=True)
+        settings = state / 'settings.json'
+        settings.write_text(json.dumps({'dns_mode': mode}))
+        settings.chmod(0o600)
+        return state
+
     def test_disable_removes_the_forward_zone_even_when_the_rest_fails(self):
         # Everything after this point can throw -- a restored configuration
         # whose Unbound model no longer matches, a truncated state file -- and
@@ -534,8 +549,109 @@ class IntegrationHelperTests(unittest.TestCase):
         # Unbound accept them is the one that stops it starting.
         self.config.write_text(self.config.read_text().replace(
             '<forwarding>', '<general><dnssec>1</dnssec></general><forwarding>'))
-        self.assertEqual(0, self.helper('enable').returncode)
+        result = self.helper('enable')
+        self.assertEqual(0, result.returncode)
         self.assertFalse(self.zone().exists())
+        self.assertFalse(self.helper_state(result)['effective_forwarding'])
+        repeated = self.helper('enable')
+        self.assertEqual(0, repeated.returncode)
+        self.assertIn('unchanged', repeated.stdout)
+        self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
+                          'integration_changed': False}, self.helper_state(repeated))
+
+    def test_forwarding_metadata_follows_enable_and_disable(self):
+        enabled = self.helper('enable')
+        self.assertEqual(0, enabled.returncode)
+        self.assertTrue(self.zone().exists())
+        self.assertTrue(self.helper_state(enabled)['effective_forwarding'])
+        self.assertTrue(self.helper_state(enabled)['dns_changed'])
+        disabled = self.helper('disable')
+        self.assertEqual(0, disabled.returncode)
+        self.assertFalse(self.zone().exists())
+        self.assertFalse(self.helper_state(disabled)['effective_forwarding'])
+        self.assertTrue(self.helper_state(disabled)['dns_changed'])
+
+    def test_tun_only_cleanup_reports_integration_change_without_dns_change(self):
+        self.config.write_text(self.config.read_text().replace(
+            '<forwarding><enabled>1</enabled>', '<general><dnssec>1</dnssec></general><forwarding><enabled>0</enabled>'
+        ).replace('10.0.0.0/8,198.18.0.0/15', '10.0.0.0/8'))
+        enabled = self.helper('enable')
+        self.assertEqual(0, enabled.returncode)
+        disabled = self.helper('disable')
+        self.assertEqual(0, disabled.returncode)
+        self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
+                          'integration_changed': True}, self.helper_state(disabled))
+
+    def test_real_dns_modes_preserve_operator_private_address_and_journal(self):
+        for mode in ('redir-host', 'normal'):
+            with self.subTest(mode=mode):
+                state = self.real_dns_mode(mode)
+                expected = self.xml()
+                enabled = self.helper('enable')
+                self.assertEqual(0, enabled.returncode)
+                self.assertFalse(self.helper_state(enabled)['dns_changed'])
+                journal = state / 'dns-state.json'
+                saved = journal.read_bytes()
+                self.assertTrue(json.loads(saved)['had_fake_ip_private_address'])
+                self.assertFalse(json.loads(saved)['removed_fake_ip_private_address'])
+                repeated = self.helper('enable')
+                self.assertEqual(0, repeated.returncode)
+                self.assertEqual(saved, journal.read_bytes())
+                self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
+                                  'integration_changed': False}, self.helper_state(repeated))
+                disabled = self.helper('disable')
+                self.assertEqual(0, disabled.returncode)
+                self.assertFalse(self.helper_state(disabled)['dns_changed'])
+                self.assertEqual(expected, self.xml())
+                self.assertFalse(journal.exists())
+
+    def test_real_dns_does_not_restore_private_address_removed_later_by_operator(self):
+        import xml.etree.ElementTree as ET
+        self.real_dns_mode('redir-host')
+        self.assertEqual(0, self.helper('enable').returncode)
+        xml = ET.parse(self.config)
+        private = xml.find('./OPNsense/unboundplus/advanced/privateaddress')
+        private.text = '10.0.0.0/8,172.16.0.0/12'
+        xml.write(self.config)
+        disabled = self.helper('disable')
+        self.assertEqual(0, disabled.returncode)
+        self.assertFalse(self.helper_state(disabled)['dns_changed'])
+        self.assertEqual('10.0.0.0/8,172.16.0.0/12', ET.parse(self.config).findtext(
+            './OPNsense/unboundplus/advanced/privateaddress'))
+
+    def test_legacy_journal_remains_until_its_removed_private_address_is_restored(self):
+        import xml.etree.ElementTree as ET
+        state = self.real_dns_mode('redir-host')
+        self.config.write_text(self.config.read_text().replace(',198.18.0.0/15', ''))
+        journal = state / 'dns-state.json'
+        journal.write_text(json.dumps({'forwarding': '0', 'roots': {},
+                                      'had_fake_ip_private_address': True}))
+        saved = journal.read_bytes()
+        enabled = self.helper('enable')
+        self.assertEqual(0, enabled.returncode)
+        self.assertFalse(self.helper_state(enabled)['dns_changed'])
+        self.assertEqual(saved, journal.read_bytes())
+        disabled = self.helper('disable')
+        self.assertEqual(0, disabled.returncode)
+        self.assertTrue(self.helper_state(disabled)['dns_changed'])
+        self.assertIn('198.18.0.0/15', ET.parse(self.config).findtext(
+            './OPNsense/unboundplus/advanced/privateaddress').split(','))
+        self.assertFalse(journal.exists())
+
+    def test_unknown_and_fake_dns_keep_legacy_private_address_removal(self):
+        import xml.etree.ElementTree as ET
+        for mode in ('fake-ip', 'unknown'):
+            with self.subTest(mode=mode):
+                state = self.real_dns_mode(mode)
+                expected = self.xml()
+                enabled = self.helper('enable')
+                self.assertEqual(0, enabled.returncode)
+                self.assertTrue(self.helper_state(enabled)['dns_changed'])
+                self.assertNotIn('198.18.0.0/15', ET.parse(self.config).findtext(
+                    './OPNsense/unboundplus/advanced/privateaddress').split(','))
+                self.assertTrue(json.loads((state / 'dns-state.json').read_text())['removed_fake_ip_private_address'])
+                self.assertEqual(0, self.helper('disable').returncode)
+                self.assertEqual(expected, self.xml())
 
     def test_the_legacy_forward_zone_name_is_cleared(self):
         # It sorted ahead of the generated dot.conf and never won the root

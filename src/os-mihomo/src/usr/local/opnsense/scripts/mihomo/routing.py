@@ -390,6 +390,12 @@ class Routing:
         self.save(record)
 
     def route_command(self, action, fib, route):
+        if action == 'add' and route['gateway'] != 'interface':
+            # route(8)'s netlink backend ignores -ifp for numeric gateways.
+            # The native helper sends OIF and creates the prefix exclusively.
+            self.command(['/usr/local/bin/python3', str(self.path('/usr/local/opnsense/scripts/mihomo/native_route.py')),
+                          'add', '--fib', str(fib), '--route', json.dumps(route, sort_keys=True)])
+            return
         net = ipaddress.ip_network(route['destination'])
         destination = str(net.network_address)
         if route['scope']:
@@ -443,8 +449,8 @@ class Routing:
             record['routes'].pop(key, None)
             self.save(record)
             if wanted is not None:
-                # RTM_ADD fails if a concurrent owner inserted this key. It
-                # never overwrites a route, so absent keys need no extra dump.
+                # Numeric adds use kernel EXCL; direct interface adds cannot
+                # append a gateway path. Neither replaces a concurrent owner.
                 self.route_command('add', fib, wanted)
                 inserted = self.routes(fib).get(key)
                 if inserted is None or route_semantic(inserted) != route_semantic(wanted):

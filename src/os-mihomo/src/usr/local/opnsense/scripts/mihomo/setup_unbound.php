@@ -148,6 +148,21 @@ function mihomoState(string $path): ?array
     return $value;
 }
 
+function mihomoRealAddressDns(string $stateDir): bool
+{
+    $handle = @fopen($stateDir . '/settings.json', 'rb');
+    if ($handle === false) {
+        return false;
+    }
+    $raw = stream_get_contents($handle, 1048577);
+    fclose($handle);
+    if ($raw === false || strlen($raw) > 1048576) {
+        return false;
+    }
+    $settings = json_decode($raw, true);
+    return is_array($settings) && in_array($settings['dns_mode'] ?? null, ['redir-host', 'normal'], true);
+}
+
 function mihomoJournal(string $field, mixed $value): ?array
 {
     if ($value === null) {
@@ -159,6 +174,8 @@ function mihomoJournal(string $field, mixed $value): ?array
     if ($field === 'dns_state') {
         if (!is_scalar($value['forwarding'] ?? null) || !in_array((string)$value['forwarding'], ['0', '1'], true)
             || !is_bool($value['had_fake_ip_private_address'] ?? null)
+            || (array_key_exists('removed_fake_ip_private_address', $value)
+                && !is_bool($value['removed_fake_ip_private_address']))
             || !is_array($value['roots'] ?? null) || count($value['roots']) > 512) {
             throw new RuntimeException('Invalid ownership journal.');
         }
@@ -376,7 +393,9 @@ try {
     }
     $before = $doc->saveXML();
     $zoneChanged = false;
+    $effectiveForwarding = false;
     $xpath = new DOMXPath($doc);
+    $unboundBefore = $xpath->query('/opnsense/OPNsense/unboundplus')->item(0)?->C14N();
     $restore = null;
     if ($mode === 'restore-backup') {
         $raw = stream_get_contents(STDIN, 1048577);
@@ -454,6 +473,11 @@ try {
         $forwarder = $xpath->query('./dot[@uuid="' . FORWARD_UUID . '"]', $dots)->item(0);
         if ($mode === 'enable') {
             mihomoEnsureTun($doc, $xpath, $tunStatePath);
+            /* Real DNS modes never manufacture fake addresses. Preserve the
+               operator's private networks and record whether we removed one;
+               older journals still require their historical restoration. */
+            $removeFakePrivate = !mihomoRealAddressDns($stateDir);
+            $hadFakePrivate = in_array(FAKE_IP_CIDR, array_map('trim', explode(',', $private->textContent)), true);
             if ($snapshot === null) {
                 $roots = [];
                 foreach ($xpath->query('./dot', $dots) as $dot) {
@@ -466,7 +490,13 @@ try {
                     }
                 }
                 $snapshot = ['forwarding' => $forwarding->textContent, 'roots' => $roots,
-                             'had_fake_ip_private_address' => in_array(FAKE_IP_CIDR, explode(',', $private->textContent), true)];
+                             'had_fake_ip_private_address' => $hadFakePrivate,
+                             'removed_fake_ip_private_address' => $removeFakePrivate && $hadFakePrivate];
+                mihomoPersist($dnsStatePath, $snapshot);
+            } elseif ($removeFakePrivate && $hadFakePrivate
+                && ($snapshot['removed_fake_ip_private_address'] ?? true) === false) {
+                $snapshot['had_fake_ip_private_address'] = true;
+                $snapshot['removed_fake_ip_private_address'] = true;
                 mihomoPersist($dnsStatePath, $snapshot);
             }
             $forwarding->nodeValue = '0';
@@ -476,14 +506,17 @@ try {
                TLS, so the template writes it ahead of any DoT entry and queries
                reach Mihomo either way. Disabling the operator's entries would
                buy nothing and would edit configuration that is not ours. */
-            $addresses = array_filter(array_map('trim', explode(',', $private->textContent)), static fn($v) => $v !== '' && $v !== FAKE_IP_CIDR);
-            $private->nodeValue = implode(',', $addresses);
+            if ($removeFakePrivate) {
+                $addresses = array_filter(array_map('trim', explode(',', $private->textContent)), static fn($v) => $v !== '' && $v !== FAKE_IP_CIDR);
+                $private->nodeValue = implode(',', $addresses);
+            }
             /* Earlier versions kept the forward zone here. Drop it on the way
                past so an upgrade stops generating domain-insecure: "." too. */
             if ($forwarder instanceof DOMElement) {
                 $dots->removeChild($forwarder);
             }
             $validating = trim($xpath->evaluate('string(./general/dnssec)', $unbound)) === '1';
+            $effectiveForwarding = !$validating;
             $zoneChanged = mihomoForwardZone(true, $fallback, $validating);
         } else {
             if ($forwarder instanceof DOMElement) {
@@ -503,7 +536,8 @@ try {
                         mihomoChild($doc, $node, 'enabled', (string)$enabled);
                     }
                 }
-                if ($snapshot['had_fake_ip_private_address']) {
+                if ($snapshot['had_fake_ip_private_address']
+                    && ($snapshot['removed_fake_ip_private_address'] ?? true)) {
                     $addresses = array_values(array_filter(array_map('trim', explode(',', $private->textContent))));
                     if (!in_array(FAKE_IP_CIDR, $addresses, true)) {
                         $addresses[] = FAKE_IP_CIDR;
@@ -546,8 +580,17 @@ try {
         @unlink($stateDir . '/migrate/cron.json');
         @unlink($stateDir . '/migrate/config.xml');
     }
-    echo $before !== $doc->saveXML() || $zoneChanged || $earlyZoneChange
+    $integrationChanged = $before !== $doc->saveXML() || $zoneChanged || $earlyZoneChange;
+    $unboundAfter = $xpath->query('/opnsense/OPNsense/unboundplus')->item(0)?->C14N();
+    $dnsChanged = is_string($unboundBefore) && is_string($unboundAfter)
+        ? $unboundBefore !== $unboundAfter || $zoneChanged || $earlyZoneChange : null;
+    echo $integrationChanged
         ? "Mihomo integration updated.\n" : "Mihomo integration unchanged.\n";
+    echo 'Mihomo integration state: ' . json_encode([
+        'effective_forwarding' => $effectiveForwarding,
+        'dns_changed' => $dnsChanged,
+        'integration_changed' => $integrationChanged
+    ]) . "\n";
 } catch (Throwable $error) {
     fwrite(STDERR, "Mihomo integration failed. Existing DNS state is retained for recovery.\n");
     exit(1);

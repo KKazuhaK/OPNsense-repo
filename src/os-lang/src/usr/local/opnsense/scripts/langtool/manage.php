@@ -404,7 +404,7 @@ function langtool_publish($state)
         throw new RuntimeException('Unable to publish localization progress.');
     }
     chmod($temporary, 0600);
-    if (!rename($temporary, LANGTOOL_STATE . '/status.json')) {
+    if (!@rename($temporary, LANGTOOL_STATE . '/status.json')) {
         @unlink($temporary);
         throw new RuntimeException('Unable to publish localization progress.');
     }
@@ -427,7 +427,8 @@ function langtool_state()
 }
 
 try {
-    if (!is_dir(LANGTOOL_STATE) && !mkdir(LANGTOOL_STATE, 0700, true)) {
+    // Another request can create the directory after the first check.
+    if (!is_dir(LANGTOOL_STATE) && !@mkdir(LANGTOOL_STATE, 0700, true) && !is_dir(LANGTOOL_STATE)) {
         throw new RuntimeException('Unable to create localization state directory.');
     }
     $action = $argv[1] ?? 'status';

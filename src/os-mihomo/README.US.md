@@ -1,4 +1,6 @@
 # os-mihomo
+Native OPNsense configuration backups include Mihomo settings and credentials, the original subscription and merge YAML, local `type:file` rule and proxy-provider files, proxy-group choices, and interface/DNS ownership journals. Restore preserves the service enabled state and turns transparent routing and consent off; the operator explicitly enables transparent routing again. See [configuration backup and restore](../../CONFIG-BACKUP.md).
+
 
 An independently maintained Mihomo integration for OPNsense CE, currently validated on 26.7 / FreeBSD 15 amd64. Committed recipes parameterize future targets.
 
@@ -51,4 +53,4 @@ Subscriptions are fetched directly with `OPNsense-Mihomo/1 (device)`. HTTP 4xx n
 
 ## Build and publish
 
-Run `sh build.sh` on the recipe's native FreeBSD / OPNsense target with matching Python, PyYAML and curl. Current 26.7 uses `python3.13` / `python313` and produces `dist/FreeBSD:15:amd64/os-mihomo-1.2.0.pkg`. `TARGET_ABI`, `TARGET_PRODUCT_ABI` and `TARGET_PYTHON` can be explicit; the actual kernel, userland, dependencies and interpreter must match. Runtime Python entry points and product annotations follow the target. Bytecode is excluded and rejected in staging and archives. See [deployment](../../DEPLOYMENT.md) for per-target native tests, signed dependency setup and publication. Pages reruns the signed report's source tests and compares package content with that revision.
+Run `sh build.sh` on the recipe's native FreeBSD / OPNsense target with matching Python, PyYAML and curl. Current 26.7 uses `python3.13` / `python313` and produces `dist/FreeBSD:15:amd64/os-mihomo-1.2.1.pkg`. `TARGET_ABI`, `TARGET_PRODUCT_ABI` and `TARGET_PYTHON` can be explicit; the actual kernel, userland, dependencies and interpreter must match. Runtime Python entry points and product annotations follow the target. Bytecode is excluded and rejected in staging and archives. See [deployment](../../DEPLOYMENT.md) for per-target native tests, signed dependency setup and publication. Pages reruns the signed report's source tests and compares package content with that revision.

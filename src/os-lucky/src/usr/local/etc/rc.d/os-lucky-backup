@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# PROVIDE: lucky_backup
+# REQUIRE: FILESYSTEMS
+# BEFORE: lucky
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="lucky_backup"
+rcvar="lucky_backup_enable"
+load_rc_config "$name"
+: "${lucky_backup_enable:=YES}"
+
+pidfile="/var/run/lucky-backup.pid"
+command="/usr/sbin/daemon"
+procname="/usr/local/bin/python3"
+command_args="-p $pidfile -f /usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py watch"
+start_precmd="lucky_backup_prestart"
+stop_postcmd="lucky_backup_stopped"
+
+lucky_backup_prestart()
+{
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py reconcile >/dev/null
+}
+
+lucky_backup_stopped()
+{
+    rm -f "$pidfile"
+}
+
+run_rc_command "$1"

@@ -1,6 +1,7 @@
 #!/usr/local/bin/python3
 """Exercise secret-safe TOML editing against the native Python runtime."""
 import importlib.util
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,8 @@ class SettingsTest(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(manager, 'CONFIG', self.config).start()
         patch.object(manager, 'LOG', self.log).start()
+        patch.object(manager, 'SAVE_LOCK', Path(self.directory.name) / 'save.lock').start()
+        patch.object(manager, 'mirror_configuration', return_value=True).start()
         patch.object(manager, 'REQUEST_ROOT', Path(self.directory.name)).start()
         patch.object(manager.pwd, 'getpwnam', return_value=type('Account', (), {'pw_uid': os.getuid()})()).start()
         self.original = '''hostname = "firewall"
@@ -53,6 +56,38 @@ password = "test-password"
         expected['hostname'] = 'renamed'
         self.assertEqual(saved, expected)
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+    def test_backup_failure_warns_after_save_and_after_releasing_save_lock(self):
+        self.input.write_text(manager.dispatch('settings')['config'].replace('firewall', 'saved-despite-warning'))
+        def failed_mirror():
+            with manager.SAVE_LOCK.open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        with patch.object(manager, 'mirror_configuration', side_effect=failed_mirror) as mirror:
+            result = manager.dispatch('save', self.input)
+        self.assertEqual(result['status'], 'ok')
+        self.assertIn('configuration backup could not be updated', result['warning'])
+        self.assertEqual(tomllib.loads(self.config.read_text())['hostname'], 'saved-despite-warning')
+        mirror.assert_called_once()
+
+    def test_invalid_save_never_mirrors_configuration(self):
+        self.input.write_text('invalid = [')
+        with patch.object(manager, 'mirror_configuration') as mirror:
+            with self.assertRaises(tomllib.TOMLDecodeError):
+                manager.dispatch('save', self.input)
+        mirror.assert_not_called()
+
+    def test_service_startup_write_shares_backup_lock_and_releases_it_before_rc(self):
+        def fake_run(arguments, timeout=30):
+            with manager.SAVE_LOCK.open('a') as lock:
+                if arguments[0] == '/usr/sbin/sysrc':
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return type('Result', (), {'returncode': 0})()
+        with patch.object(manager, 'run', side_effect=fake_run):
+            self.assertEqual(manager.dispatch('stop')['status'], 'ok')
 
     def test_concurrent_save_rejects_stale_credentials_after_first_write(self):
         public = manager.dispatch('settings')['config']

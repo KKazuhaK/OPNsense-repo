@@ -21,6 +21,10 @@ from urllib.parse import urlsplit
 CONFIG = Path('/usr/local/etc/easytier/config.toml')
 LOG = Path('/var/log/easytier.log')
 RC = '/usr/local/etc/rc.d/easytier'
+SAVE_LOCK = Path('/var/run/easytier-config.lock')
+OPERATION_LOCK = Path('/var/run/easytier-mvc.lock')
+PID = Path('/var/run/easytier.pid')
+SYSTEM_CONFIG = Path('/conf/config.xml')
 MARKER = '__EASYTIER_KEEP_'
 REQUEST_ROOT = Path('/tmp')
 REQUEST_PREFIX = 'easytier_mvc_'
@@ -29,6 +33,21 @@ SENSITIVE = re.compile(r'(secret|password|passwd|token|credential|private.?key|a
 
 def run(arguments, timeout=30):
     return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout)
+
+
+def mirror_configuration():
+    try:
+        result = run([sys.executable, str(Path(__file__).with_name('config_mirror.py')), 'mirror'])
+        data = json.loads(result.stdout) if result.returncode == 0 else None
+        return isinstance(data, dict) and data.get('ok') is True
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
+def mirrored_result(result):
+    if result.get('status') == 'ok' and not mirror_configuration():
+        result['warning'] = 'The operation completed, but its configuration backup could not be updated.'
+    return result
 
 
 def stored():
@@ -152,9 +171,28 @@ def running():
     return run([RC, 'onestatus'], 5).returncode == 0
 
 
+def rpc_portal(for_connection=True):
+    value = stored().get('rpc_portal', 0)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError('Invalid RPC portal.')
+    value = str(value)
+    if value.isdigit():
+        host, port = '127.0.0.1', int(value) or 15888
+    else:
+        match = re.fullmatch(r'(\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9_.-]+):(\d+)', value)
+        if match is None:
+            raise ValueError('Invalid RPC portal.')
+        host, port = match[1], int(match[2])
+        if for_connection:
+            host = {'0.0.0.0': '127.0.0.1', '[::]': '[::1]'}.get(host, host)
+    if not 1 <= port <= 65535:
+        raise ValueError('Invalid RPC portal.')
+    return f'{host}:{port}'
+
+
 def language():
     try:
-        return ET.parse('/conf/config.xml').findtext('system/language', default='en_US')
+        return ET.parse(SYSTEM_CONFIG).findtext('system/language', default='en_US')
     except (OSError, ET.ParseError):
         return 'en_US'
 
@@ -162,10 +200,11 @@ def language():
 def status():
     data = stored()
     identity = data.get('network_identity', {})
-    pid = Path('/var/run/easytier.pid')
+    if not isinstance(identity, dict):
+        raise ValueError('Invalid network identity.')
     version = run(['/usr/local/sbin/easytier-core', '--version'], 5).stdout.strip()
     return {'status': 'ok', 'running': running(), 'version': scrub(version, data), 'language': language(),
-            'pid': pid.read_text().strip() if pid.exists() else '',
+            'pid': PID.read_text().strip() if PID.exists() else '',
             'hostname': scrub(str(data.get('hostname', '')), data),
             'ipv4': scrub(str(data.get('ipv4', '')), data),
             'network_name': scrub(str(identity.get('network_name', '')), data)}
@@ -221,17 +260,20 @@ def dispatch(action, argument=None):
     if action == 'save':
         text = request_text(argument)
         CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with (CONFIG.parent / '.mvc-save.lock').open('a') as lock:
+        SAVE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        with SAVE_LOCK.open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            return save_configuration(text)
+            result = save_configuration(text)
+        # The archive takes the same lock after the save releases it.
+        return mirrored_result(result)
     if action == 'status':
         return status()
     if action == 'peers':
         if not running():
             return {'status': 'ok', 'running': False, 'rows': []}
-        result = run(['/usr/local/sbin/easytier-cli', '-p', '127.0.0.1:15888', 'peer'], 5)
+        result = run(['/usr/local/sbin/easytier-cli', '-p', rpc_portal(), 'peer'], 5)
         if result.returncode:
-            return {'status': 'failed', 'error': 'Unable to query peers. Check the RPC portal 127.0.0.1:15888.'}
+            return {'status': 'failed', 'error': 'Unable to query peers. Check the configured RPC portal.'}
         rows = []
         data = stored()
         for line in result.stdout.splitlines():
@@ -262,27 +304,38 @@ def dispatch(action, argument=None):
     if action in {'start', 'stop', 'restart'}:
         if action in {'start', 'stop'}:
             enabled = 'YES' if action == 'start' else 'NO'
-            result = run(['/usr/sbin/sysrc', '-f', '/etc/rc.conf.d/easytier', 'easytier_enable=' + enabled])
+            SAVE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+            with SAVE_LOCK.open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                result = run(['/usr/sbin/sysrc', '-f', '/etc/rc.conf.d/easytier', 'easytier_enable=' + enabled])
             if result.returncode:
                 return {'status': 'failed', 'error': 'Unable to update service startup settings.'}
         result = run([RC, 'one' + action], 60)
-        return {'status': 'ok' if result.returncode == 0 else 'failed',
-                'error': '' if result.returncode == 0 else 'Service operation failed. Check the EasyTier log.'}
+        return mirrored_result({'status': 'ok' if result.returncode == 0 else 'failed',
+                                'error': '' if result.returncode == 0 else 'Service operation failed. Check the EasyTier log.'})
     return {'status': 'failed', 'error': 'Unknown action.'}
 
 
 def main():
     try:
+        if len(sys.argv) < 2:
+            raise ValueError('Missing action.')
         action = sys.argv[1]
+        if action == 'rpc-portal':
+            print(rpc_portal(for_connection=False))
+            return 0
         argument = sys.argv[2] if len(sys.argv) > 2 else None
         if action in {'start', 'stop', 'restart'}:
-            with Path('/var/run/easytier-mvc.lock').open('a') as lock:
+            with OPERATION_LOCK.open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 result = dispatch(action, argument)
         else:
             result = dispatch(action, argument)
         print(json.dumps(result, ensure_ascii=False))
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        if len(sys.argv) > 1 and sys.argv[1] == 'rpc-portal':
+            print('Unable to read the EasyTier RPC portal.', file=sys.stderr)
+            return 1
         print(json.dumps({'status': 'failed', 'error': 'Unable to read, validate or update EasyTier configuration.'}))
     return 0
 

@@ -1,13 +1,25 @@
 #!/bin/sh
 
 # PROVIDE: ddnsgo
-# REQUIRE: NETWORKING LOGIN
+# REQUIRE: NETWORKING ddnsgo_backup LOGIN
 # KEYWORD: shutdown
 
 . /etc/rc.subr
 
 name="ddnsgo"
 rcvar="ddnsgo_enable"
+
+# Reconcile restored XML before reading service enable and configuration paths.
+case "${1:-}" in
+    start|onestart|faststart|forcestart)
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py reconcile >/dev/null || exit 1
+        ;;
+esac
+
+backup_force_restart=no
+case "${1:-}" in
+    onerestart|forcerestart) backup_force_restart=yes ;;
+esac
 
 load_rc_config "$name"
 
@@ -26,6 +38,7 @@ start_precmd="${name}_prestart"
 start_cmd="${name}_start"
 stop_cmd="${name}_stop"
 status_cmd="${name}_status"
+restart_cmd="${name}_restart"
 
 ddnsgo_prestart()
 {
@@ -44,7 +57,8 @@ ddnsgo_start()
 {
 	# shellcheck disable=SC2086
 	$command -P "$pidfile" -r -f -o "$logfile" -t "${name}:daemon" \
-		"$ddnsgo_bin" -c "$ddnsgo_config" -l "$ddnsgo_listen" -f "$ddnsgo_interval" $ddnsgo_extra_args
+		"$ddnsgo_bin" -c "$ddnsgo_config" -l "$ddnsgo_listen" -f "$ddnsgo_interval" $ddnsgo_extra_args || return $?
+	/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py mirror >/dev/null
 }
 
 ddnsgo_stop()
@@ -52,11 +66,46 @@ ddnsgo_stop()
 	if [ -f "$pidfile" ]; then
 		daemon_pid="$(cat "$pidfile" 2>/dev/null)"
 		if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
-			pkill -TERM -P "$daemon_pid" 2>/dev/null || true
+			children="$(pgrep -P "$daemon_pid" 2>/dev/null || true)"
 			kill -TERM "$daemon_pid" 2>/dev/null || true
+			for child in $children; do
+				kill -TERM "$child" 2>/dev/null || true
+				remaining=50
+				while kill -0 "$child" 2>/dev/null && [ "$remaining" -gt 0 ]; do
+					sleep 0.1
+					remaining=$((remaining - 1))
+				done
+				# Do not import or mirror while a writer can still flush old settings.
+				if kill -0 "$child" 2>/dev/null; then
+					return 1
+				fi
+			done
 		fi
 		rm -f "$pidfile"
 	fi
+	if [ "${1:-}" != "skip-backup" ]; then
+		/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py mirror >/dev/null
+	fi
+}
+
+ddnsgo_restart()
+{
+    # Stop embedded writers before applying a newly restored XML snapshot.
+    ddnsgo_stop skip-backup || return $?
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py reconcile >/dev/null || return $?
+    unset ddnsgo_enable ddnsgo_config ddnsgo_listen ddnsgo_interval ddnsgo_extra_args
+    load_rc_config "$name"
+	: "${ddnsgo_enable:=YES}"
+	: "${ddnsgo_config:=/usr/local/etc/ddns-go/config.yaml}"
+	: "${ddnsgo_listen:=:9876}"
+	: "${ddnsgo_interval:=300}"
+	: "${ddnsgo_extra_args:=}"
+    if [ "$backup_force_restart" = "no" ] && ! checkyesno "$rcvar"; then
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py mirror >/dev/null
+        return $?
+    fi
+    ddnsgo_prestart || return $?
+    ddnsgo_start
 }
 
 ddnsgo_status()

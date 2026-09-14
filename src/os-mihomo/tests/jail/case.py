@@ -40,6 +40,16 @@ def passed(name):
     print('PASS:', name, flush=True)
 
 
+def erase_private_saved_backup(path):
+    """Remove only the tested plugin's snapshot from generated private XML."""
+    private_xml = ET.parse(path)
+    private_mihomo = private_xml.find('./OPNsense/Mihomo')
+    saved_backup = private_mihomo.find('backup') if private_mihomo is not None else None
+    assert saved_backup is not None
+    private_mihomo.remove(saved_backup)
+    private_xml.write(path)
+
+
 shutil.rmtree('/var/db/os-mihomo', ignore_errors=True)
 previous = command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=false', 'add', '-f', '-M', '/root/old.pkg'])
 print(previous.stdout.decode(errors='replace') + previous.stderr.decode(errors='replace'), flush=True)
@@ -243,8 +253,30 @@ action('start', ok=False)
 assert not running()
 passed('Unavailable router resolver blocks startup without provider DNS fallback')
 action('remove')
+stopped_settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
+stopped_source = Path('/var/db/os-mihomo/subscription.yaml').read_bytes()
+assert stopped_settings['service_enabled'] is False
+assert ET.parse('/conf/config.xml').find('./OPNsense/Mihomo/backup') is not None
 command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=false', 'delete', '-y', 'os-mihomo'])
 shutil.rmtree('/var/db/os-mihomo')
+shutil.rmtree('/usr/local/etc/mihomo', ignore_errors=True)
+command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', 'add', '-M', '/root/new.pkg'])
+assert json.loads(Path('/var/db/os-mihomo/settings.json').read_text()) == stopped_settings
+assert Path('/var/db/os-mihomo/subscription.yaml').read_bytes() == stopped_source
+action('boot')
+action('wan-restart')
+assert not running()
+assert not action('status')['result']['dns_active']
+assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode != 0
+passed('Actual uninstall and erased configuration stores restore administrative Stop from retained XML')
+# A retained XML snapshot makes reinstall a restore. Remove only that private
+# backup node to exercise an installation with no saved configuration at all.
+command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=false', 'delete', '-y', 'os-mihomo'])
+erase_private_saved_backup('/conf/config.xml')
+assert ET.parse('/conf/config.xml').find('./OPNsense/Mihomo/backup') is None
+assert ET.parse('/conf/config.xml').findtext('./system/secret') == 'MASTER_SECRET_DO_NOT_COPY'
+shutil.rmtree('/var/db/os-mihomo')
+shutil.rmtree('/usr/local/etc/mihomo', ignore_errors=True)
 command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', 'add', '-M', '/root/new.pkg'])
 assert running()
 assert not json.loads(Path('/var/db/os-mihomo/settings.json').read_text())['transparent']

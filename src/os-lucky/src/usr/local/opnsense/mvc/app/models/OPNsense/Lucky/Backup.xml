@@ -1,0 +1,11 @@
+<model>
+    <mount>//OPNsense/Lucky/backup</mount>
+    <version>1.0.0</version>
+    <description>Validated archive of the plugin persistent configuration files.</description>
+    <items>
+        <!-- Optional fields allow installations without a saved file snapshot. -->
+        <schema type="TextField"/>
+        <archive type="TextField"/>
+        <checksum type="TextField"/>
+    </items>
+</model>

@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -37,6 +38,19 @@ class PackagingStateTests(unittest.TestCase):
             path.chmod(0o755)
         self.environment = dict(os.environ, PATH=str(self.stubs) + ':' + os.environ['PATH'],
                                 HOOK_TRACE=str(self.trace), HOOK_STOPPED='1')
+        python = self.root / 'usr/local/bin/python3'
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.symlink_to(sys.executable)
+        php = self.root / 'usr/local/bin/php'
+        php.write_text('#!/bin/sh\nprintf "%s\\n" network-setup >> "$HOOK_TRACE"\nexit 0\n')
+        php.chmod(0o755)
+        driver = self.root / 'usr/local/opnsense/scripts/singbox/config_mirror.py'
+        driver.parent.mkdir(parents=True, exist_ok=True)
+        driver.write_text('import json,os,sys\n'
+                          'with open(os.environ["HOOK_TRACE"], "a") as trace: trace.write("backup " + sys.argv[1] + "\\n")\n'
+                          'failed = sys.argv[1] == "import-config" and os.environ.get("HOOK_RESTORE_FAIL") == "1"\n'
+                          'print(json.dumps({"ok": not failed, "snapshot": os.environ.get("HOOK_SNAPSHOT") == "1"}))\n'
+                          'sys.exit(1 if failed else 0)\n')
 
     def hook(self, name, upgrade=False):
         source = (PACKAGE / 'packaging/freebsd' / name).read_text()
@@ -72,6 +86,11 @@ class PackagingStateTests(unittest.TestCase):
         source = (PACKAGE / 'build.sh').read_text()
         self.assertIn("('pre-install', '+PRE_INSTALL')", source)
         self.assertIn('packaging/freebsd/+PRE_INSTALL', source)
+        self.assertIn('src/usr/local/opnsense/scripts/singbox/config_setup.php', source)
+        post = (PACKAGE / 'packaging/freebsd/+POST_INSTALL').read_text()
+        self.assertIn('php /usr/local/opnsense/scripts/singbox/config_setup.php', post)
+        self.assertNotIn('/tmp/config.xml.tmp', post)
+        self.assertNotIn('CONFIG_FILE=', post)
 
     def test_install_preserves_existing_credentials_and_disabled_choice(self):
         content = self.existing()
@@ -106,6 +125,37 @@ class PackagingStateTests(unittest.TestCase):
         self.assertNotIn('sing-box start', self.trace.read_text())
         self.assertNotIn('sing-box restart', self.trace.read_text())
 
+    def test_restored_snapshot_does_not_seed_intentionally_absent_settings(self):
+        self.environment['HOOK_SNAPSHOT'] = '1'
+        shutil.rmtree(self.root / 'usr/local/etc/sing-box')
+        self.hook('+POST_INSTALL')
+        for path in LIVE:
+            self.assertFalse((self.root / path.lstrip('/')).exists(), path)
+        self.assertNotIn('sing-box start', self.trace.read_text())
+        self.assertFalse((self.root / 'usr/local/etc/sing-box').exists())
+
+    def test_restored_snapshot_permissions_remain_unchanged(self):
+        self.environment['HOOK_SNAPSHOT'] = '1'
+        content = self.existing()
+        for path in LIVE[:3]:
+            (self.root / path.lstrip('/')).chmod(0o400)
+        state = self.root / 'usr/local/etc/sing-box'
+        state.chmod(0o750)
+        self.hook('+POST_INSTALL')
+        self.assert_existing(content)
+        self.assertEqual(0o750, state.stat().st_mode & 0o777)
+        for path in LIVE[:3]:
+            self.assertEqual(0o400, (self.root / path.lstrip('/')).stat().st_mode & 0o777)
+
+    def test_failed_restore_neither_seeds_files_mirrors_nor_starts_service(self):
+        self.environment['HOOK_RESTORE_FAIL'] = '1'
+        self.hook('+POST_INSTALL')
+        for path in LIVE:
+            self.assertFalse((self.root / path.lstrip('/')).exists(), path)
+        trace = self.trace.read_text()
+        self.assertNotIn('backup mirror', trace)
+        self.assertNotIn('sing-box start', trace)
+
     def test_upgrade_deinstall_hooks_keep_settings_and_running_service_resumes(self):
         content = self.existing(enabled='YES')
         self.environment['HOOK_STOPPED'] = '0'
@@ -119,6 +169,22 @@ class PackagingStateTests(unittest.TestCase):
         self.assert_existing(content)
         self.assertEqual(1, self.trace.read_text().count('sing-box restart'))
         self.assertNotIn('sing-box stop', self.trace.read_text())
+
+    def test_failed_restore_keeps_private_legacy_upgrade_recovery_files(self):
+        content = self.existing()
+        self.hook('+PRE_INSTALL', upgrade=True)
+        for path in LIVE:
+            (self.root / path.lstrip('/')).unlink()
+        self.environment['HOOK_RESTORE_FAIL'] = '1'
+        self.hook('+POST_INSTALL', upgrade=True)
+        recovery = self.root / 'var/db/os-sing-box-upgrade'
+        self.assertEqual(0o700, recovery.stat().st_mode & 0o777)
+        for relative, expected in zip(['config.json', 'sub/env', 'sub/template.json', 'sing_box'], content):
+            saved = recovery / relative
+            self.assertEqual(expected, saved.read_text(), relative)
+            self.assertEqual(0o600, saved.stat().st_mode & 0o777)
+        for path in LIVE:
+            self.assertFalse((self.root / path.lstrip('/')).exists(), path)
 
 
 if __name__ == '__main__':

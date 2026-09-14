@@ -56,8 +56,8 @@ $(function () {
         ajaxCall(url, payload || {}, function (data) {
             button.prop('disabled', false);
             data = data || {};
-            report(data.status === 'ok' ? 'success' : 'danger', data.status === 'ok'
-                ? message : data.error || '{{ lang._('Operation failed.') }}');
+            report(data.status === 'ok' ? (data.warning ? 'warning' : 'success') : 'danger', data.status === 'ok'
+                ? message + (data.warning ? ' ' + data.warning : '') : data.error || '{{ lang._('Operation failed.') }}');
             if (data.status === 'ok' && reload) { load(); }
             refresh();
         });

@@ -12,12 +12,16 @@ COUNTS = ('20', '30', '40', '55', '100', 'all')
 
 
 def main():
+    if len(sys.argv) < 2:
+        raise ValueError('Snapshot options are required.')
     given = json.loads(base64.b64decode(sys.argv[1], validate=True))
+    if not isinstance(given, dict):
+        raise ValueError('Snapshot options must be an object.')
     view, sort, count = given.get('view', 'default'), given.get('sort', 'bytes'), given.get('count', '100')
     if view not in VIEWS or sort not in SORTS or count not in COUNTS:
         raise ValueError('Invalid snapshot options.')
     filter_value = str(given.get('filter', '')).strip()
-    if len(filter_value) > 160 or any(ord(char) < 32 for char in filter_value):
+    if len(filter_value) > 160 or any(ord(char) < 32 or ord(char) == 127 for char in filter_value):
         raise ValueError('The filter must contain at most 160 characters without control characters.')
     binary = next((path for path in ('/usr/local/sbin/pftop', '/usr/sbin/pftop', '/usr/bin/pftop')
                    if os.access(path, os.X_OK)), None)

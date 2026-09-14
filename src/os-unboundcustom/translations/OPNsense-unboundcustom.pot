@@ -42,6 +42,9 @@ msgstr ""
 msgid "Another apply operation is already running."
 msgstr ""
 
+msgid "Could not preserve the previous configuration fragments:"
+msgstr ""
+
 msgid "Template generation failed:"
 msgstr ""
 

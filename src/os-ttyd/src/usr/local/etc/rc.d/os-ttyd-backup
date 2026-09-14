@@ -1,0 +1,67 @@
+#!/bin/sh
+# PROVIDE: ttyd_config_backup
+# REQUIRE: FILESYSTEMS
+# BEFORE: ttyd
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name=ttyd_config_backup
+rcvar=ttyd_config_backup_enable
+pidfile=/var/run/ttyd-config-backup.pid
+command=/usr/sbin/daemon
+procname=/usr/local/bin/python3
+command_args="-P $pidfile -f -r -t $name $procname /usr/local/opnsense/scripts/ttyd/config_mirror.py watch"
+start_precmd=ttyd_config_backup_restore
+start_cmd=ttyd_config_backup_start
+status_cmd=ttyd_config_backup_running
+stop_cmd=ttyd_config_backup_stop
+
+
+ttyd_config_backup_running()
+{
+    [ -f "$pidfile" ] || return 1
+    watcher_pid="$(cat "$pidfile" 2>/dev/null || true)"
+    case "$watcher_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    /bin/ps -p "$watcher_pid" -o command= 2>/dev/null | /usr/bin/grep -Eq "^[[:space:]]*daemon: $name\[[0-9]+\]"
+}
+
+ttyd_config_backup_start()
+{
+    ttyd_config_backup_running && return 0
+    rm -f "$pidfile"
+    $command $command_args
+}
+
+ttyd_config_backup_restore()
+{
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/ttyd/config_mirror.py reconcile >/dev/null
+}
+
+
+ttyd_config_backup_stop()
+{
+    if [ -f "$pidfile" ]; then
+        watcher_pid="$(cat "$pidfile" 2>/dev/null || true)"
+        case "$watcher_pid" in
+            ''|*[!0-9]*) watcher_pid='' ;;
+        esac
+        if [ -n "$watcher_pid" ] && /bin/ps -p "$watcher_pid" -o command= 2>/dev/null | /usr/bin/grep -Eq "^[[:space:]]*daemon: $name\[[0-9]+\]"; then
+            /usr/bin/pkill -TERM -P "$watcher_pid" 2>/dev/null || true
+            /bin/kill -TERM "$watcher_pid" 2>/dev/null || true
+            count=0
+            while /bin/kill -0 "$watcher_pid" 2>/dev/null && [ "$count" -lt 5 ]; do
+                sleep 1
+                count=$((count + 1))
+            done
+            /bin/kill -KILL "$watcher_pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+    fi
+}
+
+: ${ttyd_config_backup_enable:=YES}
+load_rc_config "$name"
+run_rc_command "$1"

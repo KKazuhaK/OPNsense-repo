@@ -70,3 +70,11 @@ WebGUI 页面提供：
 - 访问地址显示
 - 配置文件在线编辑
 - 运行日志查看
+
+## Configuration backup
+
+The normal OPNsense configuration backup includes `/etc/rc.conf.d/ddnsgo`, the complete `/usr/local/etc/ddns-go` directory and the configuration file selected by `ddnsgo_config` when a custom path is used. The compressed, checksummed snapshot is stored under `OPNsense/Ddnsgo/backup`. It preserves service enable, listen address, interval, extra arguments and the original provider configuration, including stored credentials. Logs, PID files, locks and temporary files are excluded.
+
+The existing files remain the runtime configuration source. Saving YAML and changing the service updates the snapshot. A background watcher captures configuration changes made through DDNS-Go's own web interface every second.
+
+Restore the normal OPNsense backup and reboot. An early hook imports changed snapshots before the daemon reads its configuration. Unchanged snapshots do not replace newer runtime files. File contents, absence and permission modes are preserved, and installation imports saved settings before initializing defaults.

@@ -1,5 +1,11 @@
 #!/bin/sh
 
+if [ -f /usr/local/opnsense/scripts/singbox/config_mirror.py ]; then
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py mirror >/dev/null 2>&1 \
+        || echo 'Warning: Sing-box configuration backup could not be synchronized.' >&2
+fi
+service sing-box-backup onestop >/dev/null 2>&1 || true
+
 # Package upgrades keep live settings, interface assignments and runtime state.
 [ -n "${PKG_UPGRADE+x}" ] && exit 0
 

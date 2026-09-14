@@ -1,14 +1,13 @@
 #!/bin/sh
 set -eu
 
-CONFIG_FILE="/conf/config.xml"
-TMP_FILE="/tmp/config.xml.tmp"
-TUN_DEVICE="tun_singbox"
-RULE_UUID="762b3ec8-79c2-48b4-9793-c653bb3d2265"
-
-pkg_timestamp() {
-    date | sed 's/[^A-Za-z0-9]/_/g'
-}
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-sing-box >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
 
 echo "===> Configuring os-sing-box"
 
@@ -16,10 +15,28 @@ BACKUP_DIR="/var/db/os-sing-box-upgrade"
 NEW_SETTINGS=""
 INITIAL_INSTALL="no"
 WAS_RUNNING="no"
+RESTORED_SETTINGS="no"
+RESTORE_FAILED="no"
 umask 077
-mkdir -p /etc/rc.conf.d /usr/local/etc/sing-box/sub
-chmod 0700 /usr/local/etc/sing-box /usr/local/etc/sing-box/sub
+if restore_result="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py import-config 2>/dev/null)"; then
+    :
+else
+    RESTORE_FAILED="yes"
+    RESTORED_SETTINGS="yes"
+    echo 'Warning: Sing-box configuration backup could not be restored.' >&2
+fi
+if printf '%s' "$restore_result" | /usr/local/bin/python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("snapshot") else 1)' 2>/dev/null; then
+    RESTORED_SETTINGS="yes"
+fi
+mkdir -p /etc/rc.conf.d
+if [ "$RESTORED_SETTINGS" = "no" ]; then
+    mkdir -p /usr/local/etc/sing-box/sub
+    chmod 0700 /usr/local/etc/sing-box /usr/local/etc/sing-box/sub
+fi
 if [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ]; then
+    [ ! -f "$BACKUP_DIR/running" ] || WAS_RUNNING="yes"
+fi
+if [ "$RESTORED_SETTINGS" = "no" ] && [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ]; then
     for relative in config.json sub/env sub/template.json; do
         destination="/usr/local/etc/sing-box/$relative"
         if [ ! -f "$destination" ] && [ -f "$BACKUP_DIR/$relative" ]; then
@@ -29,21 +46,22 @@ if [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ]; then
     if [ ! -f /etc/rc.conf.d/sing_box ] && [ -f "$BACKUP_DIR/sing_box" ]; then
         install -m 0644 "$BACKUP_DIR/sing_box" /etc/rc.conf.d/sing_box
     fi
-    [ ! -f "$BACKUP_DIR/running" ] || WAS_RUNNING="yes"
 fi
-for relative in config.json sub/env sub/template.json; do
-    destination="/usr/local/etc/sing-box/$relative"
-    if [ ! -f "$destination" ]; then
-        install -m 0600 "$destination.sample" "$destination"
-        NEW_SETTINGS="$NEW_SETTINGS $destination"
+if [ "$RESTORED_SETTINGS" = "no" ]; then
+    for relative in config.json sub/env sub/template.json; do
+        destination="/usr/local/etc/sing-box/$relative"
+        if [ ! -f "$destination" ]; then
+            install -m 0600 "$destination.sample" "$destination"
+            NEW_SETTINGS="$NEW_SETTINGS $destination"
+        fi
+    done
+    if [ ! -f /etc/rc.conf.d/sing_box ]; then
+        install -m 0644 /etc/rc.conf.d/sing_box.sample /etc/rc.conf.d/sing_box
+        INITIAL_INSTALL="yes"
     fi
-done
-if [ ! -f /etc/rc.conf.d/sing_box ]; then
-    install -m 0644 /etc/rc.conf.d/sing_box.sample /etc/rc.conf.d/sing_box
-    INITIAL_INSTALL="yes"
 fi
 touch /var/log/sing-box.log /var/log/sing-box_sub.log 2>/dev/null || true
-chmod 0755 /usr/local/etc/sing-box/sub/sub.sh 2>/dev/null || true
+[ "$RESTORED_SETTINGS" = "yes" ] || chmod 0755 /usr/local/etc/sing-box/sub/sub.sh 2>/dev/null || true
 rm -f /usr/local/www/sing-box.php /usr/local/www/sing-box_log.php /usr/local/www/sing-box_sub.php /usr/local/www/sing-box_sub_log.php
 rm -f /usr/local/www/services_sub.php /usr/local/www/status_sing_box_logs.php
 rm -f /usr/local/www/services_sing_box.php /usr/local/www/status_sing_box.php
@@ -72,87 +90,28 @@ for secret_file in $NEW_SETTINGS; do
         ;;
     esac
 done
-chmod 0600 /usr/local/etc/sing-box/config.json 2>/dev/null || true
-chmod 0600 /usr/local/etc/sing-box/sub/env /usr/local/etc/sing-box/sub/template.json 2>/dev/null || true
-[ ! -d "$BACKUP_DIR" ] || rm -rf "$BACKUP_DIR"
-
-find_tun_interface() {
-    awk '
-    BEGIN { in_block = 0; current = ""; found = ""; max_opt = -1 }
-    {
-      if ($0 ~ /^[[:space:]]*<opt[0-9]+>[[:space:]]*$/) {
-        line = $0
-        gsub(/^[[:space:]]*</, "", line)
-        gsub(/>[[:space:]]*$/, "", line)
-        current = line
-        in_block = 1
-        num = current
-        sub(/^opt/, "", num)
-        if ((num + 0) > max_opt) max_opt = num + 0
-      }
-      if (in_block && $0 ~ /<if>tun_singbox<\/if>/) found = current
-      if (in_block && current != "" && $0 ~ ("^[[:space:]]*</" current ">[[:space:]]*$")) {
-        in_block = 0
-        current = ""
-      }
-    }
-    END { if (found != "") print found; else print "opt" (max_opt + 1) }
-    ' "$CONFIG_FILE"
-}
-
-if [ -f "$CONFIG_FILE" ]; then
-    cp "$CONFIG_FILE" "/conf/config.xml.bak.sing_box_pkg_install_$(pkg_timestamp)" || true
-    TARGET_IF_BLOCK="$(find_tun_interface)"
-
-    if ! grep -q "<if>${TUN_DEVICE}</if>" "$CONFIG_FILE"; then
-        echo "===> Adding ${TUN_DEVICE} interface as ${TARGET_IF_BLOCK}"
-        awk -v target="$TARGET_IF_BLOCK" -v dev="$TUN_DEVICE" '
-        BEGIN { inserted = 0 }
-        {
-          print
-          if ($0 ~ /<\/lo0>/ && inserted == 0) {
-            print "    <" target ">"
-            print "      <if>" dev "</if>"
-            print "      <descr>TUN</descr>"
-            print "      <enable>1</enable>"
-            print "    </" target ">"
-            inserted = 1
-          }
-        }
-        END { if (inserted == 0) exit 1 }
-        ' "$CONFIG_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$CONFIG_FILE" || rm -f "$TMP_FILE"
-    fi
-
-    TARGET_IF_BLOCK="$(find_tun_interface)"
-    if ! grep -q "$RULE_UUID" "$CONFIG_FILE"; then
-        echo "===> Adding TUN firewall pass rule"
-        awk -v target="$TARGET_IF_BLOCK" -v uuid="$RULE_UUID" '
-        BEGIN { inserted = 0 }
-        {
-          if ($0 ~ /^[[:space:]]*<filter>[[:space:]]*$/ && inserted == 0) {
-            print
-            print "          <rule uuid=\"" uuid "\">"
-            print "            <type>pass</type>"
-            print "            <interface>" target "</interface>"
-            print "            <ipprotocol>inet</ipprotocol>"
-            print "            <source><network>" target "</network></source>"
-            print "            <destination><any/></destination>"
-            print "            <descr>sing-box TUN Allow</descr>"
-            print "          </rule>"
-            inserted = 1
-            next
-          }
-          print
-        }
-        END { if (inserted == 0) exit 1 }
-        ' "$CONFIG_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$CONFIG_FILE" || rm -f "$TMP_FILE"
-    fi
+if [ "$RESTORED_SETTINGS" = "no" ]; then
+    chmod 0600 /usr/local/etc/sing-box/config.json 2>/dev/null || true
+    chmod 0600 /usr/local/etc/sing-box/sub/env /usr/local/etc/sing-box/sub/template.json 2>/dev/null || true
 fi
+if [ "$RESTORE_FAILED" = "no" ] && [ -d "$BACKUP_DIR" ]; then
+    rm -rf "$BACKUP_DIR"
+fi
+
+/usr/local/bin/php /usr/local/opnsense/scripts/singbox/config_setup.php >/dev/null 2>&1 \
+    || echo 'Warning: Sing-box interface configuration could not be synchronized.' >&2
 
 echo "===> Reloading OPNsense services"
 service configd restart >/dev/null 2>&1 || true
 configctl filter reload >/dev/null 2>&1 || true
-if [ "$WAS_RUNNING" = "yes" ]; then
+if [ "$RESTORE_FAILED" = "no" ]; then
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py mirror >/dev/null 2>&1 \
+        || echo 'Warning: Sing-box configuration backup could not be synchronized.' >&2
+fi
+service sing-box-backup onerestart >/dev/null 2>&1 || true
+if [ "$RESTORE_FAILED" = "yes" ]; then
+    :
+elif [ "$WAS_RUNNING" = "yes" ]; then
     service sing-box restart >/dev/null 2>&1 || true
 elif [ "$INITIAL_INSTALL" = "yes" ]; then
     service sing-box start >/dev/null 2>&1 || true

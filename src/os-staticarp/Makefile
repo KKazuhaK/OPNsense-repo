@@ -1,5 +1,5 @@
 PKG_NAME?=	os-staticarp
-VERSION?=	1.1.0
+VERSION?=	1.1.1
 TARGET_ABI?=	native
 
 .PHONY: package install clean

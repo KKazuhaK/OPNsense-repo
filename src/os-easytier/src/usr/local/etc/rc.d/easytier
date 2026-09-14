@@ -5,6 +5,12 @@
 
 . /etc/rc.subr
 
+case "$1" in
+    start|onestart|restart|onerestart)
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/config_mirror.py reconcile >/dev/null || exit 1
+        ;;
+esac
+
 name="easytier"
 rcvar="easytier_enable"
 desc="EasyTier mesh VPN"
@@ -44,6 +50,9 @@ easytier_prestart()
         echo "EasyTier configuration is missing or empty: ${configfile}"
         return 1
     fi
+    # The bundled core requires its management bind address on the command line.
+    rpc_portal="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/manage.py rpc-portal)" || return 1
+    command_args="-p ${pidfile} -o ${logfile} -t easytier ${procname} --config-file ${configfile} --rpc-portal ${rpc_portal}"
     install -d -m 0700 /usr/local/etc/easytier
     touch "${logfile}"
     chmod 0600 "${logfile}" "${configfile}"

@@ -7,6 +7,7 @@ const SPEEDTEST_SETTINGS = SPEEDTEST_STATE_DIR . '/settings.json';
 const SPEEDTEST_RESULT = SPEEDTEST_STATE_DIR . '/result.json';
 const SPEEDTEST_PROGRESS = SPEEDTEST_STATE_DIR . '/progress.json';
 const SPEEDTEST_RUNNER = '/usr/local/opnsense/scripts/speedtest/speedtest.py';
+const SPEEDTEST_MIRROR = '/usr/local/opnsense/scripts/speedtest/config_mirror.py';
 
 function speedtest_lang(): string {
     global $config;
@@ -53,6 +54,21 @@ function speedtest_save_settings(array $settings): void {
         if (file_put_contents($temporary, json_encode($settings, JSON_UNESCAPED_SLASHES), LOCK_EX) === false || !rename($temporary, SPEEDTEST_SETTINGS)) throw new RuntimeException('Unable to save settings.');
     } finally {
         if (file_exists($temporary)) unlink($temporary);
+    }
+    speedtest_mirror();
+}
+
+function speedtest_mirror(): void {
+    /* A backup is config.xml and nothing else, so what was just written is
+       echoed there by config_mirror.py. The file above stays the store and has
+       already been replaced by the time this runs, which is why nothing in
+       here may escape: a configuration the mirror cannot reach costs a line in
+       the log, never the save the operator asked for. */
+    try {
+        exec('/bin/timeout 20 /usr/local/bin/python3 ' . escapeshellarg(SPEEDTEST_MIRROR) . ' mirror 2>&1', $output, $status);
+        if ($status !== 0) log_msg('speedtest: settings saved but not mirrored into the configuration: ' . trim(implode(' ', $output)), LOG_WARNING);
+    } catch (Throwable $error) {
+        log_msg('speedtest: settings saved but not mirrored into the configuration: ' . $error->getMessage(), LOG_WARNING);
     }
 }
 

@@ -23,6 +23,17 @@ stop_cmd="${name}_stop"
 # shellcheck disable=SC2034
 status_cmd="${name}_status"
 
+# Restore before reading service variables or checking the enabled state.
+# Restart loads the old state first so its stop uses the running daemon's PID.
+case "$1" in
+    start|onestart|faststart|forcestart|quietstart)
+        if ! /usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py reconcile >/dev/null 2>&1; then
+            echo "Unable to prepare the restored Sing-box configuration."
+            exit 1
+        fi
+        ;;
+esac
+
 load_rc_config $name
 : "${sing_box_enable:=no}"
 
@@ -137,4 +148,13 @@ sing_box_status() {
     fi
 }
 
-run_rc_command "$1"
+case "$1" in
+    restart|onerestart|fastrestart|forcerestart|quietrestart)
+        run_rc_command onestop || exit $?
+        # A fresh process also clears overrides removed by the restored RC file.
+        next_action="${1%restart}start"
+        unset sing_box_enable
+        exec /bin/sh "$0" "$next_action"
+        ;;
+    *) run_rc_command "$1" ;;
+esac

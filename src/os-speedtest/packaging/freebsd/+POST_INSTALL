@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-speedtest >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
+
 ABI="$(pkg config ABI 2>/dev/null || pkg -vv 2>/dev/null | awk -F'"' '/ABI =/ {print $2; exit}')"
 case "$ABI" in
 	FreeBSD:14:amd64|FreeBSD:15:amd64|FreeBSD:16:amd64) ;;
@@ -12,8 +20,22 @@ chmod 0700 /var/db/speedtest
 chmod 0755 /usr/local/bin/opnsense-speedtest
 chmod 0644 \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Menu/Menu.xml \
-	/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/ACL/ACL.xml
+	/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/ACL/ACL.xml \
+	/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Backup.xml \
+	/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Backup.php
+chmod 0755 /usr/local/etc/rc.syshook.d/start/98-speedtest
 rm -f /usr/local/www/diagnostics_speedtest.php
+
+# A package installed onto a restored configuration finds its settings already
+# in config.xml; take them to disk now rather than at the next reboot. Nothing
+# is written when the configuration carries no section of ours.
+if /usr/local/bin/python3 /usr/local/opnsense/scripts/speedtest/config_mirror.py import-config >/dev/null 2>&1; then
+    # A legacy installation may have settings but no XML snapshot yet.
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/speedtest/config_mirror.py mirror >/dev/null 2>&1 \
+        || echo 'Warning: Speedtest settings could not be mirrored into the configuration backup.' >&2
+else
+    echo 'Warning: Speedtest configuration restore failed or needs repair; its saved backup was retained.' >&2
+fi
 service configd restart >/dev/null 2>&1 || true
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true

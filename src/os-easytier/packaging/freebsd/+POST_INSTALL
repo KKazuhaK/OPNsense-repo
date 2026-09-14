@@ -1,25 +1,41 @@
 #!/bin/sh
 set -eu
 
-mkdir -p /etc/rc.conf.d
-if [ ! -f /etc/rc.conf.d/easytier ]; then
-    if [ -f /var/db/os-easytier/rc.conf.upgrade ]; then
-        cp -p /var/db/os-easytier/rc.conf.upgrade /etc/rc.conf.d/easytier
-    else
-        install -m 0644 /etc/rc.conf.d/easytier.sample /etc/rc.conf.d/easytier
-    fi
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-easytier >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
+
+# Begin upgrade state restore.
+if [ ! -f /etc/rc.conf.d/easytier ] && [ -f /var/db/os-easytier/rc.conf.upgrade ]; then
+    mkdir -p /etc/rc.conf.d
+    cp -p /var/db/os-easytier/rc.conf.upgrade /etc/rc.conf.d/easytier
 fi
 rm -f /var/db/os-easytier/rc.conf.upgrade
+# End upgrade state restore.
 
 # Remove the retired entry point when upgrading from the legacy page.
 rm -f /usr/local/www/easytier.php
-mkdir -p /usr/local/etc/easytier /var/log
-if [ ! -e /usr/local/etc/easytier/config.toml ]; then
-    install -m 0600 /usr/local/etc/easytier/config.toml.sample /usr/local/etc/easytier/config.toml
+result="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/config_mirror.py import-config)" || exit 1
+snapshot="$(printf '%s' "$result" | /usr/local/bin/python3 -c 'import json,sys; result=json.load(sys.stdin); sys.exit(1) if not result.get("ok") else print("yes" if result.get("snapshot") else "no")')" || exit 1
+mkdir -p /var/log
+if [ "$snapshot" = no ]; then
+    mkdir -p /etc/rc.conf.d /usr/local/etc/easytier
+    if [ ! -e /etc/rc.conf.d/easytier ]; then
+        install -m 0644 /etc/rc.conf.d/easytier.sample /etc/rc.conf.d/easytier
+    fi
+    if [ ! -e /usr/local/etc/easytier/config.toml ]; then
+        install -m 0600 /usr/local/etc/easytier/config.toml.sample /usr/local/etc/easytier/config.toml
+    fi
+    chmod 0600 /usr/local/etc/easytier/config.toml
 fi
-chmod 0600 /usr/local/etc/easytier/config.toml
 touch /var/log/easytier.log
 chmod 0600 /var/log/easytier.log
+/usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/config_mirror.py mirror >/dev/null || echo 'Warning: EasyTier configuration backup could not be updated.' >&2
+service os-easytier-backup onestart >/dev/null 2>&1 || echo 'Warning: EasyTier configuration backup watcher could not be started.' >&2
 
 service configd restart >/dev/null 2>&1 || true
 configctl filter reload >/dev/null 2>&1 || true

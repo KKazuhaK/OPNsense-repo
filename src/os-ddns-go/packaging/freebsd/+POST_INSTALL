@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-ddns-go >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
+
 # Begin upgrade state restore.
 mkdir -p /etc/rc.conf.d
 if [ ! -f /etc/rc.conf.d/ddnsgo ]; then
@@ -20,6 +28,14 @@ if [ -d /var/db/os-ddns-go/state.upgrade ]; then
 fi
 # End upgrade state restore.
 
+# A restored native snapshot takes precedence over installation defaults.
+backup_result="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py import-config)" || {
+    echo "===> Unable to restore the saved plugin configuration." >&2
+    exit 1
+}
+backup_snapshot="$(printf '%s\n' "$backup_result" | /usr/local/bin/python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("snapshot") else "no")')"
+
+
 ABI="$(pkg config ABI 2>/dev/null || pkg -vv 2>/dev/null | awk -F'"' '/ABI =/ {print $2; exit}')"
 
 case "$ABI" in
@@ -34,7 +50,10 @@ case "$ABI" in
 esac
 
 echo "===> Preparing DDNS-Go runtime"
-mkdir -p /etc/rc.conf.d /usr/local/etc/ddns-go
+mkdir -p /etc/rc.conf.d
+if [ "$backup_snapshot" = "no" ]; then
+    mkdir -p /usr/local/etc/ddns-go
+fi
 chmod 0755 /usr/local/bin/ddns-go /usr/local/etc/rc.d/os-ddns-go 2>/dev/null || true
 chmod 0644 \
 	/usr/local/opnsense/mvc/app/controllers/OPNsense/Ddnsgo/IndexController.php \
@@ -42,13 +61,23 @@ chmod 0644 \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Ddnsgo/ACL/ACL.xml \
 	/usr/local/opnsense/service/conf/actions.d/actions_ddnsgo.conf \
 	/usr/local/share/opnsense-ddns-go/config.yaml.sample 2>/dev/null || true
-if [ ! -f /usr/local/etc/ddns-go/config.yaml ]; then
+if [ "$backup_snapshot" = "no" ] && [ ! -f /usr/local/etc/ddns-go/config.yaml ]; then
 	install -m 0600 /usr/local/share/opnsense-ddns-go/config.yaml.sample /usr/local/etc/ddns-go/config.yaml
 fi
 touch /var/log/ddnsgo.log 2>/dev/null || true
 chmod 0600 /var/log/ddnsgo.log 2>/dev/null || true
 
 find /usr/local/opnsense/mvc/app/controllers/OPNsense/Ddnsgo /usr/local/opnsense/mvc/app/views/OPNsense/Ddnsgo /usr/local/opnsense/scripts/ddnsgo -type f -exec chmod 0644 {} \; 2>/dev/null || true
+
+# Include existing settings in the next normal OPNsense configuration backup.
+/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py mirror >/dev/null || {
+    echo "===> Unable to save the plugin configuration backup." >&2
+    exit 1
+}
+service os-ddns-go-backup start >/dev/null || {
+    echo "===> Unable to start the plugin configuration backup watcher." >&2
+    exit 1
+}
 
 # Remove the retired page when upgrading from a legacy package.
 rm -f /usr/local/www/services_ddnsgo.php

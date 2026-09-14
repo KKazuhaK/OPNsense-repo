@@ -22,10 +22,20 @@ if ! mkdir "$lock" 2>/dev/null; then
 fi
 trap 'rmdir "$lock" 2>/dev/null || true' EXIT HUP INT TERM
 
+backup_fragment()
+{
+    if ! cp -p "$1" "$2" 2>/tmp/unboundcustom-template.log; then
+        backup_detail="$(cat /tmp/unboundcustom-template.log)"
+        rm -f /tmp/unboundcustom-template.log
+        json_result failed backup_failed "$backup_detail"
+        exit 0
+    fi
+}
+
 had_fragment=0
 if [ -f "$fragment" ]; then
     had_fragment=1
-    cp -p "$fragment" "$backup"
+    backup_fragment "$fragment" "$backup"
 else
     rm -f "$backup"
 fi
@@ -33,7 +43,7 @@ fi
 had_runtime_fragment=0
 if [ -f "$runtime_fragment" ]; then
     had_runtime_fragment=1
-    cp -p "$runtime_fragment" "$runtime_backup"
+    backup_fragment "$runtime_fragment" "$runtime_backup"
 else
     rm -f "$runtime_backup"
 fi
@@ -48,8 +58,8 @@ elif ! check_output=$(cd /var/unbound && /usr/local/sbin/unbound-checkconf unbou
     result_code='validation_failed'
     result_detail="$check_output"
 else
-    rm -f "$backup" "$runtime_backup" /tmp/unboundcustom-template.log
     if restart_output=$(/usr/local/sbin/configctl unbound restart 2>&1); then
+        rm -f "$backup" "$runtime_backup" /tmp/unboundcustom-template.log
         json_result ok success
         exit 0
     fi

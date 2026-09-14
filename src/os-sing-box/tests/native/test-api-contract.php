@@ -45,6 +45,19 @@ namespace OPNsense\Core {
     }
 }
 
+namespace OPNsense\SingBox\Api {
+    function tempnam(string $directory, string $prefix): string|false
+    {
+        $created = \tempnam($directory, $prefix);
+        // Preserve the requested spelling when /tmp is a filesystem alias.
+        $path = $created === false ? false : $directory . '/' . basename($created);
+        if ($path !== false && realpath($path) !== realpath($created)) {
+            throw new \RuntimeException('Request file escaped its staging directory.');
+        }
+        return $path;
+    }
+}
+
 namespace {
     use OPNsense\Core\Backend;
     use OPNsense\SingBox\Api\ServiceController;

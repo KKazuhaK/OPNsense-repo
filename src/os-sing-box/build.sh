@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-sing-box}"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 ORIGIN="${ORIGIN:-opnsense/os-sing-box}"
 COMMENT="${COMMENT:-sing-box proxy integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -56,6 +56,14 @@ need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api/Servi
 need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api/SettingsController.php"
 need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/SingBox/index.volt"
 need_file "src/usr/local/opnsense/scripts/singbox/singbox.php"
+need_file "src/usr/local/opnsense/scripts/singbox/config_mirror.py"
+need_file "src/usr/local/opnsense/scripts/singbox/config_setup.php"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/SingBox/Backup.php"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/SingBox/Backup.xml"
+need_file "src/usr/local/etc/rc.d/sing-box-backup"
+need_file "src/usr/local/etc/rc.syshook.d/start/15-singbox-backup"
+need_file "../common/config_backup.py"
+need_file "../common/config_backup.php"
 need_file "src/usr/bin/sing_box_sub"
 need_file "src/usr/local/bin/$SING_BOX_ASSET"
 need_file "packaging/freebsd/+MANIFEST.in"
@@ -147,6 +155,8 @@ prepare_binary() {
 
 echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
+install -m 0644 "$SCRIPT_DIR/../common/config_backup.py" "$STAGEDIR/usr/local/opnsense/scripts/singbox/config_backup.py"
+install -m 0644 "$SCRIPT_DIR/../common/config_backup.php" "$STAGEDIR/usr/local/opnsense/scripts/singbox/config_backup.php"
 prepare_binary "$SING_BOX_ASSET" "$SING_BOX_DOWNLOAD_URL" "$DOWNLOADDIR/sing-box"
 mkdir -p "$STAGEDIR/usr/local/bin"
 install -m 0755 "$DOWNLOADDIR/sing-box" "$STAGEDIR/usr/local/bin/sing-box"
@@ -158,6 +168,7 @@ chmod 0600 \
 chmod 0755 "$STAGEDIR/usr/local/etc/sing-box/sub/sub.sh"
 chmod 0755 "$STAGEDIR/usr/bin/sing_box_sub"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/sing-box"
+chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/sing-box-backup" "$STAGEDIR/usr/local/etc/rc.syshook.d/start/15-singbox-backup"
 
 echo "==> Generating plist"
 find "$STAGEDIR" -type f | sed "s#^$STAGEDIR##" | sort > "$PLIST"

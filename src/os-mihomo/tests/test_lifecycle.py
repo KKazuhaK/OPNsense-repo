@@ -29,6 +29,8 @@ class LifecycleHookTests(unittest.TestCase):
 from pathlib import Path
 with Path(os.environ['TEST_CALLS']).open('a') as stream:
     stream.write('control ' + ' '.join(sys.argv[2:]) + '\\n')
+if sys.argv[2:3] == ['reconcile-backup'] and os.environ.get('TEST_FAIL_RECONCILE') == '1':
+    raise SystemExit(1)
 ''')
         self.executable('usr/local/bin/php', "print('{}')\n")
         self.executable('usr/local/opnsense/scripts/firmware/register.php', '''import json,os,sys
@@ -44,7 +46,11 @@ with Path(os.environ['TEST_CALLS']).open('a') as stream:
     stream.write('register ' + action + ' ' + name + '\\n')
 ''')
         for name in ('service', 'configctl'):
-            self.executable('bin/' + name, 'import sys\n')
+            self.executable('bin/' + name, '''import os,sys
+from pathlib import Path
+with Path(os.environ['TEST_CALLS']).open('a') as stream:
+    stream.write(Path(sys.argv[0]).name + ' ' + ' '.join(sys.argv[1:]) + '\\n')
+''')
         (self.root / 'var/log').mkdir(parents=True)
 
     def executable(self, name, source):
@@ -69,6 +75,27 @@ with Path(os.environ['TEST_CALLS']).open('a') as stream:
             self.assertEqual(['os-ddclient', 'os-mihomo', 'os-other'],
                              json.loads(self.plugins.read_text()))
         self.assertEqual(2, self.calls.read_text().count('register install os-mihomo'))
+
+    def test_failed_fresh_restore_finishes_install_registration_without_defaults_or_startup(self):
+        self.env['TEST_FAIL_RECONCILE'] = '1'
+        cache = self.root / 'var/lib/php/tmp'
+        cache.mkdir(parents=True)
+        for name in ('opnsense_menu_cache.xml', 'opnsense_acl_cache.json'):
+            (cache / name).write_text('obsolete UI cache')
+        config = self.root / 'conf/config.xml'
+        config.parent.mkdir()
+        saved = b'<opnsense><OPNsense><Mihomo><backup><checksum>corrupt</checksum><secret>private-saved-secret</secret></backup></Mihomo></OPNsense></opnsense>'
+        config.write_bytes(saved)
+        result = self.run_hook('+POST_INSTALL')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('needs repair', result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls, ['control reconcile-backup', 'service configd restart', 'register install os-mihomo'])
+        self.assertEqual(config.read_bytes(), saved)
+        self.assertFalse((self.root / 'var/db/os-mihomo/settings.json').exists())
+        self.assertFalse(list(cache.iterdir()), 'A failed first restore must still clear stale menu/ACL caches')
+        for name in ('mihomo.log', 'mihomo_sub.log'):
+            self.assertEqual((self.root / 'var/log' / name).stat().st_mode & 0o777, 0o640)
 
     def test_solver_removal_keeps_desired_plugin_until_explicit_firmware_removal(self):
         self.plugins.write_text(json.dumps(['os-ddclient', 'os-mihomo', 'os-other']))

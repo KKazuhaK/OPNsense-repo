@@ -161,7 +161,7 @@ class SettingsController extends ApiControllerBase
             return ['status' => 'failed', 'error' => gettext('The backend did not answer.')];
         }
         return $decoded['ok'] ?? false
-            ? ['status' => 'ok']
+            ? ['status' => 'ok', 'warning' => $decoded['result']['warning'] ?? '']
             : ['status' => 'failed', 'error' => $decoded['error'] ?? gettext('Operation failed.')];
     }
 

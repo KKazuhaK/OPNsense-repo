@@ -31,10 +31,15 @@ need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/Api/Set
 need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Speedtest/Api/ServiceController.php"
 need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Speedtest/index.volt"
 need_file "src/usr/local/opnsense/scripts/speedtest/api.php"
+need_file "src/usr/local/opnsense/scripts/speedtest/config_mirror.php"
+need_file "src/usr/local/opnsense/scripts/speedtest/config_mirror.py"
 need_file "src/usr/local/opnsense/scripts/speedtest/speedtest.py"
 need_file "src/usr/local/opnsense/service/conf/actions.d/actions_speedtest.conf"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Menu/Menu.xml"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/ACL/ACL.xml"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Backup.xml"
+need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Backup.php"
+need_file "src/usr/local/etc/rc.syshook.d/start/98-speedtest"
 need_file "packaging/freebsd/+MANIFEST.in"
 need_file "packaging/freebsd/+POST_INSTALL"
 need_file "packaging/freebsd/+PRE_DEINSTALL"
@@ -66,7 +71,12 @@ install -m 0755 "$ENGINE" "$STAGEDIR/usr/local/bin/opnsense-speedtest"
 chmod 0644 \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Menu/Menu.xml" \
 	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/ACL/ACL.xml" \
+	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Backup.xml" \
+	"$STAGEDIR/usr/local/opnsense/mvc/app/models/OPNsense/Speedtest/Backup.php" \
 	"$STAGEDIR/usr/local/opnsense/version/speedtest"
+# The boot hook is executed, not sourced, so a checkout that lost the bit has
+# to get it back here rather than fail silently once per boot.
+chmod 0755 "$STAGEDIR/usr/local/etc/rc.syshook.d/start/98-speedtest"
 
 find "$STAGEDIR" \( -type f -o -type l \) | sed "s#^$STAGEDIR##" | sort > "$PLIST"
 FLATSIZE=0

@@ -6,6 +6,18 @@
 
 # Sing-Box for OPNsense
 
+OPNsense 常规 `config.xml` 备份包含 Sing-box 配置目录、订阅环境和模板、服务启用
+设置，以及配置中明确引用的自定义证书、密钥、信任目录和本地规则文件。保存配置和
+订阅更新会同步压缩快照；独立监视进程每秒检查文件编辑。安装插件或启动服务前会
+恢复导入的快照，并保留缺失文件和禁用状态。运行日志、锁、PID、样例、软件包
+提供的订阅脚本、内核缓存及编辑器保护密钥不进入备份。
+
+外部文件引用必须使用绝对路径；系统信任库和默认 hosts 文件由 OPNsense 提供。
+同步失败会保留已保存的文件并显示通用警告，不返回凭据。恢复后需先安装兼容的
+插件，再启动服务。导出的备份包含订阅 URL 和代理凭据，应作为私密文件保管。
+恢复会先检查版本、校验和及允许的路径，再替换文件、恢复权限和清理过期文件；
+失败时回滚。已有的软件包升级临时备份继续保留，用于兼容旧版软件包。
+
 ![OPNsense](https://img.shields.io/badge/OPNsense-red)
 ![Sing-Box](https://img.shields.io/badge/Sing--Box-Latest-brightgreen)
 
@@ -80,7 +92,7 @@ forward-zone:
 ## 安装命令
 将安装包上传到 OPNsense 后执行：
 ```sh
-pkg add -f os-sing-box-1.0.3.pkg
+pkg add -f os-sing-box-1.1.1.pkg
 ```
 刷新 OPNsense WebGUI，进入：
 ```text
@@ -94,7 +106,7 @@ pkg delete os-sing-box
 ```
 ## 订阅更新
 
-1.0.3 直接拉取完整 Sing-box JSON 订阅，不再支持 YAML 或模板转换。私密 URL 不进入进程参数或日志，HTTP 失败不重试。当前维护包面向 FreeBSD 15，旧 ABI 包作为兼容下载保留。
+当前插件直接拉取完整 Sing-box JSON 订阅，不再支持 YAML 或模板转换。私密 URL 不进入进程参数或日志，HTTP 失败不重试。当前维护包面向 FreeBSD 15，旧 ABI 包作为兼容下载保留。
 自动更新订阅可通过 Cron 完成：
 ```text
 转到 系统>设置>任务
@@ -116,11 +128,11 @@ make package
 生成文件：
 
 ```text
-dist/os-sing-box-1.0.3.pkg
+dist/os-sing-box-1.1.1.pkg
 ```
 检查包元数据：
 ```sh
-pkg info -F dist/os-sing-box-1.0.3.pkg
+pkg info -F dist/os-sing-box-1.1.1.pkg
 ```
 ## 常用命令
 服务控制：

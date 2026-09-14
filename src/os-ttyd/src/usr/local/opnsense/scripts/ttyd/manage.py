@@ -26,6 +26,16 @@ def run(action):
     return subprocess.run([RC, 'one' + action], capture_output=True, text=True, timeout=30)
 
 
+def mirror_configuration():
+    try:
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name('config_mirror.py')), 'mirror'],
+                                capture_output=True, text=True, timeout=30)
+        data = json.loads(result.stdout) if result.returncode == 0 else None
+        return isinstance(data, dict) and data.get('ok') is True
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
 def dispatch(action):
     if action == 'status':
         source = RC_CONFIG
@@ -42,8 +52,11 @@ def dispatch(action):
                 'port': setting('ttyd_port', '7681'), 'target': target, 'path': '/ttyd/'}
     if action in {'start', 'stop', 'restart'}:
         result = run(action)
-        return {'status': 'ok' if result.returncode == 0 else 'failed',
-                'error': '' if result.returncode == 0 else 'Unable to start or stop the terminal service. Check that Secure Shell is enabled.'}
+        response = {'status': 'ok' if result.returncode == 0 else 'failed',
+                    'error': '' if result.returncode == 0 else 'Unable to start or stop the terminal service. Check that Secure Shell is enabled.'}
+        if response['status'] == 'ok' and not mirror_configuration():
+            response['warning'] = 'The operation completed, but its configuration backup could not be updated.'
+        return response
     return {'status': 'failed', 'error': 'Unknown action.'}
 
 

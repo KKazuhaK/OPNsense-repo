@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import re
 import stat
 import subprocess
 import sys
+import syslog
 import tempfile
 import time
 import tomllib
@@ -28,6 +30,13 @@ MAX_DOCUMENT = 1048576
 LOG_LINES = 200
 SERVICE = '/usr/sbin/service'
 SYSRC = '/usr/sbin/sysrc'
+PHP = '/usr/local/bin/php'
+# The PHP end of the configuration mirror. It is a sibling of this file, but the
+# path is a constant so there is one place that says where the plugin keeps it.
+MIRROR = Path('/usr/local/opnsense/scripts/frp/config_mirror.php')
+APPLIED_BACKUP = CONFIG_DIR / '.backup-applied'
+# What rc.subr reads as "yes" in an rc.conf.d fragment.
+TRUE_WORDS = frozenset({'YES', 'TRUE', 'ON', '1'})
 
 SIDES = {
     'frps': {
@@ -73,8 +82,11 @@ class Error(Exception):
     """A failure whose message is safe to show in the web interface."""
 
 
-def run(arguments, timeout=30):
-    return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout)
+def run(arguments, timeout=30, stdin=None):
+    # stdin, not another argument: the mirror is handed a document that carries
+    # the authentication token, and a command line is readable in the process
+    # table by anyone on the box.
+    return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout, input=stdin)
 
 
 def table(data, name):
@@ -251,14 +263,25 @@ def scrub(text, secrets=()):
 
 # --- stored document ---------------------------------------------------------
 
-def read_document(path):
-    if not path.exists():
-        return {}
+def read_raw(path):
+    """The bytes of a document this plugin owns.
+
+    O_NOFOLLOW because the path is fixed and a symlink there is somebody
+    redirecting a root read, and a ceiling because the only thing that limits
+    the size of a file on disk is the disk.
+    """
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as stream:
         content = stream.read(MAX_DOCUMENT + 1)
     if len(content) > MAX_DOCUMENT:
         raise Error('The stored configuration is larger than the 1 MiB this plugin handles.')
+    return content
+
+
+def read_document(path):
+    if not path.exists():
+        return {}
+    content = read_raw(path)
     try:
         return jsonable(tomllib.loads(content.decode('utf-8')))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as failure:
@@ -469,15 +492,13 @@ def is_enabled(side):
     try:
         result = run([SYSRC, '-f', str(config['rcconf']), '-n', config['rcvar']], 10)
         if result.returncode == 0:
-            return result.stdout.strip().upper() in {'YES', 'TRUE', 'ON', '1'}
+            return result.stdout.strip().upper() in TRUE_WORDS
     except (OSError, subprocess.SubprocessError):
         pass
-    try:
-        content = config['rcconf'].read_text(encoding='utf-8', errors='replace')
-    except OSError:
-        return False
-    found = re.search(r'^\s*' + config['rcvar'] + r'\s*=\s*"?([A-Za-z0-9]+)"?', content, re.M)
-    return bool(found) and found.group(1).upper() in {'YES', 'TRUE', 'ON', '1'}
+    # sysrc(8) is not there, or would not answer: read the fragment the way it
+    # would have. One parser for that file is what keeps the page and the
+    # configuration mirror from disagreeing about the same boolean.
+    return enabled_at_boot(side)
 
 
 def set_enabled(side, enabled):
@@ -491,6 +512,380 @@ def set_enabled(side, enabled):
 def recent_log(side, data, lines=20):
     text = tail(log_path(side, data), lines)
     return scrub(text, collect(data).values()).strip()
+
+
+# --- the configuration mirror ------------------------------------------------
+#
+# An OPNsense backup is /conf/config.xml and nothing else, and frp keeps none of
+# its state there: the two documents live under the configuration directory and
+# the two boot flags in rc.conf.d.  A restored firewall therefore came back with
+# the shipped samples and both daemons disabled -- including, on a box reached
+# through frpc, the tunnel that was how anyone got to it.
+#
+# Everything below copies the live state into //OPNsense/Frp/backup so the
+# native backup carries it, and reads it back on a box that has just been
+# restored.  The direction is fixed: the files stay the source of truth each
+# daemon reads and config.xml is only ever written from them.  Nothing here may
+# fail the operation that triggered it either -- a settings save that reached
+# disk has succeeded whatever config.xml then does -- so the entry points return
+# a warning where they would otherwise raise.
+
+# What XML 1.0 can hold.  TOML may legally carry a raw control character that it
+# cannot, and libxml2 does not refuse such a document: it silently rewrites the
+# character as U+FFFD.  A mirror of one would restore a file corrupted in a way
+# nothing downstream can attribute, so it is refused here, which is the last
+# place the original bytes still exist to be compared against.
+XML_UNSAFE = re.compile('[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]')
+
+
+def unrepresentable(text):
+    """Where the first character XML cannot carry is, or '' when there is none."""
+    found = XML_UNSAFE.search(text)
+    if not found:
+        return ''
+    if masked_credentials(text):
+        raise Error('The ' + side + ' configuration contains an unresolved credential placeholder; '
+                    'enter the credential before backing it up.')
+    offset = found.start()
+    return 'U+%04X at line %d, column %d' % (
+        ord(found.group()), text.count('\n', 0, offset) + 1, offset - text.rfind('\n', 0, offset))
+
+
+def mirrored_document(side):
+    """The live document as text, or '' when there is nothing worth carrying."""
+    path = SIDES[side]['config']
+    if not path.exists():
+        return ''
+    try:
+        text = read_raw(path).decode('utf-8')
+    except UnicodeDecodeError:
+        raise Error('The ' + side + ' configuration is not UTF-8 text, so the configuration backup '
+                    'cannot carry it. Save it again from the ' + SIDES[side]['label'] + ' page.') from None
+    if not text.strip():
+        # An empty file is not a document -- the rc script refuses to start on
+        # one -- and mirroring it would replace a good stored copy with nothing.
+        return ''
+    where = unrepresentable(text)
+    if where:
+        raise Error('The ' + side + ' configuration holds a character XML cannot carry (' + where
+                    + '), so nothing was written to the configuration backup. config.xml would have '
+                    'dropped or replaced it and a restore would write a corrupted '
+                    'file. Remove it from ' + str(path) + ' and save again.')
+    return text
+
+
+def enabled_at_boot(side):
+    """What the rc.conf.d fragment says, read the way sh reads it: the last word wins.
+
+    This is the same question is_enabled() answers, asked without sysrc(8), so
+    that building the mirror stays a matter of reading this plugin's own files.
+    """
+    config = SIDES[side]
+    try:
+        content = config['rcconf'].read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return False
+    found = re.findall(r'^\s*' + config['rcvar'] + r'\s*=\s*"?([A-Za-z0-9]+)"?', content, re.M)
+    return bool(found) and found[-1].upper() in TRUE_WORDS
+
+
+def unmirrored_overrides(side):
+    """rc.conf.d settings in the fragment that the backup deliberately leaves behind.
+
+    The fragment may also point the daemon at another configuration file and
+    another log, and neither is mirrored.  The log path is not something the
+    tunnel depends on, and the plugin already resolves the log pane from the
+    document's own log.to rather than from rc.conf, so carrying it would add a
+    second answer to one question.  The configuration path is worse than merely
+    unmirrored: only the document this plugin manages is stored, so a restore
+    that faithfully reproduced a pointer somewhere else would produce a daemon
+    reading a file nobody restored.  Leaving the pointer behind leaves the
+    daemon reading the document the restore did write.
+
+    Neither is anything this plugin sets, so the only way one is here is that
+    somebody put it there by hand -- and they are told, because a backup that is
+    quietly incomplete is the failure this whole section exists to fix.
+    """
+    try:
+        content = SIDES[side]['rcconf'].read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return []
+    names = re.findall(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=', content, re.M)
+    return sorted({name for name in names if name != SIDES[side]['rcvar']})
+
+
+def mirror_payload():
+    """The live state as the one object config.xml carries.
+
+    Reads this plugin's own files and nothing else, so what a backup ends up
+    holding can be asserted without a router underneath.
+    """
+    payload = {}
+    for side in sorted(SIDES):
+        text = mirrored_document(side)
+        if text:
+            payload[side + '_toml'] = text
+        # A document that is not there is not the same as an empty one: leaving
+        # the key out tells the mirror to keep what it has, where sending ''
+        # would erase a good stored copy the moment the other daemon was
+        # started.  A missing rc.conf.d fragment does mean "not enabled", which
+        # is exactly what rc.subr concludes from it, so that one is always said.
+        payload[side + '_enable'] = is_enabled(side)
+    return payload
+
+
+def mirror_secrets(payload):
+    """Every credential a payload carries, so a failure cannot quote one back."""
+    secrets = []
+    for side in SIDES:
+        text = payload.get(side + '_toml')
+        if not isinstance(text, str) or not text:
+            continue
+        try:
+            secrets.extend(collect(jsonable(tomllib.loads(text))).values())
+        except (tomllib.TOMLDecodeError, ValueError):
+            continue
+    return secrets
+
+
+def shim(verb, payload=None):
+    """Run the one process that is allowed to touch config.xml."""
+    if not MIRROR.exists():
+        raise Error('The configuration mirror is not installed at ' + str(MIRROR) + '.')
+    try:
+        result = run([PHP, str(MIRROR), verb], 60,
+                     json.dumps(payload, ensure_ascii=False) if payload is not None else None)
+    except (OSError, subprocess.SubprocessError):
+        raise Error('The configuration mirror did not answer.') from None
+    if result.returncode != 0:
+        # The model reports a rejected value by quoting it back, and the value
+        # is a document that holds the authentication token.
+        reason = scrub(((result.stderr or '') + (result.stdout or '')).strip(),
+                       mirror_secrets(payload or {}))[:500].strip()
+        raise Error('The configuration mirror failed.' + (' ' + reason if reason else ''))
+    try:
+        answer = json.loads(result.stdout or '')
+    except ValueError:
+        raise Error('The configuration mirror answered with something that is not JSON.') from None
+    if not isinstance(answer, dict):
+        raise Error('The configuration mirror did not answer with an object.')
+    return answer
+
+
+def backup_token(fields):
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=True, sort_keys=True,
+                                    separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def applied_backup():
+    try:
+        value = APPLIED_BACKUP.read_text(encoding='ascii').strip()
+        return value if re.fullmatch(r'[a-f0-9]{64}', value) else None
+    except (OSError, UnicodeError):
+        return None
+
+
+def mark_backup(fields):
+    APPLIED_BACKUP.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=APPLIED_BACKUP.parent, prefix='.backup-applied.')
+    try:
+        with os.fdopen(handle, 'w', encoding='ascii') as output:
+            output.write(backup_token(fields) + '\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, APPLIED_BACKUP)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def mirror_warning(message):
+    syslog.syslog(syslog.LOG_WARNING, 'os-frp: ' + message)
+    return {'ok': False, 'warning': message}
+
+
+def mirror():
+    """Copy the live state into config.xml, reporting rather than raising.
+
+    Every caller has already changed the live state by the time it gets here. A
+    mirror that cannot run leaves the backup one version behind, which is what
+    the warning is for; a mirror that could fail the save would leave the daemon
+    and the page disagreeing about what is on disk, which is worse.
+    """
+    try:
+        stored = shim('import')
+        if any(not isinstance(name, str) or not isinstance(value, str) for name, value in stored.items()):
+            raise Error('The stored configuration mirror could not be read.')
+        expected = backup_token(stored)
+        marker = applied_backup()
+        if stored and marker is not None and marker != expected:
+            return mirror_warning('A restored FRP configuration is pending; import it before saving settings.')
+        payload = mirror_payload()
+        payload['_expected'] = expected
+    except Error as failure:
+        return mirror_warning(str(failure))
+    except OSError:
+        return mirror_warning('The live frp configuration could not be read for the configuration backup.')
+    warnings = [str(SIDES[side]['rcconf']) + ' also sets ' + ', '.join(extra)
+                + ', which the configuration backup does not carry.'
+                for side, extra in ((side, unmirrored_overrides(side)) for side in sorted(SIDES))
+                if extra]
+    try:
+        answer = shim('export', payload)
+        confirmed = shim('import')
+        for name, value in payload.items():
+            if name == '_expected':
+                continue
+            text = ('1' if value else '0') if isinstance(value, bool) else str(value)
+            if confirmed.get(name) != text:
+                raise Error('The FRP backup changed before its update could be confirmed.')
+        mark_backup(confirmed)
+    except (Error, OSError, ValueError, subprocess.SubprocessError) as failure:
+        reason = str(failure) if isinstance(failure, Error) else 'The configuration mirror could not be run.'
+        return mirror_warning(' '.join([reason] + warnings))
+    note = {'ok': True, 'changed': bool(answer.get('changed'))}
+    if warnings:
+        note['warning'] = ' '.join(warnings)
+        syslog.syslog(syslog.LOG_WARNING, 'os-frp: ' + note['warning'])
+    return note
+
+
+# --- adopting what a restore brought back ------------------------------------
+
+def truth(value):
+    """Read a stored flag whichever of its spellings the mirror handed back."""
+    return value if isinstance(value, bool) else str(value).strip().upper() in TRUE_WORDS
+
+
+def stated(value):
+    """Whether the mirror says anything at all about this field."""
+    return value is not None and not (isinstance(value, str) and not value.strip())
+
+
+def masked_credentials(text):
+    """Credential paths in a document that still hold the transport mask.
+
+    "__KEEP__" is what the page is shown in place of a credential so that no
+    secret is ever sent to the browser; the backend resolves it from the live
+    file before writing.  It therefore never exists on disk, and a document
+    carrying one did not come from disk.  Written back it would give frps a
+    token whose value is the literal placeholder: a daemon that authenticates
+    nobody, after a restore that looked like it worked.
+    """
+    if KEEP not in text:
+        return []
+    try:
+        data = jsonable(tomllib.loads(text))
+    except (tomllib.TOMLDecodeError, ValueError):
+        # The mask is in there somewhere and a document that does not parse
+        # offers no way to say it is not a credential.
+        return ['an unreadable position']
+    def positions(value, path=()):
+        if isinstance(value, dict):
+            return [position for name, item in value.items() for position in positions(item, path + (name,))]
+        if isinstance(value, list):
+            return [position for index, item in enumerate(value)
+                    for position in positions(item, path + (item_key(item, index),))]
+        return [dotted(path)] if value == KEEP else []
+    return sorted(positions(data))
+
+
+def adopt_document(side, text):
+    """Put one document back on disk. Answers whether the file actually changed."""
+    path = SIDES[side]['config']
+    content = text.encode('utf-8')
+    if path.exists():
+        try:
+            if read_raw(path) == content:
+                return False
+        except (Error, OSError):
+            pass
+    # The same private, fsynced, atomically renamed write a save uses: what is
+    # put back is a file the daemon may be about to read.
+    temporary = candidate_file(side, text)
+    try:
+        os.replace(temporary, path)
+    except OSError:
+        os.unlink(temporary)
+        raise
+    return True
+
+
+def adopt_payload(payload):
+    """Write the on-disk state the mirror carries, and nothing else.
+
+    Idempotent by construction: a file whose bytes already match is not
+    rewritten and a flag that already reads the wanted way is not flipped, so a
+    second run does nothing at all.  Nothing here starts, stops or reloads a
+    daemon either.  This runs from a package hook and from rc.syshook, where the
+    operator is not present, and the flags it writes are the whole of how frp
+    comes up: rc does the starting, the way it always does.
+    """
+    if not isinstance(payload, dict):
+        raise Error('The stored configuration is not an object.')
+    report = {'documents': [], 'flags': [], 'warnings': []}
+    for side in sorted(SIDES):
+        text = payload.get(side + '_toml')
+        # A field the stored section does not have, or does not have yet, is a
+        # field this leaves alone: half a restore beats a document made up here.
+        if isinstance(text, str) and text.strip():
+            masked = masked_credentials(text)
+            if masked:
+                report['warnings'].append(
+                    'The stored ' + side + ' configuration still holds the "' + KEEP
+                    + '" placeholder at ' + ', '.join(masked) + ', so it was not written. Enter the '
+                    'credential on the ' + SIDES[side]['label'] + ' page instead.')
+            else:
+                try:
+                    if adopt_document(side, text):
+                        report['documents'].append(side)
+                except (Error, OSError):
+                    report['warnings'].append('The stored ' + side + ' configuration could not be '
+                                              'written to ' + str(SIDES[side]['config']) + '.')
+        wanted = payload.get(side + '_enable')
+        if stated(wanted):
+            try:
+                if truth(wanted) != is_enabled(side):
+                    set_enabled(side, truth(wanted))
+                    report['flags'].append(side)
+            except (Error, OSError, subprocess.SubprocessError):
+                report['warnings'].append('The ' + side + ' startup setting could not be restored.')
+    return report
+
+
+def import_config():
+    """Converge the live state on what a restored config.xml carries.
+
+    Run from the package's own post-install, and again from rc.syshook at every
+    boot so that a configuration restored onto a box which already has the
+    plugin converges on the next reboot instead of never.  Both callers are
+    unattended, so a section that is absent, empty, or partly unknown to this
+    version is a no-op and not a failure.
+    """
+    report = {'imported': False, 'documents': [], 'flags': [], 'warnings': []}
+    try:
+        payload = shim('import')
+    except (Error, OSError, ValueError, subprocess.SubprocessError) as failure:
+        warning = str(failure) if isinstance(failure, Error) else 'The configuration mirror could not be run.'
+        report['warnings'].append(warning)
+        syslog.syslog(syslog.LOG_WARNING, 'os-frp: ' + warning)
+        return report
+    if not payload:
+        return report
+    if applied_backup() == backup_token(payload):
+        return report
+    report.update(adopt_payload(payload))
+    report['imported'] = True
+    if not report['warnings']:
+        try:
+            if shim('import') != payload:
+                raise Error('The FRP backup changed during restoration; retry the import.')
+            mark_backup(payload)
+        except (Error, OSError):
+            report['warnings'].append('The restored FRP configuration could not be confirmed; retry the import.')
+    for warning in report['warnings']:
+        syslog.syslog(syslog.LOG_WARNING, 'os-frp: ' + warning)
+    return report
 
 
 # --- log ---------------------------------------------------------------------
@@ -691,13 +1086,18 @@ def set_settings(side, argument):
                         + checked['message'])
         os.replace(temporary, SIDES[side]['config'])
         temporary = None
+        # The live file is now what the daemon reads, so it is also what the
+        # configuration backup should carry. This is deliberately after the
+        # replace and not before it: a candidate that never became the live
+        # file is not state anyone would want restored.
+        mirrored = mirror()
     finally:
         if temporary is not None and os.path.exists(temporary):
             os.unlink(temporary)
     issues = guards(side, merged)
     return {'saved': True, 'valid': checked['valid'], 'method': checked['method'],
             'message': checked['message'], 'guards': issues,
-            'restart_required': is_running(side)}
+            'restart_required': is_running(side), 'mirror': mirrored}
 
 
 def verify_settings(side, argument):
@@ -738,6 +1138,11 @@ def start(side):
     if checked['valid'] is False:
         raise Error(SIDES[side]['label'] + ' was not started because its configuration is invalid: ' + checked['message'])
     set_enabled(side, True)
+    # The boot flag has changed on disk, and that flag is half of what the
+    # backup carries. Mirroring here rather than after the service call is what
+    # keeps the two honest when the daemon then fails to come up: the flag is
+    # set either way, so the backup has to say so either way.
+    mirrored = mirror()
     started = run([SERVICE, side, 'onestart'], 60)
     if not wait_for(side, True):
         # The rc script refuses to start on its own account -- placeholders
@@ -747,15 +1152,16 @@ def start(side):
         reason = scrub((started.stdout + started.stderr).strip(), collect(data).values())
         raise Error(SIDES[side]['label'] + ' did not start. '
                     + (reason or recent_log(side, data) or 'Nothing was written to its log.'))
-    return {'running': True, 'enabled': True, 'pid': str(running_pid(side) or '')}
+    return {'running': True, 'enabled': True, 'pid': str(running_pid(side) or ''), 'mirror': mirrored}
 
 
 def stop(side):
     set_enabled(side, False)
+    mirrored = mirror()
     run([SERVICE, side, 'onestop'], 60)
     if not wait_for(side, False):
         raise Error(SIDES[side]['label'] + ' is still running after the stop request.')
-    return {'running': False, 'enabled': False, 'pid': ''}
+    return {'running': False, 'enabled': False, 'pid': '', 'mirror': mirrored}
 
 
 def restart(side):
@@ -781,6 +1187,11 @@ def log(side, argument=None):
 # --- entry point -------------------------------------------------------------
 
 READ_ONLY = {'status', 'settings', 'log'}
+# import-config restores both daemons from the one mirrored section, so it is
+# not a per-side action at all: the side on its command line is ignored and it
+# holds both locks. It is idempotent, so running it for either side, or twice,
+# converges the whole plugin exactly once.
+WHOLE_PLUGIN = frozenset({'import-config'})
 
 
 def dispatch(side, action, argument):
@@ -800,6 +1211,8 @@ def dispatch(side, action, argument):
         return stop(side)
     if action == 'restart':
         return restart(side)
+    if action == 'import-config':
+        return import_config()
     raise Error('Unknown action.')
 
 
@@ -815,7 +1228,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--json', action='store_true', help='Return structured action results for configd.')
     parser.add_argument('side', choices=sorted(SIDES))
-    parser.add_argument('action', choices=sorted(READ_ONLY | {'start', 'stop', 'restart', 'set-settings', 'verify'}))
+    parser.add_argument('action', choices=sorted(READ_ONLY | WHOLE_PLUGIN
+                                                 | {'start', 'stop', 'restart', 'set-settings', 'verify'}))
     parser.add_argument('argument', nargs='?')
     arguments = parser.parse_args()
     try:
@@ -824,11 +1238,15 @@ def main():
         else:
             if os.geteuid() != 0:
                 raise Error('Changing ' + arguments.side + ' state requires root privileges.')
-            lock = locked(arguments.side)
+            # Sorted, and both of them for an action that touches both, so
+            # two of these can never be holding one lock each and waiting.
+            sides = sorted(SIDES) if arguments.action in WHOLE_PLUGIN else [arguments.side]
+            locks = [locked(side) for side in sides]
             try:
                 result = dispatch(arguments.side, arguments.action, arguments.argument)
             finally:
-                lock.close()
+                for lock in locks:
+                    lock.close()
         if arguments.json:
             print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
         else:

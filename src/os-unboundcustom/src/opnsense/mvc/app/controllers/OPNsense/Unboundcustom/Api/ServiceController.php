@@ -24,6 +24,7 @@ class ServiceController extends ApiControllerBase
 
         $messages = [
             'busy' => gettext('Another apply operation is already running.'),
+            'backup_failed' => gettext('Could not preserve the previous configuration fragments:'),
             'template_failed' => gettext('Template generation failed:'),
             'stage_failed' => gettext('Could not stage the generated configuration fragment:'),
             'validation_failed' => gettext('Unbound configuration validation failed:'),

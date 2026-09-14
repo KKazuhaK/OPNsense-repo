@@ -1,9 +1,13 @@
 #!/usr/local/bin/python3
 """Manage Mihomo configuration, service state, and transparent DNS as one unit."""
 import argparse
+import base64
 import contextlib
 import copy
 import fcntl
+import gzip
+import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -14,21 +18,34 @@ import secrets
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 from xml.etree import ElementTree
 import time
+import zlib
+from urllib import parse as urlparse, request as urlrequest
 
 import yaml
 
 MAX_CONFIG = 16 * 1024 * 1024
+MAX_BACKUP = 24 * 1024 * 1024
+BACKUP_KEYS = ('subscription_url', 'secret', 'device', 'service_enabled', 'transparent',
+               'transparent_consent', 'mixed_port', 'socks_port', 'bind_address', 'allow_lan',
+               'tun_stack', 'tun_mtu', 'dns_mode', 'dns_hijack', 'dns_fallback', 'router_dns',
+               'ipv6', 'geo_source', 'dns_default', 'dns_nameserver', 'dns_proxy_nameserver',
+               'device_mode', 'device_list', 'controller')
+BACKUP_WARNING = 'The operation completed, but the Mihomo configuration backup could not be updated.'
+BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. The current local configuration is retained. '
+                            'Stop the service and use Repair saved backup to validate and import the edited backup.')
 UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
 FORWARDER = '127.0.0.1@1053'
 ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1
 SCRIPT = "/usr/local/opnsense/scripts/mihomo/mihomo.py"
 HELPER = "/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
+MIRROR_HELPER = "/usr/local/opnsense/scripts/mihomo/config_mirror.php"
 STATE = "/var/db/os-mihomo"
 HOME = STATE + "/home"
 SHARE = "/usr/local/share/mihomo"
@@ -41,6 +58,16 @@ DEFAULT_UI_URL = "https://github.com/Zephyruso/zashboard/releases/latest/downloa
 
 class Error(Exception):
     pass
+
+
+class BackupIntegrityError(Error):
+    pass
+
+
+class LocalAPIHandler(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, url):
+        # The controller secret belongs only to the local core.
+        return None
 
 
 class Loader(yaml.SafeLoader):
@@ -781,9 +808,10 @@ def atomic_write(path, content, mode=0o600):
 
 
 class System:
-    def run(self, args, timeout=45, check=True, cwd=None):
+    def run(self, args, timeout=45, check=True, cwd=None, input=None):
         try:
-            result = subprocess.run(args, capture_output=True, timeout=timeout, cwd=cwd)
+            options = {'input': input} if input is not None else {}
+            result = subprocess.run(args, capture_output=True, timeout=timeout, cwd=cwd, **options)
         except (subprocess.TimeoutExpired, OSError):
             raise Error("A system operation failed or timed out.") from None
         output = result.stdout + result.stderr
@@ -941,11 +969,12 @@ class System:
         except OSError:
             return False
 
-    def dns(self, enabled, settings):
+    def dns(self, enabled, settings, recovery_only=False):
         pending = Path(STATE) / "dns-reload-pending"
         was_pending = pending.exists()
         atomic_write(pending, b"pending\n")
-        result = self.run(["/usr/local/bin/php", HELPER, "enable" if enabled else "disable",
+        mode = 'rescue' if recovery_only else 'enable' if enabled else 'disable'
+        result = self.run(["/usr/local/bin/php", HELPER, mode,
                   "1" if settings["dns_fallback"] else "0"], timeout=90)
         # "unchanged" reports that the configuration already said this. It says
         # nothing about the file Unbound reads, which is generated from that
@@ -976,6 +1005,17 @@ class System:
     def tun(self):
         self.run(['/usr/local/bin/php', HELPER, 'enable-tun'], timeout=90)
         self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
+
+    def restore_integration(self, settings, payload):
+        # Early boot restores only configuration; normal boot starts services.
+        atomic_write(Path(STATE) / 'dns-reload-pending', b'pending\n')
+        self.run(['/usr/local/bin/php', HELPER, 'restore-backup',
+                  '1' if settings['dns_fallback'] else '0'],
+                 input=json.dumps(payload, ensure_ascii=True).encode(), timeout=90)
+
+    def rescue(self, settings):
+        # Pending XML cannot be paired with the older local ownership journals.
+        self.dns(False, settings, recovery_only=True)
 
     def check_router_dns(self):
         import struct
@@ -1061,7 +1101,7 @@ def fetch_subscription(url, user_agent, proxy="127.0.0.1:7891", run=subprocess.r
 
 
 class Manager:
-    def __init__(self, root=Path("/"), system=None):
+    def __init__(self, root=Path("/"), system=None, backup_transport=None, proxy_api=None):
         self.root = Path(root)
         self.system = system or System()
         self.state = self.path(STATE)
@@ -1071,12 +1111,23 @@ class Manager:
         self.merge_file = self.state / 'merge.yaml'
         self.warnings_file = self.state / 'warnings.json'
         self.status_file = self.path("/var/run/mihomo-status.json")
+        self.backup_marker = self.state / 'backup-applied.sha256'
+        self.backup_warning_file = self.state / 'backup-warning'
+        self.selections_file = self.state / 'proxy-selections.json'
+        self.replay_file = self.state / 'proxy-replay-pending'
+        self.proxy_warning_file = self.state / 'proxy-backup-warning'
+        self.backup_transport = backup_transport or self._backup_transport
+        self.proxy_api = proxy_api or self._proxy_api
+        self._lock_depth = 0
 
     def path(self, path):
         return self.root / path.lstrip("/")
 
     @contextlib.contextmanager
     def lock(self, blocking=True):
+        if self._lock_depth:
+            yield
+            return
         path = self.path("/var/run/os-mihomo.lock")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as stream:
@@ -1085,7 +1136,466 @@ class Manager:
                 fcntl.flock(stream, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             except BlockingIOError:
                 raise Error("Another Mihomo operation is in progress.") from None
-            yield
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+
+    def _backup_read(self, path):
+        for parent in [path, *path.parents]:
+            if parent == self.root.parent:
+                break
+            if parent.is_symlink():
+                raise Error('A Mihomo backup path traverses a symbolic link.')
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor, 'rb') as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_CONFIG:
+                raise Error('A Mihomo backup file exceeds its supported size or type.')
+            content = handle.read(MAX_CONFIG + 1)
+            after = os.fstat(handle.fileno())
+        if len(content) > MAX_CONFIG or (before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino,
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise Error('The Mihomo configuration changed while its backup was read.')
+        return content
+
+    def _backup_transport(self, action, payload=None):
+        helper = self.path(MIRROR_HELPER)
+        # Existing isolated backend fixtures never bootstrap the host's XML.
+        if self.root != Path('/') and not helper.exists():
+            return {} if action == 'import' else {'changed': False}
+        try:
+            answer = subprocess.run(['/usr/local/bin/php', str(helper), action],
+                input=json.dumps(payload, ensure_ascii=True).encode() if payload is not None else None,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=False)
+            if answer.returncode or len(answer.stdout) > MAX_BACKUP:
+                raise ValueError()
+            decoded = json.loads(answer.stdout)
+            if not isinstance(decoded, dict):
+                raise ValueError()
+            return decoded
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise Error('The native Mihomo configuration backup operation failed.') from None
+
+    @staticmethod
+    def _backup_checksum(payload):
+        fields = {key: value for key, value in payload.items() if key != 'checksum'}
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in fields.items()):
+            raise Error('The stored Mihomo configuration backup is invalid.')
+        content = json.dumps(fields, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode()
+        if len(content) > MAX_BACKUP:
+            raise Error('The stored Mihomo configuration backup exceeds its size limit.')
+        return hashlib.sha256(content).hexdigest()
+
+    def _stored_backup(self, verify=True):
+        stored = self.backup_transport('import')
+        if not isinstance(stored, dict):
+            raise Error('The stored Mihomo configuration backup is invalid.')
+        checksum = self._backup_checksum(stored)
+        if 'checksum' in stored and not isinstance(stored['checksum'], str):
+            raise Error('The stored Mihomo configuration backup is invalid.')
+        if verify and stored.get('checksum') and stored['checksum'] != checksum:
+            raise BackupIntegrityError(BACKUP_INTEGRITY_WARNING)
+        return stored, checksum
+
+    @staticmethod
+    def _backup_revision(stored):
+        return hashlib.sha256(json.dumps(stored, ensure_ascii=True, sort_keys=True,
+                              separators=(',', ':')).encode()).hexdigest()
+
+    def _guard_backup(self):
+        stored, checksum = self._stored_backup()
+        marker = self._backup_read(self.backup_marker)
+        if stored and (marker or b'').strip() != checksum.encode():
+            raise Error('A restored Mihomo configuration is pending. Stop the service and restore it or reboot before saving.')
+        return stored
+
+    def _preset_path(self, name):
+        if name not in ('full.yaml', 'tun-only.yaml', 'proxy-only.yaml'):
+            raise Error('The stored Mihomo merge preset is invalid.')
+        path = self.path(SHARE + '/presets/' + name)
+        return path if path.exists() else Path(__file__).resolve().parents[3] / 'share/mihomo/presets' / name
+
+    def _consent_scope(self):
+        xml = self._backup_read(self.path('/conf/config.xml'))
+        if xml:
+            with contextlib.suppress(ElementTree.ParseError):
+                doc = ElementTree.fromstring(xml)
+                identity = [doc.findtext('./system/' + name, '') for name in ('uuid', 'hostname', 'domain')]
+                if any(identity):
+                    return hashlib.sha256('|'.join(identity).encode()).hexdigest()
+        return ''
+
+    def _mirror_payload(self):
+        settings = self.settings()
+        payload = {key: json.dumps(settings[key], ensure_ascii=True, separators=(',', ':'))
+                   for key in BACKUP_KEYS if key in settings}
+        merge = self._backup_read(self.merge_file) or b'{}\n'
+        payload['merge_yaml'] = json.dumps(merge.decode('utf-8'), ensure_ascii=True)
+        payload['merge_preset'] = ''
+        actual = parse_yaml(merge)
+        for name in ('full.yaml', 'tun-only.yaml', 'proxy-only.yaml'):
+            preset = parse_yaml(self._preset_path(name).read_bytes())
+            absorb_switches(preset, settings)
+            if actual == preset:
+                payload['merge_preset'] = name
+                break
+        source = self._backup_read(self.source_file)
+        payload['subscription_snapshot'] = base64.b64encode(gzip.compress(source, mtime=0)).decode() if source is not None else ''
+        data = parse_yaml(source) if source is not None else {}
+        local = []
+        for path in self._reference_paths(data, actual):
+            value = self._backup_read(self.path(path))
+            local.append({'path': path, 'data': base64.b64encode(value).decode() if value is not None else None,
+                          'mode': stat.S_IMODE(self.path(path).stat().st_mode) if value is not None else 0o600})
+        raw = json.dumps({'version': 1, 'files': local}, sort_keys=True, separators=(',', ':')).encode()
+        if len(raw) > MAX_CONFIG:
+            raise Error('Referenced Mihomo configuration exceeds its backup size limit.')
+        payload['local_files'] = base64.b64encode(gzip.compress(raw, mtime=0)).decode()
+        payload['proxy_selections'] = (self._backup_read(self.selections_file) or b'{}').decode('utf-8')
+        for field, filename in [('dns_state', 'dns-state.json'), ('tun_state', 'tun-state.json')]:
+            value = self._backup_read(self.state / filename)
+            payload[field] = json.dumps(value.decode('utf-8'), ensure_ascii=True) if value is not None else ''
+        payload['consent_scope'] = self._consent_scope()
+        payload['checksum'] = self._backup_checksum(payload)
+        return payload
+
+    def mirror_backup(self):
+        with self.lock():
+            try:
+                stored = self._guard_backup()
+                payload = {**stored, **self._mirror_payload()}
+                payload['checksum'] = self._backup_checksum(payload)
+                answer = self.backup_transport('export', {**payload, '_expected': self._backup_revision(stored)})
+                if not isinstance(answer, dict):
+                    raise ValueError()
+                atomic_write(self.backup_marker, (payload['checksum'] + '\n').encode())
+                self.backup_warning_file.unlink(missing_ok=True)
+                if self.proxy_warning_file.exists():
+                    raise Error(BACKUP_WARNING)
+                return {'ok': True, 'changed': bool(answer.get('changed'))}
+            except (Error, OSError, ValueError, TypeError, UnicodeError) as error:
+                warning = BACKUP_INTEGRITY_WARNING if isinstance(error, BackupIntegrityError) else BACKUP_WARNING
+                with contextlib.suppress(OSError):
+                    atomic_write(self.backup_warning_file, warning.encode())
+                return {'ok': False, 'warning': warning}
+
+    def _mirrored_result(self, result):
+        report = self.mirror_backup()
+        if not report['ok']:
+            result['warning'] = report['warning']
+        with contextlib.suppress(Error, OSError, ValueError):
+            status = json.loads(self.status_file.read_bytes()) if self.status_file.exists() else {}
+            self.publish_status(dns_active=bool(status.get('dns_active')), error=status.get('error', ''))
+        return result
+
+    @staticmethod
+    def _backup_text(value):
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, str) else value
+        except ValueError:
+            return value
+
+    @staticmethod
+    def _selection_map(value):
+        mapping = json.loads(value)
+        if (not isinstance(mapping, dict) or len(mapping) > 512 or any(
+                not isinstance(key, str) or not isinstance(choice, str) or not key or
+                len(key) > 4096 or len(choice) > 4096 for key, choice in mapping.items())):
+            raise Error('The stored Mihomo proxy selections are invalid.')
+        return mapping
+
+    @staticmethod
+    def _journal(field, raw):
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise Error('The stored Mihomo ownership journal is invalid.')
+        if field == 'dns_state':
+            if (str(value.get('forwarding')) not in ('0', '1') or
+                    type(value.get('had_fake_ip_private_address')) is not bool or
+                    not isinstance(value.get('roots'), dict) or len(value['roots']) > 512 or any(
+                        not re.fullmatch(r'[A-Za-z0-9-]{1,128}', key) or str(enabled) not in ('0', '1')
+                        for key, enabled in value['roots'].items())):
+                raise Error('The stored Mihomo ownership journal is invalid.')
+        elif (not re.fullmatch(r'opt[0-9]{1,8}', value.get('interface', '')) or
+              type(value.get('created_interface')) is not bool or type(value.get('created_rule')) is not bool):
+            raise Error('The stored Mihomo ownership journal is invalid.')
+        return raw
+
+    def _reference_paths(self, data, overlay):
+        merged = merge_yaml(data, overlay)
+        paths = set()
+        for field in ('proxy-providers', 'rule-providers'):
+            providers = merged.get(field, {})
+            if not isinstance(providers, dict):
+                raise Error('The Mihomo provider configuration is invalid.')
+            for provider in providers.values():
+                if not isinstance(provider, dict) or provider.get('type') != 'file':
+                    continue
+                value = provider.get('path')
+                if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
+                    raise Error('A local Mihomo provider has an unsupported configuration path.')
+                path = os.path.normpath(value if value.startswith('/') else HOME + '/' + value)
+                forbidden = ('/conf', '/dev', '/proc', '/boot', '/bin', '/sbin', '/usr/bin',
+                    '/usr/sbin', '/usr/lib', '/usr/local/bin', '/usr/local/sbin', '/usr/local/lib',
+                    '/usr/local/opnsense', '/etc/ssh', '/usr/local/etc/pkg', '/root/.ssh')
+                critical = {'/', '/etc', '/usr', '/usr/local', '/usr/local/etc', '/var', '/var/db',
+                    '/var/run', '/var/log', '/root', '/home', '/tmp', '/etc/passwd',
+                    '/etc/master.passwd', '/etc/group', '/etc/rc', '/etc/rc.conf', '/etc/fstab'}
+                if (path.startswith('//') or path in critical or path in (STATE, HOME, HOME + '/cache.db') or
+                        any(path == root or path.startswith(root + '/') for root in forbidden) or
+                        (path.startswith(STATE + '/') and not path.startswith(HOME + '/'))):
+                    raise Error('A local Mihomo provider references a protected configuration path.')
+                paths.add(path)
+        if len(paths) > 512:
+            raise Error('There are too many local Mihomo provider files to back up.')
+        return sorted(paths)
+
+    def _reference_restore(self, stored, data, overlay):
+        paths = self._reference_paths(data, overlay)
+        if 'local_files' not in stored:
+            if paths:
+                raise Error('The saved Mihomo backup is missing local provider files.')
+            return {}
+        compressed = base64.b64decode(stored['local_files'], validate=True)
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as handle:
+            raw = handle.read(MAX_CONFIG + 1)
+        if len(raw) > MAX_CONFIG:
+            raise ValueError()
+        document = json.loads(raw)
+        if (not isinstance(document, dict) or document.get('version') != 1 or
+                not isinstance(document.get('files'), list) or len(document['files']) > 512 or
+                any(not isinstance(entry, dict) or set(entry) != {'path', 'data', 'mode'}
+                    or not isinstance(entry['path'], str) or
+                    (entry['data'] is not None and not isinstance(entry['data'], str))
+                    for entry in document['files']) or [e['path'] for e in document['files']] != paths):
+            raise ValueError()
+        restored = {}
+        for entry in document['files']:
+            if type(entry['mode']) is not int or not 0 <= entry['mode'] <= 0o777:
+                raise ValueError()
+            content = base64.b64decode(entry['data'], validate=True) if entry['data'] is not None else None
+            if content is not None and len(content) > MAX_CONFIG:
+                raise ValueError()
+            restored[self.path(entry['path'])] = (content, entry['mode'])
+        return restored
+
+    def restore_backup(self, force=False, repair=False):
+        with self.lock():
+            stored, checksum = self._stored_backup(verify=not repair)
+            if not stored:
+                return {'restored': False, 'snapshot': False}
+            if not force and (self._backup_read(self.backup_marker) or b'').strip() == checksum.encode():
+                return {'restored': False, 'snapshot': True}
+            if self.system.running():
+                raise Error('Stop Mihomo before restoring its configuration backup.')
+            try:
+                settings = {
+                    'subscription_url': '', 'secret': secrets.token_hex(32), 'device': 'router',
+                    'transparent': False, 'transparent_consent': False, 'service_enabled': True,
+                    'dns_fallback': True, **SWITCH_DEFAULTS}
+                with contextlib.suppress(Error):
+                    if self.settings_file.exists():
+                        settings = self.settings()
+                for field in BACKUP_KEYS:
+                    if field not in stored or stored[field] == '':
+                        continue
+                    fallback = settings.get(field, [] if field in (*DNS_SERVER_FIELDS, 'device_list') else
+                                            'off' if field == 'device_mode' else LOOPBACK_CONTROLLER)
+                    decoded = json.loads(stored[field]) if not isinstance(fallback, str) else self._backup_text(stored[field])
+                    if isinstance(fallback, bool) and type(decoded) is int and decoded in (0, 1):
+                        decoded = bool(decoded)
+                    if type(decoded) is not type(fallback):
+                        raise ValueError()
+                    settings[field] = decoded
+                settings.update(transparent=False, transparent_consent=False,
+                                state_schema=STATE_SCHEMA, switch_schema=SWITCH_SCHEMA)
+                self.check_settings(settings)
+                pending = {self.settings_file: (json.dumps(settings, indent=2) + '\n').encode()}
+                merge = self._backup_read(self.merge_file)
+                if stored.get('merge_preset'):
+                    preset = parse_yaml(self._preset_path(self._backup_text(stored['merge_preset'])).read_bytes())
+                    absorb_switches(preset, settings)
+                    merge = yaml.safe_dump(preset, allow_unicode=True, sort_keys=False).encode()
+                elif 'merge_yaml' in stored:
+                    merge = self._backup_text(stored['merge_yaml']).encode('utf-8') or b'{}\n'
+                if merge is None:
+                    merge = self._preset_path('full.yaml').read_bytes()
+                overlay = parse_yaml(merge)
+                pending[self.merge_file] = merge
+                source = self._backup_read(self.source_file)
+                if 'subscription_snapshot' in stored:
+                    if stored['subscription_snapshot']:
+                        encoded = base64.b64decode(stored['subscription_snapshot'], validate=True)
+                        with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as handle:
+                            source = handle.read(MAX_CONFIG + 1)
+                        if len(source) > MAX_CONFIG:
+                            raise ValueError()
+                    else:
+                        source = None
+                    pending[self.source_file] = source
+                data = parse_yaml(source) if source is not None else {'proxies': [], 'proxy-groups': [], 'rules': ['MATCH,DIRECT']}
+                if source is not None:
+                    check_subscription(data)
+                journals = {}
+                scope = stored.get('consent_scope', '')
+                if scope and not re.fullmatch('[a-f0-9]{64}', scope):
+                    raise ValueError()
+                current_scope = self._consent_scope()
+                owned = bool(scope and scope == current_scope)
+                for field, filename in [('dns_state', 'dns-state.json'), ('tun_state', 'tun-state.json')]:
+                    if field in stored:
+                        raw = self._backup_text(stored[field]) if stored[field] else ''
+                        # Validate even untrusted journals, but never install them
+                        # over local journals before their XML pairing is checked.
+                        validated = self._journal(field, raw) if raw else None
+                        journals[field] = json.loads(validated) if owned and validated else None
+                    pending[self.state / filename] = None
+                if 'proxy_selections' in stored:
+                    selections = self._selection_map(stored['proxy_selections'] or '{}')
+                    pending[self.selections_file] = json.dumps(selections, ensure_ascii=True, sort_keys=True).encode()
+                    pending[self.replay_file] = b'pending\n' if selections else None
+                references = self._reference_restore(stored, data, overlay)
+                pending.update({path: content for path, (content, mode) in references.items()})
+                upstreams, ipv6 = self.router_context(settings)
+                config = render(data, settings, overlay=overlay, upstreams=upstreams, ipv6_advertised=ipv6)
+                pending[self.config_file] = config
+                pending[self.backup_marker] = (checksum + '\n').encode()
+                self.state.mkdir(parents=True, mode=0o700, exist_ok=True)
+                staged, originals, recovery, applied, created = {}, {}, {}, [], []
+                committed = False
+                try:
+                    for path, content in pending.items():
+                        originals[path] = self._backup_read(path)
+                        parent = path.parent
+                        while not parent.exists():
+                            parent = parent.parent
+                        if originals[path] is not None:
+                            fd, name = tempfile.mkstemp(prefix='.backup-original-', dir=parent)
+                            os.close(fd)
+                            recovery[path] = Path(name)
+                            atomic_write(recovery[path], originals[path], stat.S_IMODE(path.stat().st_mode))
+                        if content is not None:
+                            fd, name = tempfile.mkstemp(prefix='.backup-restore-', dir=parent)
+                            os.close(fd)
+                            staged[path] = Path(name)
+                            atomic_write(staged[path], content, references.get(path, (None, 0o600))[1])
+                    self.system.validate(staged[self.config_file])
+                    for path in pending:
+                        if path in (self.state / 'dns-state.json', self.state / 'tun-state.json'):
+                            continue
+                        missing = []
+                        parent = path.parent
+                        while not parent.exists():
+                            missing.append(parent)
+                            parent = parent.parent
+                        for parent in reversed(missing):
+                            parent.mkdir(mode=0o700)
+                            created.append(parent)
+                        if pending[path] is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            os.replace(staged[path], path)
+                        applied.append(path)
+                    restore = getattr(self.system, 'restore_integration', self.system.dns)
+                    payload = {'expected': self._backup_revision(stored), 'scope': scope, 'current_scope': current_scope,
+                               'journals': journals, 'repair_checksum': checksum if repair else ''}
+                    restore(settings, payload) if hasattr(self.system, 'restore_integration') else restore(False, settings)
+                    committed = True
+                except Exception:
+                    for path in reversed(applied):
+                        try:
+                            if originals[path] is None:
+                                path.unlink(missing_ok=True)
+                            else:
+                                os.replace(recovery[path], path)
+                        except OSError:
+                            pass
+                    for parent in reversed(created):
+                        with contextlib.suppress(OSError):
+                            parent.rmdir()
+                    raise
+                finally:
+                    for path in staged.values():
+                        path.unlink(missing_ok=True)
+                    for destination, path in recovery.items():
+                        if committed or destination not in applied:
+                            path.unlink(missing_ok=True)
+                # Core caches are derived; proxy choices are replayed through API.
+                result = {'restored': True, 'snapshot': True}
+                if not owned and any(stored.get(field) for field in ('dns_state', 'tun_state')):
+                    result['warning'] = 'The saved ownership journals do not match this system configuration and were not applied.'
+                try:
+                    (self.path(HOME) / 'cache.db').unlink(missing_ok=True)
+                    self.backup_warning_file.unlink(missing_ok=True)
+                    self.proxy_warning_file.unlink(missing_ok=True)
+                    self.record_warnings(data, overlay)
+                    self.publish_status(settings)
+                except (Error, OSError, ValueError):
+                    result['warning'] = 'The Mihomo configuration was restored, but its derived status could not be refreshed.'
+                return result
+            except (Error, OSError, ValueError, TypeError, UnicodeError, EOFError, zlib.error):
+                raise Error('The Mihomo configuration backup could not be restored; its saved copy was retained.') from None
+
+    def _proxy_api(self, method, path, payload=None):
+        if self.root != Path('/'):
+            return {'proxies': {}} if method == 'GET' else {}
+        settings = self.settings()
+        host, port = settings.get('controller', LOOPBACK_CONTROLLER).rsplit(':', 1)
+        host = '127.0.0.1'
+        request = urlrequest.Request('http://' + host + ':' + port + path,
+            data=json.dumps(payload).encode() if payload is not None else None, method=method,
+            headers={'Authorization': 'Bearer ' + settings['secret'], 'Content-Type': 'application/json'})
+        opener = urlrequest.build_opener(urlrequest.ProxyHandler({}), LocalAPIHandler())
+        with opener.open(request, timeout=2) as response:
+            value = response.read(2 * 1024 * 1024 + 1)
+        if len(value) > 2 * 1024 * 1024:
+            raise ValueError()
+        return json.loads(value) if value else {}
+
+    def proxy_tick(self):
+        if not self.system.running():
+            return False
+        try:
+            proxies = self.proxy_api('GET', '/proxies').get('proxies', {})
+            if not isinstance(proxies, dict) or len(proxies) > 4096:
+                raise ValueError()
+            if self.replay_file.exists():
+                saved = self._selection_map((self._backup_read(self.selections_file) or b'{}').decode())
+                deadline, mutations, complete = time.monotonic() + 3, 0, True
+                for name, choice in saved.items():
+                    group = proxies.get(name, {})
+                    if group.get('type', '').lower() != 'selector' or choice not in group.get('all', []):
+                        continue
+                    if group.get('now') != choice:
+                        if mutations >= 32 or time.monotonic() >= deadline:
+                            complete = False
+                            break
+                        self.proxy_api('PUT', '/proxies/' + urlparse.quote(name, safe=''), {'name': choice})
+                        mutations += 1
+                        group['now'] = choice
+                if not complete:
+                    return False
+                self.replay_file.unlink(missing_ok=True)
+            choices = {name: group['now'] for name, group in proxies.items() if isinstance(group, dict)
+                       and group.get('type', '').lower() == 'selector' and group.get('all')
+                       and isinstance(group.get('now'), str) and group['now'] != group['all'][0]}
+            self._selection_map(json.dumps(choices))
+            self.proxy_warning_file.unlink(missing_ok=True)
+            content = json.dumps(choices, ensure_ascii=True, sort_keys=True).encode()
+            if content != (self._backup_read(self.selections_file) or b'{}'):
+                atomic_write(self.selections_file, content)
+                return True
+        except (OSError, ValueError, Error, TypeError, AttributeError):
+            with contextlib.suppress(OSError):
+                atomic_write(self.proxy_warning_file, BACKUP_WARNING.encode())
+        return False
 
     def settings(self):
         try:
@@ -1170,7 +1680,9 @@ class Manager:
         status = {"running": self.system.running(), "transparent": settings["transparent"],
                   "dns_active": dns_active, "dns_fallback": settings["dns_fallback"],
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
-                  "error": error, "updated": time.time()}
+                  "error": error, "backup_warning": self.backup_warning_file.read_text()
+                      if self.backup_warning_file.exists() else BACKUP_WARNING
+                      if self.proxy_warning_file.exists() else '', "updated": time.time()}
         atomic_write(self.status_file, json.dumps(status).encode(), 0o644)
         return status
 
@@ -1187,6 +1699,7 @@ class Manager:
             pass
 
     def initialize(self, upgrade=False):
+        self._restore_for_start()
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.state, 0o700)
         if self.settings_file.exists():
@@ -1272,7 +1785,7 @@ class Manager:
         # previous one. Retire it here so the next start runs the installed code.
         self.system.stop_watch()
         self.publish_status(settings)
-        return {"initialized": True, "transparent": settings["transparent"]}
+        return self._mirrored_result({"initialized": True, "transparent": settings["transparent"]})
 
     def router_context(self, settings):
         if not settings.get('router_dns'):
@@ -1345,6 +1858,9 @@ class Manager:
                 self.system.tun()
             if dns_active:
                 self.system.dns(True, settings)
+            if self.selections_file.exists():
+                atomic_write(self.replay_file, b'pending\n')
+            self.proxy_tick()
             self.system.watch()
         except Error:
             self.stop(settings)
@@ -1352,6 +1868,7 @@ class Manager:
         return self.publish_status(settings, dns_active)
 
     def apply(self, content, settings=None, subscription=True, overlay=None):
+        self._guard_backup()
         settings = settings or self.settings()
         if overlay is not None:
             settings = absorb_switches(overlay, settings)
@@ -1420,7 +1937,7 @@ class Manager:
             for path in backup_dir.iterdir():
                 path.unlink(missing_ok=True)
             backup_dir.rmdir()
-        return {"applied": True, "proxies": len(data.get("proxies", [])), "rules": len(data["rules"])}
+        return self._mirrored_result({"applied": True, "proxies": len(data.get("proxies", [])), "rules": len(data["rules"])})
 
     def set_policy(self, enabled):
         settings = self.settings()
@@ -1455,6 +1972,7 @@ class Manager:
             except BlockingIOError:
                 raise Error("A subscription update is already running.") from None
             with self.lock():
+                self._guard_backup()
                 settings = self.settings()
                 proxy = ''
                 if self.system.running():
@@ -1494,6 +2012,39 @@ class Manager:
         return {"queued": True}
 
     def watchdog_tick(self):
+        try:
+            self._guard_backup()
+        except Error as error:
+            # Backup preservation must not disable the local crash rescue path.
+            # Only the running-settings rewrite and mirror need the XML guard.
+            settings = self.settings()
+            active = False
+            with contextlib.suppress(OSError, ValueError):
+                active = bool(json.loads(self.status_file.read_bytes()).get('dns_active'))
+            rescue_error = ''
+            if not self.system.running():
+                self.system.destroy_tun()
+                pending_dns = (self.state / 'dns-reload-pending').exists()
+                if pending_dns or (active and (settings['dns_fallback'] or not settings['service_enabled'])):
+                    try:
+                        if hasattr(self.system, 'rescue'):
+                            self.system.rescue(settings)
+                        else:
+                            self.system.dns(False, settings)
+                        active = False
+                    except (Error, OSError):
+                        rescue_error = 'Direct DNS recovery failed and will be retried. '
+            if isinstance(error, BackupIntegrityError):
+                atomic_write(self.backup_warning_file, BACKUP_INTEGRITY_WARNING.encode())
+            return self.publish_status(settings, active, error=rescue_error + str(error))
+        result = self._watchdog_tick()
+        self.proxy_tick()
+        self.mirror_backup()
+        result['backup_warning'] = BACKUP_WARNING if self.backup_warning_file.exists() or self.proxy_warning_file.exists() else ''
+        atomic_write(self.status_file, json.dumps(result).encode(), 0o644)
+        return result
+
+    def _watchdog_tick(self):
         settings = self.settings()
         try:
             status = json.loads(self.status_file.read_bytes())
@@ -1516,7 +2067,52 @@ class Manager:
                 return self.publish_status(settings, active)
         return self.publish_status(settings, active)
 
+    def _restore_for_start(self):
+        try:
+            return self.restore_backup()
+        except BackupIntegrityError as error:
+            atomic_write(self.backup_warning_file, BACKUP_INTEGRITY_WARNING.encode())
+            # A damaged XML mirror must not retire a usable local installation.
+            # Fresh installs still fail with the explicit repair instructions.
+            try:
+                self.settings()
+                parse_yaml(self.config_file.read_bytes())
+            except (Error, OSError):
+                raise error from None
+            return {'restored': False, 'snapshot': True, 'warning': BACKUP_INTEGRITY_WARNING}
+
     def dispatch(self, action, argument=None):
+        if action == 'repair-backup':
+            return self.restore_backup(force=True, repair=True)
+        if action == 'import-config':
+            return self.restore_backup(force=True)
+        if action == 'reconcile-backup':
+            return self._restore_for_start()
+        if action == 'mirror-backup':
+            result = self.mirror_backup()
+            if not result['ok']:
+                raise Error(BACKUP_WARNING)
+            return result
+        if action in {'start', 'restart', 'boot'}:
+            if action == 'restart' and self.system.running():
+                stored, checksum = self._stored_backup(verify=False)
+                if stored and (self._backup_read(self.backup_marker) or b'').strip() != checksum.encode():
+                    # Stop the old writer before applying newly restored intent.
+                    self.system.stop_watch()
+                    self.system.stop()
+            self._restore_for_start()
+        mutation = action not in {'status', 'devices', 'clear-log', 'clear-sub-log', 'queue-update'}
+        if mutation and action not in {'init', 'stop', 'suspend', 'remove', 'start', 'restart', 'boot'}:
+            self._guard_backup()
+        if action in {'stop', 'suspend', 'remove'}:
+            self.proxy_tick()
+        result = self._dispatch(action, argument)
+        if mutation and action not in {'init', 'sub-update', 'save-config', 'save-merge',
+                'load-preset', 'set-settings', 'enable-transparent', 'disable-transparent'}:
+            result = self._mirrored_result(result)
+        return result
+
+    def _dispatch(self, action, argument=None):
         if action in {"clear-log", "clear-sub-log"}:
             path = self.path("/var/log/mihomo.log" if action == "clear-log" else "/var/log/mihomo_sub.log")
             with path.open("w"):

@@ -5,15 +5,25 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import yaml
+from config_backup import BackupError, rc_value
 
 CONFIG = Path('/usr/local/etc/ddns-go/config.yaml')
 RC_CONFIG = Path('/etc/rc.conf.d/ddnsgo')
 LOG = Path('/var/log/ddnsgo.log')
 PRIVATE_KEY = re.compile(r'password|passwd|secret|token|credential|key|userid|username|webhook|authorization', re.I)
 MARKER_PREFIX = '__DDNSGO_KEEP_'
+
+
+def mirror_settings():
+    try:
+        return subprocess.run([sys.executable, str(Path(__file__).with_name('config_mirror.py')), 'mirror'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        return False
 
 
 def marker(path):
@@ -50,8 +60,21 @@ def stored_scalars(value, path=(), private=False):
     return result
 
 
-def read_config():
-    raw = CONFIG.read_bytes() if CONFIG.exists() else b''
+def config_path():
+    # Use the same literal rc assignment parser as the backup profile. Never
+    # execute shell expansions while locating the daemon's configuration.
+    raw = RC_CONFIG.read_bytes() if RC_CONFIG.exists() else b''
+    value = rc_value(raw, 'ddnsgo_config', str(CONFIG))
+    if (not value.startswith('/') or value.startswith('//') or value == '/' or
+            str(Path(value)) != value or '..' in Path(value).parts or
+            any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise ValueError('The configuration file must use an absolute application path without parent traversal.')
+    return Path(value)
+
+
+def read_config(configuration=None):
+    configuration = config_path() if configuration is None else configuration
+    raw = configuration.read_bytes() if configuration.exists() else b''
     value = yaml.safe_load(raw) if raw.strip() else {}
     if not isinstance(value, dict):
         raise ValueError('The configuration must be a YAML mapping.')
@@ -59,14 +82,14 @@ def read_config():
 
 
 def listen_address():
-    raw = RC_CONFIG.read_text() if RC_CONFIG.exists() else ''
-    found = re.search(r'^ddnsgo_listen="([^"\r\n]*)"', raw, re.M)
-    return found.group(1) if found else ':9876'
+    raw = RC_CONFIG.read_bytes() if RC_CONFIG.exists() else b''
+    return rc_value(raw, 'ddnsgo_listen', ':9876')
 
 
 def main():
     action = sys.argv[1]
-    raw, current = read_config()
+    configuration = config_path()
+    raw, current = read_config(configuration)
     revision = hashlib.sha256(raw).hexdigest()
     if action == 'get':
         return {'settings': {'config_content': yaml.safe_dump(transform(current), allow_unicode=True, sort_keys=False),
@@ -85,6 +108,8 @@ def main():
     if action != 'set':
         raise ValueError('Unknown action.')
     given = json.loads(Path(sys.argv[2]).read_text())
+    if not isinstance(given, dict):
+        raise ValueError('The settings must be a JSON object.')
     content = str(given.get('config_content', ''))
     if not content.strip():
         raise ValueError('The configuration content cannot be empty.')
@@ -96,16 +121,18 @@ def main():
     if not isinstance(document, dict):
         raise ValueError('The configuration must be a YAML mapping.')
     restored = transform(document, restore=stored_scalars(current))
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix='.ddnsgo-', dir=CONFIG.parent)
+    configuration.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix='.ddnsgo-', dir=configuration.parent)
     try:
         with os.fdopen(descriptor, 'w') as handle:
             yaml.safe_dump(restored, handle, allow_unicode=True, sort_keys=False)
         os.chmod(temporary, 0o600)
-        os.replace(temporary, CONFIG)
+        os.replace(temporary, configuration)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+    if not mirror_settings():
+        return {'status': 'failed', 'saved': True, 'error': 'Settings were saved, but the configuration backup failed.'}
     return {'status': 'ok'}
 
 
@@ -115,6 +142,6 @@ if __name__ == '__main__':
     except yaml.YAMLError:
         # Parser diagnostics include configuration lines and can expose secrets.
         result = {'status': 'failed', 'error': 'The configuration contains invalid YAML.'}
-    except (ValueError, OSError, KeyError, TypeError, RecursionError) as exception:
+    except (BackupError, ValueError, OSError, KeyError, TypeError, RecursionError) as exception:
         result = {'status': 'failed', 'error': str(exception)}
     print(json.dumps(result))

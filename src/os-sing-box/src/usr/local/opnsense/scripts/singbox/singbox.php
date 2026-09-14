@@ -1,8 +1,28 @@
 <?php
 /* Copyright (C) 2026 Kazuha. All rights reserved. */
 
-/* All callers use the existing plugin store. No config.xml model is needed. */
+/* Plugin files remain authoritative; successful writes mirror into config.xml. */
 const SINGBOX_KEEP = '__SING_BOX_KEEP_STORED_VALUE__';
+
+function singbox_mirror_result(array $result): array
+{
+    if (empty($result['ok'])) {
+        return $result;
+    }
+    $root = getenv('SINGBOX_ROOT') ?: '';
+    if ($root !== '') {
+        putenv('OS_SINGBOX_BACKUP_ROOT=' . $root);
+    }
+    $output = [];
+    $code = 1;
+    exec('/usr/local/bin/python3 ' . escapeshellarg(singbox_path('/usr/local/opnsense/scripts/singbox/config_mirror.py'))
+        . ' mirror 2>/dev/null', $output, $code);
+    $answer = json_decode(implode("\n", $output), true);
+    if ($code !== 0 || !is_array($answer) || empty($answer['ok'])) {
+        $result['warning'] = 'The settings were saved, but the configuration backup could not be synchronized.';
+    }
+    return $result;
+}
 
 function singbox_mvc_key(): string
 {
@@ -430,7 +450,11 @@ function singbox_update(bool $background, bool $wait = false): array
         $message = $code === 0 ? 'Subscription validated and applied.' : 'Subscription update failed. Check the subscription log.';
         file_put_contents(singbox_path('/var/log/sing-box_sub.log'), date('[Y-m-d H:i:s] ') . singbox_scrub(implode("\n", $output)) . "\n", FILE_APPEND | LOCK_EX);
         singbox_update_state(['running' => false, 'ok' => $code === 0, 'message' => $message]);
-        return ['ok' => $code === 0, 'error' => $code === 0 ? '' : $message];
+        $result = singbox_mirror_result(['ok' => $code === 0, 'error' => $code === 0 ? '' : $message]);
+        if (!empty($result['warning'])) {
+            singbox_update_state(['running' => false, 'ok' => $code === 0, 'message' => $message . ' ' . $result['warning']]);
+        }
+        return $result;
     } finally {
         flock($handle, LOCK_UN);
         fclose($handle);
@@ -450,7 +474,14 @@ function singbox_action(string $action, string $argument = ''): array
                 fclose($handle);
             }
         case 'set-settings':
-            return singbox_save_url(singbox_request($argument));
+            $handle = singbox_config_lock();
+            try {
+                $result = singbox_save_url(singbox_request($argument));
+            } finally {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+            }
+            return singbox_mirror_result($result);
         case 'save-config':
             $handle = singbox_config_lock();
             try {
@@ -461,11 +492,12 @@ function singbox_action(string $action, string $argument = ''): array
                 if (!hash_equals(singbox_revision(), $request['revision'])) {
                     throw new RuntimeException('The configuration changed. Reload it before saving.');
                 }
-                return singbox_save_config($request['config']);
+                $result = singbox_save_config($request['config']);
             } finally {
                 flock($handle, LOCK_UN);
                 fclose($handle);
             }
+            return singbox_mirror_result($result);
         case 'status':
             $output = [];
             $code = 1;
@@ -477,7 +509,7 @@ function singbox_action(string $action, string $argument = ''): array
             $output = [];
             $code = 1;
             exec('/usr/sbin/service sing-box ' . $action . ' 2>&1', $output, $code);
-            return ['ok' => $code === 0, 'error' => $code === 0 ? '' : 'Service operation failed. Check the service log.'];
+            return singbox_mirror_result(['ok' => $code === 0, 'error' => $code === 0 ? '' : 'Service operation failed. Check the service log.']);
         case 'log':
         case 'sub-log':
             return ['ok' => true, 'log' => singbox_tail($action === 'log' ? 'sing-box.log' : 'sing-box_sub.log')];

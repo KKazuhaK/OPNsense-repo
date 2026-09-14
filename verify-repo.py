@@ -19,7 +19,7 @@ INDEPENDENT_ABI = 'FreeBSD:*:amd64'
 VERSION_PATTERN = r'[0-9][0-9A-Za-z._,+]*'
 PHASES = ('pre-install', 'post-install', 'pre-deinstall', 'post-deinstall')
 REGISTRY = 'packaging/plugins.json'
-RECORD_FIELDS = {'staging', 'abi', 'version', 'stage', 'deps', 'vendored', 'generated',
+RECORD_FIELDS = {'staging', 'abi', 'version', 'stage', 'shared', 'deps', 'vendored', 'generated',
                  'version_file', 'reason', 'notes'}
 VENDOR_FIELDS = {'artifact', 'sha256', 'sha256_file', 'checksums_file', 'archive',
                  'members', 'install'}
@@ -182,10 +182,12 @@ def plugin_records(source):
                    signed product-series rewrite of os-kazuha-repo, "unsupported"
                    names a plugin this verifier refuses to publish and why.
       abi          "target" requires FreeBSD:<major>:amd64, "independent" requires
-                   FreeBSD:*:amd64.
+                   FreeBSD:*:amd64, or a concrete FreeBSD ABI pins one runtime.
       version      the version this source publishes; a package may carry no other.
       stage        {source directory under the plugin: install directory}. Every
                    committed file under src/ must fall inside one of them.
+      shared       {repository-relative source file: install file} for regular
+                   files copied from outside the plugin, inside the repository.
       deps         {package: origin} the manifest must declare, exactly.
       vendored     artifacts unpacked into the stage. Each one pins a sha256 that
                    this verifier recomputes before it unpacks anything.
@@ -219,7 +221,8 @@ def plugin_record(source, plugin):
         raise ValueError('Unsupported additional release package: ' + plugin)
     if record['staging'] == 'unsupported':
         raise ValueError('Unsupported additional release package: ' + plugin + ': ' + str(record.get('reason', '')))
-    if record.get('abi') not in {'target', 'independent'}:
+    abi = record.get('abi')
+    if abi not in {'target', 'independent'} and (not isinstance(abi, str) or not re.fullmatch(ABI_PATTERN, abi)):
         raise ValueError('The staging record for ' + plugin + ' declares no ABI policy.')
     return record
 
@@ -234,6 +237,8 @@ def package_version(manifest):
 def abi_allowed(record, abi):
     if record['abi'] == 'independent':
         return abi == INDEPENDENT_ABI
+    if record['abi'] != 'target':
+        return abi == record['abi']
     return bool(re.fullmatch(ABI_PATTERN, abi))
 
 
@@ -316,6 +321,18 @@ def vendored_files(root, record):
                     if not member.isreg():
                         raise ValueError('A vendored archive may only stage regular files: ' + name)
                     contents[name] = archive.extractfile(member).read()
+        elif item.get('archive') == 'pkg':
+            if item.get('install') or not isinstance(item.get('members'), dict) or not item['members']:
+                raise ValueError('A vendored archive must name the members it stages.')
+            members = {name: install_path(value) for name, value in item['members'].items()}
+            contents = {}
+            inventory = python_members(artifact)
+            for name in members:
+                install_path(name)
+                selected = [member for member in inventory if member.name == name]
+                if len(selected) != 1 or not selected[0].isreg() or selected[0].mode & 0o7000:
+                    raise ValueError('A vendored archive may only stage unique regular files: ' + name)
+                contents[name] = subprocess.check_output(['tar', '-xOf', str(artifact), '-P', '--', name])
         else:
             raise ValueError('Unsupported vendored archive format: ' + str(item.get('archive')))
         for name, install in members.items():
@@ -363,20 +380,45 @@ def staged_tree(root, record, artifacts=frozenset()):
     return result
 
 
-def record_files(root, record, manifest, plugin):
+def shared_files(repository, record):
+    """Read explicitly registered shared files without leaving the repository."""
+    shared = record.get('shared', {})
+    if not isinstance(shared, dict):
+        raise ValueError('Invalid shared file staging record.')
+    result = {}
+    for relative, destination in shared.items():
+        path = source_path(repository, relative)
+        install = install_path(destination)
+        if any(install == other or install.startswith(other + '/') or other.startswith(install + '/')
+               for other in result):
+            raise ValueError('Shared files claim conflicting install paths: ' + install)
+        result[install] = path.read_bytes()
+    return result
+
+
+def record_files(root, record, manifest, plugin, repository):
     """Rebuild, from committed source alone, what the package is allowed to contain."""
     version = package_version(manifest)
+    shared = shared_files(repository, record)
     staged, artifacts = vendored_files(root, record)
     expected = staged_tree(root, record, artifacts)
     for install, content in staged.items():
         if install in expected:
             raise ValueError('A vendored member replaces a committed file: ' + install)
         expected[install] = content
+    for install, content in shared.items():
+        if any(install == other or install.startswith(other + '/') or other.startswith(install + '/')
+               for other in expected):
+            raise ValueError('A shared file conflicts with another staged file: ' + install)
+        expected[install] = content
     for install, item in (record.get('generated') or {}).items():
         if not isinstance(item, dict) or set(item) != {'literal'} or not isinstance(item['literal'], str):
             raise ValueError('Invalid generated file record: ' + str(install))
         content = item['literal'].replace('@VERSION@', version).encode()
         install = install_path(install)
+        if any(install == other or install.startswith(other + '/') or other.startswith(install + '/')
+               for other in shared):
+            raise ValueError('A generated file conflicts with a shared file: ' + install)
         if install in expected and expected[install] != content:
             raise ValueError('Generated file differs from the committed copy: ' + install)
         expected[install] = content
@@ -656,7 +698,7 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
         elif binary:
             expected['/usr/local/bin/' + binary] = lzma.decompress((src / 'src/usr/local/bin' / asset).read_bytes())
     else:
-        expected = record_files(src, record, manifest, plugin)
+        expected = record_files(src, record, manifest, plugin, source)
     actual = manifest['files']
     archive_paths = archive_members(package)
     if any('__pycache__' in Path(name).parts or Path(name).suffix in {'.pyc', '.pyo'} for name in archive_paths.values()):
@@ -693,7 +735,13 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
 def audit_versions(site, source):
     """Report plugins whose committed source no longer matches a published version."""
     findings = []
-    for plugin, record in sorted(plugin_records(source).items()):
+    records = dict(plugin_records(source))
+    # Mihomo uses its native target recipe instead of the additional-plugin registry.
+    metadata = source / 'src/os-mihomo/src/usr/local/opnsense/version/mihomo'
+    if metadata.is_file():
+        records['os-mihomo'] = {'staging': 'target',
+                                'version': package_version({'version': json.loads(metadata.read_text()).get('product_version')})}
+    for plugin, record in sorted(records.items()):
         if record['staging'] == 'unsupported':
             findings.append((plugin, 'rejected', str(record.get('reason', ''))))
             continue

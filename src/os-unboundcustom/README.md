@@ -7,7 +7,7 @@ An updated replacement for `os-unboundcustom-maxit`, tested with OPNsense 26.1.
 The plugin saves settings, generates its dedicated include fragment, stages the
 runtime copy below `/var/unbound/etc`, validates the complete
 `/var/unbound/unbound.conf`, and only then restarts Unbound. On a validation or
-template error it restores both copies of the previous fragment, so a bad edit
+template or restart error it restores both copies of the previous fragment, so a bad edit
 does not interrupt the running resolver.
 
 Custom directives still require knowledge of `unbound.conf`. They are inserted

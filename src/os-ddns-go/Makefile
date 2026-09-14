@@ -1,5 +1,5 @@
 PKG_NAME?=	os-ddns-go
-VERSION?=	1.1.0
+VERSION?=	1.1.1
 ABI?=		native
 
 .PHONY: package install clean

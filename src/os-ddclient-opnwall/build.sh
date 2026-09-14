@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ddclient-opnwall}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.0.3}"
 ORIGIN="${ORIGIN:-opnwall/os-ddclient-opnwall}"
 COMMENT="${COMMENT:-Extended Dynamic DNS client for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -23,7 +23,7 @@ die() { echo "error: $*" >&2; exit 1; }
 command -v pkg >/dev/null 2>&1 || die "pkg command not found; run on FreeBSD/OPNsense"
 
 case "$TARGET_ABI" in
-  native) PKG_ABI="$(pkg config ABI)" ;;
+  native) PKG_ABI="$(env -u ABI pkg config ABI)" ;;
   FreeBSD:*:amd64) PKG_ABI="$TARGET_ABI" ;;
   *) die "unsupported ABI: $TARGET_ABI" ;;
 esac
@@ -33,6 +33,13 @@ PKG_ARCH="freebsd:${ABI_MAJOR}:x86:64"
 rm -rf "$WORKDIR"
 mkdir -p "$STAGEDIR" "$METADIR" "$DISTDIR"
 (cd "$SCRIPT_DIR/src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' -cf - .) | (cd "$STAGEDIR" && tar -xf -)
+
+# The plugin framework's etc subtree belongs under the installed local prefix.
+if [ -d "$STAGEDIR/etc" ]; then
+  mkdir -p "$STAGEDIR/usr/local/etc"
+  (cd "$STAGEDIR/etc" && tar -cf - .) | (cd "$STAGEDIR/usr/local/etc" && tar -xf -)
+  rm -rf "$STAGEDIR/etc"
+fi
 
 mkdir -p "$STAGEDIR/usr/local/opnsense/version"
 cat > "$STAGEDIR/usr/local/opnsense/version/ddclient-opnwall" <<EOF
@@ -54,7 +61,7 @@ for script in +PRE_INSTALL +POST_INSTALL +PRE_DEINSTALL +POST_DEINSTALL; do
   install -m 0755 "$SCRIPT_DIR/packaging/freebsd/$script" "$METADIR/$script"
 done
 
-pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
+env -u ABI pkg create -f "$FORMAT" -r "$STAGEDIR" -m "$METADIR" -p "$PLIST" -o "$DISTDIR"
 CREATED="$DISTDIR/$PKG_NAME-$VERSION.pkg"
 [ ! -f "$CREATED" ] || mv -f "$CREATED" "$DISTDIR/$OUTPUT_NAME"
-pkg info -F "$DISTDIR/$OUTPUT_NAME"
+env -u ABI pkg info -F "$DISTDIR/$OUTPUT_NAME"

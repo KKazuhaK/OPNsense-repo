@@ -1,6 +1,15 @@
 #!/bin/sh
 set -eu
 
+if [ -f /usr/local/opnsense/scripts/easytier/config_mirror.py ]; then
+    if /usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/config_mirror.py reconcile >/dev/null; then
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/config_mirror.py mirror >/dev/null \
+            || echo 'Warning: EasyTier configuration backup could not be updated before upgrade.' >&2
+    else
+        echo 'Warning: EasyTier configuration backup could not be reconciled before upgrade.' >&2
+    fi
+fi
+
 # pkg runs this before deleting the old version's package-owned rc file.
 state=/var/db/os-easytier
 live=/etc/rc.conf.d/easytier

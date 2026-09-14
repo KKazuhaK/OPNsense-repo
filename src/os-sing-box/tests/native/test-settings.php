@@ -10,6 +10,27 @@ function check(bool $condition, string $message): void
     }
 }
 
+function singbox_test_mirror(string $root): void
+{
+    $path = $root . '/usr/local/opnsense/scripts/singbox';
+    mkdir($path, 0700, true);
+    file_put_contents($path . '/config_mirror.py', <<<'PYTHON'
+import fcntl,json,os,sys
+root = os.environ['OS_SINGBOX_BACKUP_ROOT']
+with open(root + '/var/run/sing-box-config.lock', 'a') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({'ok': False}))
+        sys.exit(1)
+    if os.environ.get('SINGBOX_FAIL_MIRROR') == '1':
+        print(json.dumps({'ok': False, 'error': 'SENTINEL_MIRROR_PRIVATE_DIAGNOSTIC'}))
+        sys.exit(1)
+    print(json.dumps({'ok': True}))
+PYTHON
+    );
+}
+
 function singbox_test_mutation(string $action, string $content, ?string $revision = null): array
 {
     if ($action === 'save-config') {
@@ -35,6 +56,7 @@ $configDirectory = $directory . '/usr/local/etc/sing-box';
 mkdir($configDirectory . '/sub', 0700, true);
 mkdir($directory . '/var/run', 0700, true);
 mkdir($directory . '/var/log', 0700, true);
+singbox_test_mirror($directory);
 $core = $directory . '/core';
 file_put_contents($core, "#!/bin/sh\n[ \"\$SINGBOX_FAIL_CHECK\" != 1 ]\n");
 chmod($core, 0700);
@@ -55,6 +77,7 @@ file_put_contents($configDirectory . '/sub/env', "# Keep custom environment sett
 try {
     $fresh = $directory . '/fresh';
     mkdir($fresh . '/var/run', 0700, true);
+    singbox_test_mirror($fresh);
     putenv('SINGBOX_ROOT=' . $fresh);
     $empty = singbox_action('get-settings');
     check(!empty($empty['ok']) && $empty['config'] === '{}' && empty($empty['has_url']), 'Settings get failed before state was initialized.');
@@ -70,7 +93,8 @@ try {
     $edit = json_decode($result['config']);
     $edit->outbounds = array_reverse($edit->outbounds);
     $edit->outbounds[1]->server_port = 8443;
-    singbox_test_mutation('save-config', json_encode($edit));
+    $saveResult = singbox_test_mutation('save-config', json_encode($edit));
+    check(empty($saveResult['warning']), 'The backup mirror ran while the configuration lock was held.');
     $saved = json_decode(file_get_contents($configDirectory . '/config.json'));
     check($saved->outbounds[0]->uuid === 'SENTINEL_UUID', 'Reordering lost the VLESS credential.');
     check($saved->outbounds[1]->password === 'SENTINEL_PASSWORD', 'Reordering lost the Trojan credential.');
@@ -80,6 +104,12 @@ try {
     check((fileperms($configDirectory . '/config.json') & 0777) === 0600, 'The active configuration is not private.');
     check((fileperms($configDirectory . '/config.json.bak') & 0777) === 0600, 'The backup is not private.');
     check((fileperms($configDirectory . '/.mvc-key') & 0777) === 0600, 'The protection key is not private.');
+    putenv('SINGBOX_FAIL_MIRROR=1');
+    $mirrorFailure = singbox_test_mutation('save-config', json_encode($edit));
+    check(!empty($mirrorFailure['ok']) && !empty($mirrorFailure['warning']), 'A backup failure failed the completed configuration save.');
+    check(strpos(json_encode($mirrorFailure), 'SENTINEL_') === false, 'The backup warning exposed private worker diagnostics.');
+    check(json_decode(file_get_contents($configDirectory . '/config.json'))->outbounds[1]->server_port === 8443, 'Backup failure discarded saved settings.');
+    putenv('SINGBOX_FAIL_MIRROR=');
     $snapshot = singbox_action('get-settings');
     $subscription = json_decode(file_get_contents($configDirectory . '/config.json'));
     $subscription->outbounds[1]->password = 'SENTINEL_NEW_SUBSCRIPTION_PASSWORD';

@@ -18,7 +18,7 @@ the form does not model.
 
 | | |
 | --- | --- |
-| Plugin version | `1.0.0` |
+| Plugin version | `1.0.1` |
 | Bundled frp | `0.71.0` |
 | Target | OPNsense 26.7, `FreeBSD:15:amd64`, Python 3.13 |
 
@@ -36,11 +36,16 @@ misspelled key is `exit(1)` rather than a warning. Everything the plugin writes
 comes from a known field table, never from a guessed key name.
 
 Credentials — `auth.token`, `webServer.password` and any proxy `secretKey` or
-plugin password — never leave the router. They are replaced on the way out by
+plugin password — are masked in the settings API. They are replaced on the way out by
 the literal string `__KEEP__`, and a field that still carries `__KEEP__` on the
 way in keeps the stored value. A `__KEEP__` arriving at a path that held no
 credential before is rejected, so the placeholder cannot be moved somewhere else
 to smuggle a value out.
+
+The system configuration backup carries both TOML documents verbatim, including
+tokens and passwords. Encrypt exported backups or store them as secrets. Ordinary
+boots retain newer local edits; restoring a different saved configuration imports
+its documents and startup choices before services start.
 
 ## What the plugin refuses to start
 
@@ -61,7 +66,7 @@ with the sample configuration in place and both services stopped.
 
 ```text
 Makefile                                                 make package / pin-checksum / test / clean
-build.sh                                                 builds dist/os-frp-1.0.0.pkg on FreeBSD 15
+build.sh                                                 builds dist/os-frp-1.0.1.pkg on FreeBSD 15
 vendor/frp_0.71.0_freebsd_amd64.tar.gz                   upstream release archive, digest pinned
 vendor/frp_sha256_checksums.txt                          the release's published checksums
 packaging/freebsd/                                       pkg metadata and the four lifecycle hooks
@@ -117,7 +122,7 @@ Then:
 make package
 ```
 
-The result is `dist/os-frp-1.0.0.pkg`. `build.sh` can also be called directly:
+The result is `dist/os-frp-1.0.1.pkg`. `build.sh` can also be called directly:
 
 ```sh
 ABI=native sh build.sh
@@ -142,7 +147,7 @@ The build refuses to produce a package when:
 ## Install
 
 ```sh
-pkg add -f os-frp-1.0.0.pkg
+pkg add -f os-frp-1.0.1.pkg
 ```
 
 Refresh the web interface. The menu gains a **Services > frp** heading with

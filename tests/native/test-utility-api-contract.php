@@ -42,7 +42,12 @@ namespace OPNsense\Core {
 namespace OPNsense\EasyTier\Api {
     function tempnam(string $directory, string $prefix): string|false
     {
-        $path = \tempnam($directory, $prefix);
+        $created = \tempnam($directory, $prefix);
+        // Preserve the requested spelling when /tmp is a filesystem alias.
+        $path = $created === false ? false : $directory . '/' . basename($created);
+        if ($path !== false && realpath($path) !== realpath($created)) {
+            throw new \RuntimeException('Request file escaped its staging directory.');
+        }
         \OPNsense\Core\Backend::$staged[] = $path;
         return $path;
     }

@@ -43,6 +43,28 @@ function mihomoChild(DOMDocument $doc, DOMElement $parent, string $name, string 
     return $node;
 }
 
+function mihomoLockCurrent(OPNsense\Core\Config $config): void
+{
+    $config->lock();
+    /* The native reader downgrades EX while reloading. Refresh under a newly
+       acquired EX lock before applying ownership-journal changes. */
+    $config->lock(false);
+    $settings = new OPNsense\Core\AppConfig();
+    $fresh = simplexml_load_string(file_get_contents($settings->application->configDir . '/config.xml'),
+                                  'SimpleXMLElement', LIBXML_NOBLANKS | LIBXML_NONET);
+    if ($fresh === false) {
+        throw new RuntimeException('Unable to read current configuration.');
+    }
+    $source = dom_import_simplexml($fresh);
+    $destination = dom_import_simplexml($config->object());
+    while ($destination->firstChild !== null) {
+        $destination->removeChild($destination->firstChild);
+    }
+    foreach ($source->childNodes as $child) {
+        $destination->appendChild($destination->ownerDocument->importNode($child, true));
+    }
+}
+
 function mihomoForwardZone(bool $enabled, bool $fallback, bool $validating = false): bool
 {
     $path = mihomoForwardFile();
@@ -126,6 +148,57 @@ function mihomoState(string $path): ?array
     return $value;
 }
 
+function mihomoJournal(string $field, mixed $value): ?array
+{
+    if ($value === null) {
+        return null;
+    }
+    if (!is_array($value)) {
+        throw new RuntimeException('Invalid ownership journal.');
+    }
+    if ($field === 'dns_state') {
+        if (!is_scalar($value['forwarding'] ?? null) || !in_array((string)$value['forwarding'], ['0', '1'], true)
+            || !is_bool($value['had_fake_ip_private_address'] ?? null)
+            || !is_array($value['roots'] ?? null) || count($value['roots']) > 512) {
+            throw new RuntimeException('Invalid ownership journal.');
+        }
+        foreach ($value['roots'] as $uuid => $enabled) {
+            if (!is_string($uuid) || !preg_match('/^[A-Za-z0-9-]{1,128}$/D', $uuid)
+                || !is_scalar($enabled) || !in_array((string)$enabled, ['0', '1'], true)) {
+                throw new RuntimeException('Invalid ownership journal.');
+            }
+        }
+    } elseif (!is_string($value['interface'] ?? null)
+        || !preg_match('/^opt[0-9]{1,8}$/D', $value['interface'])
+        || !is_bool($value['created_interface'] ?? null) || !is_bool($value['created_rule'] ?? null)) {
+        throw new RuntimeException('Invalid ownership journal.');
+    }
+    return $value;
+}
+
+function mihomoBackupRevision(DOMXPath $xpath): string
+{
+    $fields = [];
+    foreach ($xpath->query('/opnsense/OPNsense/Mihomo/backup/*') as $node) {
+        if ($node instanceof DOMElement && $node->getElementsByTagName('*')->length === 0) {
+            $fields[$node->tagName] = $node->textContent;
+        }
+    }
+    ksort($fields, SORT_STRING);
+    $encoded = json_encode((object)$fields, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    return hash('sha256', str_replace("\x7f", '\u007f', $encoded));
+}
+
+function mihomoConsentScope(DOMXPath $xpath): string
+{
+    $identity = [];
+    foreach (['uuid', 'hostname', 'domain'] as $field) {
+        $identity[] = (string)$xpath->evaluate('string(/opnsense/system/' . $field . ')');
+    }
+    return count(array_filter($identity, static fn($value) => $value !== '')) > 0
+        ? hash('sha256', implode('|', $identity)) : '';
+}
+
 function mihomoEnsureTun(DOMDocument $doc, DOMXPath $xpath, string $statePath): void
 {
     $saved = mihomoState($statePath);
@@ -189,18 +262,20 @@ function mihomoCronCommand(string $command): bool
         '/usr/bin/mihomo_sub', '/usr/local/etc/mihomo/sub/sub.sh'], true);
 }
 
-function mihomoRemoveTun(DOMXPath $xpath, string $path): void
+function mihomoRemoveTun(DOMXPath $xpath, ?array $tun): void
 {
-    $tun = mihomoState($path);
+    $node = $tun !== null ? $xpath->query('/opnsense/interfaces/' . $tun['interface'])->item(0) : null;
+    $assigned = !$node instanceof DOMElement || trim($xpath->evaluate('string(./if)', $node)) === 'tun_mihomo';
     if ($tun !== null && $tun['created_interface']) {
-        $node = $xpath->query('/opnsense/interfaces/' . $tun['interface'])->item(0);
-        if ($node instanceof DOMElement && trim($xpath->evaluate('string(./if)', $node)) === 'tun_mihomo') {
+        if ($node instanceof DOMElement && $assigned) {
             $node->parentNode->removeChild($node);
         }
     }
-    if ($tun !== null && $tun['created_rule']) {
+    if ($tun !== null && $tun['created_rule'] && $assigned) {
         foreach ($xpath->query('/opnsense/filter/rule[@uuid="' . RULE_UUID . '"]') as $node) {
-            $node->parentNode->removeChild($node);
+            if (trim($xpath->evaluate('string(./interface)', $node)) === $tun['interface']) {
+                $node->parentNode->removeChild($node);
+            }
         }
     }
 }
@@ -211,8 +286,8 @@ if ($mode === 'uninstall') {
     $mode = 'disable';
 }
 $fallback = ($argv[2] ?? '1') === '1';
-if (!in_array($mode, ['enable', 'enable-tun', 'disable', 'remove', 'restore-cron'], true)) {
-    fwrite(STDERR, "usage: setup_unbound.php enable|enable-tun|disable|remove|restore-cron [fallback:0|1]\n");
+if (!in_array($mode, ['enable', 'enable-tun', 'disable', 'remove', 'restore-cron', 'restore-backup', 'rescue'], true)) {
+    fwrite(STDERR, "usage: setup_unbound.php enable|enable-tun|disable|remove|restore-cron|restore-backup|rescue [fallback:0|1]\n");
     exit(64);
 }
 /* Removing the forward zone comes before anything that can fail. Everything
@@ -221,7 +296,7 @@ if (!in_array($mode, ['enable', 'enable-tun', 'disable', 'remove', 'restore-cron
    so a removal left until after those checks can leave Unbound forwarding the
    root to a port with nothing behind it. */
 $earlyZoneChange = false;
-if (in_array($mode, ['disable', 'remove'], true)) {
+if (in_array($mode, ['disable', 'remove', 'rescue'], true)) {
     $earlyZoneChange = mihomoForwardZone(false, $fallback);
 }
 $root = rtrim(getenv('OS_MIHOMO_ROOT') ?: '', '/');
@@ -243,7 +318,7 @@ try {
         require_once('/usr/local/etc/inc/util.inc');
         require_once('/usr/local/etc/inc/config.inc');
         $native = OPNsense\Core\Config::getInstance();
-        $native->lock();
+        mihomoLockCurrent($native);
         $doc = dom_import_simplexml($native->object())->ownerDocument;
     } else {
         $handle = fopen($configPath, 'r');
@@ -259,6 +334,35 @@ try {
     $before = $doc->saveXML();
     $zoneChanged = false;
     $xpath = new DOMXPath($doc);
+    $restore = null;
+    if ($mode === 'restore-backup') {
+        $raw = stream_get_contents(STDIN, 1048577);
+        if ($raw === false || strlen($raw) > 1048576) {
+            throw new RuntimeException('Invalid backup recovery payload.');
+        }
+        $restore = json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
+        if (!is_array($restore) || !is_string($restore['expected'] ?? null)
+            || !preg_match('/^[a-f0-9]{64}$/D', $restore['expected'])
+            || !is_string($restore['scope'] ?? null) || !is_array($restore['journals'] ?? null)
+            || !is_string($restore['current_scope'] ?? null)
+            || !hash_equals($restore['current_scope'], mihomoConsentScope($xpath))
+            || !is_string($restore['repair_checksum'] ?? null)
+            || ($restore['repair_checksum'] !== '' && !preg_match('/^[a-f0-9]{64}$/D', $restore['repair_checksum']))
+            || !hash_equals($restore['expected'], mihomoBackupRevision($xpath))) {
+            throw new RuntimeException('The backup changed during recovery.');
+        }
+        $owned = $restore['scope'] !== '' && hash_equals($restore['scope'], mihomoConsentScope($xpath));
+        $snapshot = mihomoJournal('dns_state', $restore['journals']['dns_state'] ?? null);
+        $tunSnapshot = mihomoJournal('tun_state', $restore['journals']['tun_state'] ?? null);
+        if (!$owned) {
+            $snapshot = $tunSnapshot = null;
+        }
+    } elseif ($mode === 'rescue' || $mode === 'restore-cron') {
+        $snapshot = $tunSnapshot = null;
+    } else {
+        $snapshot = mihomoJournal('dns_state', mihomoState($dnsStatePath));
+        $tunSnapshot = mihomoJournal('tun_state', mihomoState($tunStatePath));
+    }
     if ($mode === 'restore-cron') {
         $legacyPath = $stateDir . '/migrate/cron.json';
         if (file_exists($legacyPath)) {
@@ -304,7 +408,6 @@ try {
         if (!$unbound instanceof DOMElement || !$forwarding instanceof DOMElement || !$private instanceof DOMElement || !$dots instanceof DOMElement) {
             throw new RuntimeException('The Unbound model is incomplete.');
         }
-        $snapshot = mihomoState($dnsStatePath);
         $forwarder = $xpath->query('./dot[@uuid="' . FORWARD_UUID . '"]', $dots)->item(0);
         if ($mode === 'enable') {
             mihomoEnsureTun($doc, $xpath, $tunStatePath);
@@ -352,7 +455,8 @@ try {
                    earlier version of the plugin turned off. */
                 foreach ($snapshot['roots'] as $uuid => $enabled) {
                     $node = $xpath->query('./dot[@uuid="' . $uuid . '"]', $dots)->item(0);
-                    if ($node instanceof DOMElement && trim($xpath->evaluate('string(./enabled)', $node)) === '0') {
+                    if ($node instanceof DOMElement && in_array(trim($xpath->evaluate('string(./domain)', $node)), ['', '.'], true)
+                        && trim($xpath->evaluate('string(./enabled)', $node)) === '0') {
                         mihomoChild($doc, $node, 'enabled', (string)$enabled);
                     }
                 }
@@ -371,8 +475,15 @@ try {
                     }
                 }
             }
-            mihomoRemoveTun($xpath, $tunStatePath);
+            mihomoRemoveTun($xpath, $tunSnapshot);
         }
+    }
+    if ($restore !== null && $restore['repair_checksum'] !== '') {
+        $section = $xpath->query('/opnsense/OPNsense/Mihomo/backup')->item(0);
+        if (!$section instanceof DOMElement) {
+            throw new RuntimeException('The saved backup disappeared.');
+        }
+        mihomoChild($doc, $section, 'checksum', $restore['repair_checksum']);
     }
     if ($before !== $doc->saveXML()) {
         if ($native !== null) {
@@ -384,7 +495,7 @@ try {
             }
         }
     }
-    if (in_array($mode, ['disable', 'remove'], true)) {
+    if (in_array($mode, ['disable', 'remove', 'restore-backup'], true)) {
         @unlink($dnsStatePath);
         @unlink($tunStatePath);
     }

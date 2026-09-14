@@ -41,18 +41,28 @@ UNBOUND_VERSION = ('{\n    "product_abi": "26.7",\n    "product_arch": "amd64",\
 
 # What each build.sh actually stages, read off the shell and written out again here.
 BUILDS = {
-    'os-staticarp': {'abi': NATIVE, 'copy': [('src', '/')]},
+    'os-staticarp': {'abi': NATIVE, 'copy': [('src', '/')],
+                    'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/staticarp/config_backup.py'),
+                                    ('src/common/config_backup.php', '/usr/local/opnsense/scripts/staticarp/config_backup.php')]},
     'os-pftop': {'abi': WILDCARD, 'copy': [('src/usr', '/usr')]},
     'os-lang': {'abi': WILDCARD, 'copy': [('src', '/')]},
-    'os-easytier': {'abi': NATIVE, 'copy': [('src', '/')]},
-    'os-ddns-go': {'abi': NATIVE, 'copy': [('src', '/')]},
+    'os-easytier': {'abi': NATIVE, 'copy': [('src', '/')],
+                   'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/easytier/config_backup.py'),
+                                   ('src/common/config_backup.php', '/usr/local/opnsense/scripts/easytier/config_backup.php')]},
+    'os-ddns-go': {'abi': NATIVE, 'copy': [('src', '/')],
+                  'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/ddnsgo/config_backup.py'),
+                                  ('src/common/config_backup.php', '/usr/local/opnsense/scripts/ddnsgo/config_backup.php')]},
     'os-lucky': {'abi': NATIVE, 'copy': [('src', '/')],
+                 'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/lucky/config_backup.py'),
+                                 ('src/common/config_backup.php', '/usr/local/opnsense/scripts/lucky/config_backup.php')],
                  'unpack': [('src/usr/local/bin/lucky_2.27.2_freebsd_x86_64.tar.gz', 'tar.gz',
                              {'lucky': '/usr/local/bin/lucky'})]},
     'os-speedtest': {'abi': NATIVE, 'copy': [('src', '/')],
                      'unpack': [('src/usr/local/bin/speedtest-go_1.7.10_Freebsd_x86_64.tar.gz', 'tar.gz',
                                  {'speedtest-go': '/usr/local/bin/opnsense-speedtest'})]},
     'os-sing-box': {'abi': NATIVE, 'copy': [('src', '/')],
+                    'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/singbox/config_backup.py'),
+                                    ('src/common/config_backup.php', '/usr/local/opnsense/scripts/singbox/config_backup.php')],
                     'deps': {'jq': {'origin': 'textproc/jq', 'version': '>=0'},
                              'curl': {'origin': 'ftp/curl', 'version': '>=0'}},
                     'unpack': [('src/usr/local/bin/bsd-box-reF1nd-freebsd-amd64.xz', 'xz',
@@ -64,12 +74,38 @@ BUILDS = {
     'os-unboundcustom': {'abi': WILDCARD, 'copy': [('src/opnsense', '/usr/local/opnsense')],
                          'generate': {'/usr/local/opnsense/version/unboundcustom': UNBOUND_VERSION},
                          'annotations': 'version-file'},
-    'os-ddclient-opnwall': {'abi': WILDCARD, 'copy': [('src', '/')],
+    'os-ddclient-opnwall': {'abi': WILDCARD, 'copy': [('src/etc', '/usr/local/etc'), ('src/usr', '/usr')],
                             'deps': {'ddclient': {'origin': 'dns/ddclient', 'version': '0'},
                                      'py313-boto3': {'origin': 'devel/py-boto3@py313', 'version': '0'}},
                             'generate': {'/usr/local/opnsense/version/ddclient-opnwall': DDCLIENT_VERSION}},
     'os-kazuha-repo': {'abi': WILDCARD, 'copy': [('src', '/')], 'version_rewrite': True,
                        'annotations': 'version-file'},
+    'os-ttyd': {'abi': NATIVE, 'copy': [('src', '/')],
+                'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/ttyd/config_backup.py'),
+                                ('src/common/config_backup.php', '/usr/local/opnsense/scripts/ttyd/config_backup.php')],
+                'unpack': [
+                    ('vendor/freebsd15-amd64/libuv.pkg', 'pkg', {
+                        '/usr/local/lib/libuv.so.1.0.0': '/usr/local/os-ttyd/lib/libuv.so.1.0.0',
+                        '/usr/local/share/licenses/libuv-1.52.1/LICENSE': '/usr/local/os-ttyd/share/licenses/libuv-1.52.1/LICENSE',
+                        '/usr/local/share/licenses/libuv-1.52.1/MIT': '/usr/local/os-ttyd/share/licenses/libuv-1.52.1/MIT',
+                        '/usr/local/share/licenses/libuv-1.52.1/catalog.mk': '/usr/local/os-ttyd/share/licenses/libuv-1.52.1/catalog.mk'}),
+                    ('vendor/freebsd15-amd64/libuv.pkg', 'pkg', {
+                        '/usr/local/lib/libuv.so.1.0.0': '/usr/local/os-ttyd/lib/libuv.so.1'}),
+                    ('vendor/freebsd15-amd64/libuv.pkg', 'pkg', {
+                        '/usr/local/lib/libuv.so.1.0.0': '/usr/local/os-ttyd/lib/libuv.so'}),
+                    ('vendor/freebsd15-amd64/libwebsockets.pkg', 'pkg', {
+                        '/usr/local/lib/libwebsockets.so.21': '/usr/local/os-ttyd/lib/libwebsockets.so.21',
+                        '/usr/local/lib/libwebsockets-evlib_uv.so': '/usr/local/os-ttyd/lib/libwebsockets-evlib_uv.so',
+                        '/usr/local/share/licenses/libwebsockets-4.5.8/LICENSE': '/usr/local/os-ttyd/share/licenses/libwebsockets-4.5.8/LICENSE',
+                        '/usr/local/share/licenses/libwebsockets-4.5.8/MIT': '/usr/local/os-ttyd/share/licenses/libwebsockets-4.5.8/MIT',
+                        '/usr/local/share/licenses/libwebsockets-4.5.8/catalog.mk': '/usr/local/os-ttyd/share/licenses/libwebsockets-4.5.8/catalog.mk'}),
+                    ('vendor/freebsd15-amd64/libwebsockets.pkg', 'pkg', {
+                        '/usr/local/lib/libwebsockets.so.21': '/usr/local/os-ttyd/lib/libwebsockets.so'}),
+                    ('vendor/freebsd15-amd64/ttyd.pkg', 'pkg', {
+                        '/usr/local/bin/ttyd': '/usr/local/os-ttyd/bin/ttyd',
+                        '/usr/local/share/licenses/ttyd-1.7.7_2/LICENSE': '/usr/local/os-ttyd/share/licenses/ttyd-1.7.7_2/LICENSE',
+                        '/usr/local/share/licenses/ttyd-1.7.7_2/MIT': '/usr/local/os-ttyd/share/licenses/ttyd-1.7.7_2/MIT',
+                        '/usr/local/share/licenses/ttyd-1.7.7_2/catalog.mk': '/usr/local/os-ttyd/share/licenses/ttyd-1.7.7_2/catalog.mk'})]},
 }
 
 
@@ -100,11 +136,17 @@ def staged_files(root, plugin, version):
             if path.suffix in {'.pyc', '.pyo'} or any(p == '.DS_Store' or p.startswith('._') for p in parts):
                 continue
             staged[destination.rstrip('/') + '/' + path.relative_to(base).as_posix()] = path.read_bytes()
+    for relative, destination in recipe.get('shared_copy', []):
+        staged[destination] = (root / relative).read_bytes()
     for name, kind, members in recipe.get('unpack', []):
         data = (project / name).read_bytes()
         if kind == 'xz':
             import lzma
             staged[next(iter(members.values()))] = lzma.decompress(data)
+            continue
+        if kind == 'pkg':
+            for member, install in members.items():
+                staged[install] = subprocess.check_output(['tar', '-xOf', str(project / name), '-P', '--', member])
             continue
         with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
             for member, install in members.items():
@@ -165,7 +207,12 @@ class SourceTree(unittest.TestCase):
 
     def source(self, records=None):
         root = Path(tempfile.mkdtemp(dir=self.temp.name))
-        (root / 'src').symlink_to(REPO / 'src', target_is_directory=True)
+        (root / 'src').mkdir()
+        for entry in (REPO / 'src').iterdir():
+            if entry.name == 'common':
+                shutil.copytree(entry, root / 'src/common', symlinks=True)
+            else:
+                (root / 'src' / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
         (root / 'packaging').mkdir()
         registry = json.loads((REPO / 'packaging/plugins.json').read_text())
         if records:
@@ -279,6 +326,120 @@ class PluginPackageTests(SourceTree):
         self.assertEqual('plain\ttext\n', verify.manifest_script('plain\ttext\n'))
 
 
+class SharedPayloadTests(SourceTree):
+    def test_a_shared_payload_is_required_and_its_exact_bytes_are_checked(self):
+        original = staged_files(REPO, 'os-staticarp', build_version('os-staticarp'))
+        for relative, destination in BUILDS['os-staticarp']['shared_copy']:
+            self.assertEqual(original[destination], (REPO / relative).read_bytes())
+            missing = dict(original)
+            missing.pop(destination)
+            package = build_package(self.dist, REPO, 'os-staticarp', files=missing)
+            with self.subTest(destination=destination, failure='missing'), \
+                    self.assertRaisesRegex(ValueError, 'file inventory does not match'):
+                verify.verify_source_package(package, REPO, plugin='os-staticarp')
+            modified = dict(original)
+            modified[destination] += b'\n'
+            package = build_package(self.dist, REPO, 'os-staticarp', files=modified)
+            with self.subTest(destination=destination, failure='modified'), \
+                    self.assertRaisesRegex(ValueError, 'Package content differs from source'):
+                verify.verify_source_package(package, REPO, plugin='os-staticarp')
+
+    def test_an_unregistered_shared_copy_is_not_accepted_from_the_build(self):
+        record = self.record('os-staticarp')
+        record['shared'].pop('src/common/config_backup.py')
+        source = self.source({'os-staticarp': record})
+        package = build_package(self.dist, REPO, 'os-staticarp')
+        with self.assertRaisesRegex(ValueError, 'file inventory does not match'):
+            verify.verify_source_package(package, source, plugin='os-staticarp')
+
+    def test_missing_or_changed_shared_source_cannot_verify_an_earlier_package(self):
+        for failure in ['missing', 'changed']:
+            source = self.source()
+            package = build_package(self.dist, source, 'os-staticarp')
+            shared = source / 'src/common/config_backup.php'
+            if failure == 'missing':
+                shared.unlink()
+                message = 'Committed source file is missing or unsafe'
+            else:
+                shared.write_bytes(shared.read_bytes() + b'\n')
+                message = 'Package content differs from source'
+            with self.subTest(failure=failure), self.assertRaisesRegex(ValueError, message):
+                verify.verify_source_package(package, source, plugin='os-staticarp')
+
+    def test_shared_source_records_cannot_escape_the_repository(self):
+        package = build_package(self.dist, REPO, 'os-staticarp')
+        for relative in ['../outside.py', '/tmp/outside.py', 'src/common/../../outside.py',
+                         'src/common/config_backup*.py']:
+            record = self.record('os-staticarp')
+            record['shared'] = {relative: '/usr/local/opnsense/scripts/staticarp/config_backup.py'}
+            source = self.source({'os-staticarp': record})
+            with self.subTest(relative=relative), self.assertRaisesRegex(ValueError, 'Unsafe committed source path'):
+                verify.verify_source_package(package, source, plugin='os-staticarp')
+
+    def test_shared_file_and_parent_symlinks_cannot_supply_external_bytes(self):
+        for link_parent in [False, True]:
+            source = self.source()
+            package = build_package(self.dist, source, 'os-staticarp')
+            outside = Path(tempfile.mkdtemp(dir=self.temp.name))
+            if link_parent:
+                shutil.copytree(source / 'src/common', outside / 'common')
+                shutil.rmtree(source / 'src/common')
+                (source / 'src/common').symlink_to(outside / 'common', target_is_directory=True)
+            else:
+                shared = source / 'src/common/config_backup.py'
+                (outside / 'config_backup.py').write_bytes(shared.read_bytes())
+                shared.unlink()
+                shared.symlink_to(outside / 'config_backup.py')
+            with self.subTest(link_parent=link_parent), \
+                    self.assertRaisesRegex(ValueError, 'Committed source file is missing or unsafe'):
+                verify.verify_source_package(package, source, plugin='os-staticarp')
+
+    def test_shared_mapping_and_install_paths_are_validated(self):
+        package = build_package(self.dist, REPO, 'os-staticarp')
+        for invalid in [None, [], 'src/common/config_backup.py']:
+            record = self.record('os-staticarp')
+            record['shared'] = invalid
+            source = self.source({'os-staticarp': record})
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'Invalid shared file staging record'):
+                verify.verify_source_package(package, source, plugin='os-staticarp')
+        for destination in ['relative.py', '/usr/local/../etc/config.py', '//tmp/config.py', '/tmp/config*', '/']:
+            record = self.record('os-staticarp')
+            record['shared'] = {'src/common/config_backup.py': destination}
+            source = self.source({'os-staticarp': record})
+            with self.subTest(destination=destination), self.assertRaisesRegex(ValueError, 'Unsafe install path'):
+                verify.verify_source_package(package, source, plugin='os-staticarp')
+
+    def test_shared_destinations_cannot_collide_with_each_other_or_staged_files(self):
+        package = build_package(self.dist, REPO, 'os-staticarp')
+        for destinations, message in [
+                (['/tmp/shared.py', '/tmp/shared.py'], 'Shared files claim conflicting install paths'),
+                (['/tmp/shared', '/tmp/shared/backup.php'], 'Shared files claim conflicting install paths'),
+                (['/usr/local/opnsense/scripts/staticarp/settings.php', '/tmp/backup.php'],
+                 'A shared file conflicts with another staged file'),
+                (['/usr/local/opnsense/scripts/staticarp', '/tmp/backup.php'],
+                 'A shared file conflicts with another staged file')]:
+            record = self.record('os-staticarp')
+            record['shared'] = dict(zip(['src/common/config_backup.py', 'src/common/config_backup.php'], destinations))
+            source = self.source({'os-staticarp': record})
+            with self.subTest(destinations=destinations), self.assertRaisesRegex(ValueError, message):
+                verify.verify_source_package(package, source, plugin='os-staticarp')
+
+    def test_vendored_and_generated_payloads_cannot_replace_a_shared_file(self):
+        record = self.record('os-sing-box')
+        record['shared']['src/common/config_backup.py'] = '/usr/local/bin/sing-box'
+        source = self.source({'os-sing-box': record})
+        package = build_package(self.dist, REPO, 'os-sing-box')
+        with self.assertRaisesRegex(ValueError, 'A shared file conflicts with another staged file'):
+            verify.verify_source_package(package, source, plugin='os-sing-box')
+        record = self.record('os-staticarp')
+        destination = record['shared']['src/common/config_backup.py']
+        record['generated'] = {destination: {'literal': (REPO / 'src/common/config_backup.py').read_text()}}
+        source = self.source({'os-staticarp': record})
+        package = build_package(self.dist, REPO, 'os-staticarp')
+        with self.assertRaisesRegex(ValueError, 'A generated file conflicts with a shared file'):
+            verify.verify_source_package(package, source, plugin='os-staticarp')
+
+
 class StagingRecordTests(SourceTree):
     def test_a_vendored_artifact_that_misses_its_pin_is_rejected(self):
         record = self.record('os-frp')
@@ -343,6 +504,27 @@ class StagingRecordTests(SourceTree):
         with self.assertRaisesRegex(ValueError, 'differs from the committed staging record'):
             verify.verify_source_package(package, REPO, plugin='os-lang')
 
+    def test_makefile_defaults_match_the_package_versions(self):
+        for project in sorted((REPO / 'src').glob('os-*')):
+            makefile = project / 'Makefile'
+            if not makefile.is_file():
+                continue
+            with self.subTest(plugin=project.name):
+                match = re.search(r'^(?:VERSION\?=|PLUGIN_VERSION=)\s*([^\s]+)',
+                                  makefile.read_text(), re.MULTILINE)
+                self.assertIsNotNone(match)
+                self.assertEqual(build_version(project.name), match.group(1))
+
+    def test_install_hooks_register_only_their_own_plugin(self):
+        for project in sorted((REPO / 'src').glob('os-*')):
+            with self.subTest(plugin=project.name):
+                body = (project / 'packaging/freebsd/+POST_INSTALL').read_text()
+                registered = re.findall(r'register\.php install (os-[A-Za-z0-9-]+)', body)
+                self.assertEqual([project.name], registered)
+                self.assertNotRegex(body, r'register\.php\s+(?:resync|unregister)\b')
+                if project.name != 'os-kazuha-repo':
+                    self.assertIn('/usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror', body)
+
     def test_declared_dependencies_and_product_metadata_are_enforced(self):
         record = self.record('os-sing-box')
         record['deps'] = {'jq': 'textproc/jq'}
@@ -389,21 +571,30 @@ class StagingRecordTests(SourceTree):
         with self.assertRaisesRegex(ValueError, 'must not contain native executables'):
             verify.verify_source_package(package, source, plugin='os-easytier')
 
-    def test_ttyd_stays_rejected_while_its_runtime_packages_carry_no_digest(self):
+    def test_ttyd_pins_its_runtime_and_materializes_library_aliases(self):
         record = self.record('os-ttyd')
-        self.assertEqual('unsupported', record['staging'])
-        self.assertTrue(record['reason'])
-        self.assertFalse(list((REPO / 'src/os-ttyd/vendor').rglob('*.sha256')))
-        with self.assertRaisesRegex(ValueError, 'Unsupported additional release package'):
-            verify.plugin_record(REPO, 'os-ttyd')
-        package = self.dist / 'os-ttyd-1.1.0.pkg'
-        payload = json.dumps({'name': 'os-ttyd', 'version': '1.1.0', 'abi': NATIVE,
-                              'files': {}, 'scripts': {}}).encode()
-        with tarfile.open(package, 'w') as archive:
-            for name in ('+MANIFEST', '+COMPACT_MANIFEST'):
-                add_member(archive, name, payload)
-        with self.assertRaisesRegex(ValueError, 'Unsupported additional release package'):
-            verify.verify_source_package(package, REPO, plugin='os-ttyd')
+        self.assertEqual(NATIVE, record['abi'])
+        package = build_package(self.dist, REPO, 'os-ttyd')
+        verify.verify_source_package(package, REPO, plugin='os-ttyd')
+        staged = staged_files(REPO, 'os-ttyd', build_version('os-ttyd'))
+        self.assertEqual(staged['/usr/local/os-ttyd/lib/libuv.so.1.0.0'],
+                         staged['/usr/local/os-ttyd/lib/libuv.so.1'])
+        self.assertEqual(staged['/usr/local/os-ttyd/lib/libwebsockets.so.21'],
+                         staged['/usr/local/os-ttyd/lib/libwebsockets.so'])
+        self.assertTrue(all(member.isreg() for member in verify.python_members(package)))
+        legacy = build_package(self.root, REPO, 'os-ttyd', abi='FreeBSD:14:amd64')
+        with self.assertRaisesRegex(ValueError, 'incorrect identity or ABI'):
+            verify.verify_source_package(legacy, REPO, plugin='os-ttyd')
+        record['vendored'][0]['sha256'] = '0' * 64
+        source = self.source({'os-ttyd': record})
+        with self.assertRaisesRegex(ValueError, 'differs from its committed digest'):
+            verify.verify_source_package(package, source, plugin='os-ttyd')
+
+    def test_vendored_pkg_cannot_stage_its_original_symlink(self):
+        record = self.record('os-ttyd')
+        record['vendored'][0]['members'] = {'/usr/local/lib/libuv.so': '/usr/local/os-ttyd/lib/invalid.so'}
+        with self.assertRaisesRegex(ValueError, 'unique regular files'):
+            verify.vendored_files(REPO / 'src/os-ttyd', record)
 
     def test_the_repository_shape_is_held_to_the_same_record(self):
         # Calling a plugin "repository" must not skip the version pin the record carries.
@@ -439,13 +630,60 @@ class StagingRecordTests(SourceTree):
             verify.plugin_record(REPO, 'os-not-in-the-registry')
 
 
+class VersionAuditTests(SourceTree):
+    def test_unpublished_native_mihomo_is_included_outside_the_registry(self):
+        self.assertNotIn('os-mihomo', verify.plugin_records(REPO))
+        with patch.object(verify, 'published_versions', return_value=[]), patch('builtins.print'):
+            findings = verify.audit_versions(self.root, REPO)
+        self.assertIn(('os-mihomo', 'unpublished', build_version('os-mihomo')), findings)
+
+    def test_native_mihomo_drift_uses_the_source_verifier(self):
+        package = self.dist / ('os-mihomo-' + build_version('os-mihomo') + '.pkg')
+        for failure, state in ((None, 'unchanged'),
+                               (ValueError('Package content differs from source'),
+                                'changed without a version bump')):
+            with self.subTest(state=state), \
+                    patch.object(verify, 'published_versions',
+                                 side_effect=lambda site, name, version: [package] if name == 'os-mihomo' else []), \
+                    patch.object(verify, 'verify_source_package', side_effect=failure) as checked, \
+                    patch('builtins.print'):
+                findings = verify.audit_versions(self.root, REPO)
+            checked.assert_called_once_with(package, REPO, plugin='os-mihomo')
+            self.assertEqual(state, next(state for name, state, _ in findings if name == 'os-mihomo'))
+
+    def test_failed_preupgrade_mirror_preserves_upgrade_progress(self):
+        for plugin, script_name in (('os-easytier', 'easytier'), ('os-ttyd', 'ttyd')):
+            for fail_phase, expected in (('reconcile', ['reconcile']),
+                                         ('mirror', ['reconcile', 'mirror'])):
+                with self.subTest(plugin=plugin, phase=fail_phase):
+                    sandbox = Path(tempfile.mkdtemp(dir=self.temp.name))
+                    control = sandbox / 'config_mirror.py'
+                    control.touch()
+                    log = sandbox / 'calls'
+                    runner = sandbox / 'python3'
+                    runner.write_text('#!/bin/sh\n'
+                                      'printf "%s\\n" "$2" >> "' + str(log) + '"\n'
+                                      '[ "$2" != "' + fail_phase + '" ]\n')
+                    runner.chmod(0o755)
+                    body = (REPO / 'src' / plugin / 'packaging/freebsd/+PRE_INSTALL').read_text()
+                    body = body.replace('/usr/local/bin/python3', str(runner))
+                    body = body.replace('/usr/local/opnsense/scripts/' + script_name + '/config_mirror.py',
+                                        str(control))
+                    for prefix in ('/var/db/', '/etc/rc.conf.d/', '/usr/local/etc/'):
+                        body = body.replace(prefix, str(sandbox) + '/absent/')
+                    result = subprocess.run(['sh'], input=body, text=True, capture_output=True)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn('Warning:', result.stderr)
+                    self.assertEqual(expected, log.read_text().splitlines())
+
+
 @unittest.skipUnless((SITE / 'repo').is_dir(), 'the signed site is not part of a clean checkout')
 class PublishedSiteTests(SourceTree):
     """The site holds packages a real FreeBSD pkg built; they are the reference."""
 
-    def test_a_published_package_verifies_against_the_committed_source(self):
+    def test_a_published_package_can_be_reused_with_its_original_content(self):
         package = SITE / 'repo/FreeBSD:15:amd64/All/os-ddclient-opnwall-1.0.2.pkg'
-        verify.verify_source_package(package, REPO, plugin='os-ddclient-opnwall')
+        verify.check_published_version(SITE, verify.manifest_of(package))
 
     def test_source_changed_without_a_version_bump_is_reported_and_refused(self):
         # Against a real published package, not a fixture: a source tree still
@@ -459,8 +697,8 @@ class PublishedSiteTests(SourceTree):
         with patch('builtins.print'):
             findings = dict((plugin, state) for plugin, state, _ in verify.audit_versions(SITE, root))
         self.assertEqual('changed without a version bump', findings['os-unboundcustom'])
-        self.assertEqual('unchanged', findings['os-ddclient-opnwall'])
-        self.assertEqual('rejected', findings['os-ttyd'])
+        self.assertEqual('unpublished', findings['os-ddclient-opnwall'])
+        self.assertEqual('unpublished', findings['os-ttyd'])
 
     def drifted_source(self, plugin, version):
         """The repository, with one plugin held at an older version and edited."""
@@ -555,7 +793,8 @@ class ReleasePreparationTests(SourceTree):
 
     def test_an_unrecorded_or_unsupported_plugin_is_never_published(self):
         site = self.site()
-        for plugin in ('os-ttyd', 'os-unknown'):
+        source = self.source({'os-unsupported': {'staging': 'unsupported', 'reason': 'No pinned runtime.'}})
+        for plugin in ('os-unsupported', 'os-unknown'):
             package = self.dist / (plugin + '-1.1.0.pkg')
             payload = json.dumps({'name': plugin, 'version': '1.1.0', 'abi': NATIVE,
                                   'files': {}, 'scripts': {}}).encode()
@@ -564,8 +803,18 @@ class ReleasePreparationTests(SourceTree):
                     add_member(archive, name, payload)
             with self.subTest(plugin=plugin), \
                     self.assertRaisesRegex(ValueError, 'Unsupported additional release package'):
-                self.prepare(site, [self.mihomo(), package])
-        self.assertFalse(list((site / 'repo').rglob('os-ttyd*')))
+                self.prepare(site, [self.mihomo(), package], source=source)
+        self.assertFalse(list((site / 'repo').rglob('os-unsupported*')))
+
+    def test_ttyd_reaches_only_its_pinned_current_native_repository(self):
+        site = self.site()
+        (site / 'repo/FreeBSD:14:amd64').mkdir()
+        package = build_package(self.dist, REPO, 'os-ttyd')
+        report, checked = self.prepare(site, [self.mihomo(), package])
+        self.assertEqual(['repo/' + NATIVE + '/26.7/All/' + package.name],
+                         [entry['path'] for entry in report['additional_packages']])
+        self.assertEqual(2, checked.call_count)
+        self.assertFalse(list((site / 'repo/FreeBSD:14:amd64').rglob('os-ttyd*')))
 
     def test_a_release_is_published_under_the_identity_it_carries(self):
         # Builds rename their output (os-lang.pkg), so the file name must not decide

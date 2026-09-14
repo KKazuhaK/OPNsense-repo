@@ -5,6 +5,25 @@
 
 # Sing-Box for OPNsense
 
+Native OPNsense configuration backups carry the Sing-box configuration directory,
+subscription environment and templates, service enable settings, and explicitly
+referenced custom certificate, key, trust-directory and local rule files. Files
+remain the active store; saves and subscription updates synchronize a compressed
+snapshot into `config.xml`, while an independent watcher notices file edits once
+per second. Imported snapshots are restored before service startup and during
+package installation. Missing files and disabled service settings are preserved.
+Runtime logs, locks, PID files, samples, the packaged subscription wrapper, the
+core cache and editor protection key are excluded.
+
+Custom external references must use absolute paths. Built-in system trust stores
+and hosts files are supplied by OPNsense and are not duplicated. Synchronization
+failures leave saved files intact and report a generic warning. Reinstall the
+compatible plugin before starting services after restoring a native backup.
+Keep exported backups private: they contain subscription URLs and proxy credentials.
+The snapshot checks schema, checksum and permitted paths before writing, restores
+bytes and permissions, removes stale owned files, and rolls back on failure.
+The existing package-upgrade scratch backup also remains for older packages.
+
 ![OPNsense](https://img.shields.io/badge/OPNsense-orange)
 ![Sing-Box](https://img.shields.io/badge/Sing--Box-Latest-brightgreen)
 
@@ -87,7 +106,7 @@ forward-zone:
 Upload the package to OPNsense and run:
 
 ```sh
-pkg add -f os-sing-box-1.0.3.pkg
+pkg add -f os-sing-box-1.1.1.pkg
 ```
 
 Refresh the OPNsense WebGUI and go to:
@@ -112,7 +131,7 @@ pkg delete os-sing-box
 
 ## Subscription Updates
 
-Version 1.0.3 fetches a complete Sing-box JSON subscription directly; YAML/template conversion is no longer supported. The private URL stays outside process arguments and logs. HTTP failures do not retry. The current maintained package targets FreeBSD 15; legacy ABI downloads remain archived.
+The plugin fetches a complete Sing-box JSON subscription directly; YAML/template conversion is no longer supported. The private URL stays outside process arguments and logs. HTTP failures do not retry. The current maintained package targets FreeBSD 15; legacy ABI downloads remain archived.
 
 Automatic subscription updates can be scheduled with Cron:
 
@@ -143,13 +162,13 @@ make package ABI=native
 Output file:
 
 ```text
-dist/os-sing-box-1.0.3.pkg
+dist/os-sing-box-1.1.1.pkg
 ```
 
 Inspect package metadata:
 
 ```sh
-pkg info -F dist/os-sing-box-1.0.3.pkg
+pkg info -F dist/os-sing-box-1.1.1.pkg
 ```
 
 ## Common Commands

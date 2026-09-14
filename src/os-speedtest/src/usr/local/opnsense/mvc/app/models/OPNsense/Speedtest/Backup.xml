@@ -1,0 +1,23 @@
+<model>
+    <mount>//OPNsense/Speedtest/backup</mount>
+    <version>1.0.0</version>
+    <description>
+        The part of the speed test a rebuilt box cannot work out for itself.
+        An OPNsense backup is config.xml and nothing else, so the three choices
+        the page stores in /var/db/speedtest/settings.json are lost with the
+        disk unless they are also kept here. Results, progress, the cached
+        server lists and the run lock are measurements the plugin makes again
+        on first use, so they are deliberately absent.
+    </description>
+    <items>
+        <!-- Plain text and nothing required, on purpose. This section is a
+             copy of a file that stays the source of truth, so it must load
+             when it is absent, when a restore wrote only half of it, and when
+             it carries a value a later version would refuse. Meaning belongs
+             to config_mirror.py, which is the only thing that decides what a
+             sane interface, server or connection count is. -->
+        <interface type="TextField"/>
+        <server_id type="TextField"/>
+        <threads type="TextField"/>
+    </items>
+</model>

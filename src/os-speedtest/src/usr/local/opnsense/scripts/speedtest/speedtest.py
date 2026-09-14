@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -112,21 +113,38 @@ def publish(state, text='', error=''):
 def write(path, payload, mode):
     os.makedirs(STATE, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=STATE)
-    with os.fdopen(handle, 'w') as stream:
-        json.dump(payload, stream)
-    os.chmod(temporary, mode)
-    os.rename(temporary, path)
+    try:
+        with os.fdopen(handle, 'w') as stream:
+            json.dump(payload, stream)
+        os.chmod(temporary, mode)
+        os.rename(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def main(argv):
     # Two tests at once share the link and both report a fraction of it.
     os.makedirs(STATE, exist_ok=True)
-    guard = open(LOCK, 'a')
+    with open(LOCK, 'a') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print('a speed test is already running', file=sys.stderr)
+            return 1
+        return run_locked(argv)
+
+
+def stop_process(process):
+    # The timeout wrapper and engine share their own group, outside the worker.
     try:
-        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print('a speed test is already running', file=sys.stderr)
-        return 1
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=5)
+
+
+def run_locked(argv):
     background = len(argv) > 1 and argv[1] == '--background'
     arguments = argv[2:] if background else argv[1:]
     publish('running')
@@ -148,32 +166,35 @@ def main(argv):
     collected = ''
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                   stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                   start_new_session=True)
     except OSError as error:
         publish('failed', error=str(error))
         return 1
-    deadline = time.time() + TIMEOUT
     try:
+        deadline = time.time() + TIMEOUT
         for line in process.stdout:
             collected += line
             publish('running', collected)
             if time.time() > deadline:
-                process.kill()
+                stop_process(process)
                 publish('failed', collected, 'The speed test exceeded its time limit.')
                 return 1
+        if process.wait() != 0:
+            publish('failed', collected, 'The speed test failed.')
+            return 1
+        data = publish('running', collected)
+        result = result_of(data)
+        if result is None:
+            publish('failed', collected, 'The speed test produced no usable result.')
+            return 1
+        write(RESULT, result, 0o600)
+        publish('done', collected)
+        return 0
     finally:
         process.stdout.close()
-    if process.wait() != 0:
-        publish('failed', collected, 'The speed test failed.')
-        return 1
-    data = publish('running', collected)
-    result = result_of(data)
-    if result is None:
-        publish('failed', collected, 'The speed test produced no usable result.')
-        return 1
-    write(RESULT, result, 0o600)
-    publish('done', collected)
-    return 0
+        if process.poll() is None:
+            stop_process(process)
 
 
 if __name__ == '__main__':

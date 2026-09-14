@@ -72,3 +72,11 @@ dist/os-lucky.pkg
 ## 免责
 
 这是一个非官方社区项目，无官方 OPNsense 团队支持，自行承担使用过程中可能产生的风险。
+
+## Configuration backup
+
+The normal OPNsense configuration backup includes `/etc/rc.conf.d/lucky` and the complete application configuration directory selected by `lucky_conf_dir`, including a custom directory. The compressed, checksummed snapshot is stored under `OPNsense/Lucky/backup`. It preserves service enable, port, application settings, account credentials, certificates and other persistent files in that directory; logs, PID files, locks and temporary files are excluded.
+
+The existing files remain the runtime configuration source. Saving plugin settings and changing the service updates the snapshot. A background watcher captures settings written through Lucky's own web interface every second.
+
+Restore the normal OPNsense backup and reboot. An early hook imports changed snapshots before the daemon reads its configuration. Unchanged snapshots do not replace newer runtime files. File contents, absence and permission modes are preserved, and installation imports saved settings before initializing defaults.

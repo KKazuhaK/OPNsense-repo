@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'src/usr/local/opnsense/scripts/mihomo/mihomo.py'
@@ -172,6 +173,65 @@ class StateTests(unittest.TestCase):
         self.assertIn('stop', self.system.events)
         self.assertFalse(self.manager.source_file.exists())
 
+    def test_settings_action_applies_listener_and_tun_fields_before_and_after_subscription(self):
+        payload = self.manager.state / 'request.json'
+        for has_subscription, mixed_port in ((False, 17890), (True, 17892)):
+            with self.subTest(has_subscription=has_subscription):
+                if has_subscription:
+                    self.manager.apply(SUBSCRIPTION)
+                given = {'mixed_port': mixed_port, 'socks_port': mixed_port + 1,
+                         'allow_lan': True, 'bind_address': '10.0.0.1',
+                         'tun_stack': 'system', 'tun_mtu': 1400}
+                payload.write_text(json.dumps(given))
+                self.manager.dispatch('set-settings', str(payload))
+                settings = self.manager.settings()
+                for key, value in given.items():
+                    self.assertEqual(value, settings[key], key)
+                generated = m.parse_yaml(self.manager.config_file.read_bytes())
+                for key in ('mixed_port', 'socks_port', 'allow_lan', 'bind_address'):
+                    self.assertEqual(given[key], generated[key.replace('_', '-')], key)
+                self.assertEqual('system', generated['tun']['stack'])
+                self.assertEqual(1400, generated['tun']['mtu'])
+                self.assertFalse(generated['tun']['enable'])
+                self.assertTrue(self.system.alive)
+
+    def test_settings_action_rejects_invalid_listener_and_tun_fields_without_changes(self):
+        payload = self.manager.state / 'request.json'
+        for invalid in ({'mixed_port': 53}, {'socks_port': 7890},
+                        {'mixed_port': True}, {'allow_lan': 'yes'},
+                        {'bind_address': 'invalid'}, {'tun_stack': 'invalid'},
+                        {'tun_mtu': 1}):
+            with self.subTest(invalid=invalid):
+                payload.write_text(json.dumps(invalid))
+                before = self.snapshot()
+                events = list(self.system.events)
+                with self.assertRaises(m.Error):
+                    self.manager.dispatch('set-settings', str(payload))
+                self.assertEqual(before, self.snapshot())
+                self.assertEqual(events, self.system.events)
+                self.assertTrue(self.system.alive)
+
+    def test_repeated_start_preserves_generated_dns_mode(self):
+        config = self.manager.path('/conf/config.xml')
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('<opnsense><OPNsense><unboundplus><dots/></unboundplus></OPNsense></opnsense>')
+        dot = self.manager.path('/var/unbound/etc/dot.conf')
+        dot.parent.mkdir(parents=True, exist_ok=True)
+        dot.write_text('forward-addr: 1.1.1.1@853\n')
+        self.manager.apply(SUBSCRIPTION)
+        for router_dns, dns_enabled in ((True, True), (False, False), (False, True)):
+            with self.subTest(router_dns=router_dns, dns_enabled=dns_enabled):
+                settings = self.manager.settings()
+                settings['router_dns'] = router_dns
+                overlay = {'tun': {'enable': True, 'auto-route': True},
+                           'dns': {'enable': dns_enabled, 'listen': '127.0.0.1:1053'}}
+                self.manager.apply(SUBSCRIPTION, settings, overlay=overlay)
+                result = self.manager.dispatch('enable-transparent')
+                expected = dns_enabled and not router_dns
+                self.assertEqual(expected, self.manager.dispatch('status')['dns_active'])
+                for action in ('boot', 'start'):
+                    self.assertEqual(expected, self.manager.dispatch(action)['dns_active'])
+
     def test_invalid_fake_ip_range_does_not_enable_transparency(self):
         self.manager.apply(SUBSCRIPTION.replace(b'198.18.0.1/16', b'28.0.0.1/8'))
         before = self.snapshot()
@@ -185,6 +245,29 @@ class StateTests(unittest.TestCase):
         self.manager.log('Safe diagnostic.')
         self.manager.apply(SUBSCRIPTION)
         self.assertTrue(self.system.alive)
+
+
+class BundledCoreStackTests(unittest.TestCase):
+    def test_unsupported_tun_stacks_are_rejected_before_running_the_core(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / 'config.yaml'
+            system = m.System()
+            with mock.patch.object(system, 'run') as run:
+                for stack in ('system', 'mixed'):
+                    candidate.write_text(yaml.safe_dump({'tun': {'enable': True, 'stack': stack}}))
+                    with self.subTest(stack=stack), self.assertRaisesRegex(m.Error, 'gVisor'):
+                        system.validate(candidate)
+                run.assert_not_called()
+
+    def test_gvisor_and_disabled_tun_use_normal_core_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / 'config.yaml'
+            system = m.System()
+            for enabled, stack in ((True, 'gvisor'), (False, 'system'), (False, 'mixed')):
+                candidate.write_text(yaml.safe_dump({'tun': {'enable': enabled, 'stack': stack}}))
+                with self.subTest(enabled=enabled, stack=stack), mock.patch.object(system, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+                    system.validate(candidate)
+                    run.assert_called_once()
 
 
 class RecoveryTests(unittest.TestCase):

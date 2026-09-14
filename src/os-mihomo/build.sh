@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME=os-mihomo
-VERSION="${VERSION:-1.2.1}"
+VERSION="${VERSION:-1.2.2}"
 SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd)"
 DISTDIR="${DISTDIR:-$SCRIPT_DIR/dist}"
 ASSET="$SCRIPT_DIR/src/usr/local/bin/clash-meta-freebsd-amd64.xz"

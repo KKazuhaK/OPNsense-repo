@@ -840,6 +840,10 @@ class System:
         return self.valid_pid(PID, "/usr/local/bin/mihomo") is not None
 
     def validate(self, candidate):
+        data = parse_yaml(Path(candidate).read_bytes())
+        tun = data.get('tun', {})
+        if tun.get('enable') and tun.get('stack', 'gvisor') != 'gvisor':
+            raise Error('This FreeBSD core supports only the gVisor TUN stack. Select gVisor before enabling transparent routing.')
         result = self.run(["/usr/local/bin/mihomo", "-t", "-d", HOME, "-f", str(candidate)], timeout=90, check=False)
         if result.returncode:
             raise Error("Mihomo rejected the configuration. No configuration was applied.")
@@ -867,11 +871,20 @@ class System:
                         time.sleep(0.5)
                         continue
                 if transparent:
-                    present = self.run(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
+                    interface = self.run(['/sbin/ifconfig', 'tun_mihomo'], check=False)
+                    present = interface.returncode == 0
                     routed = not data.get('tun', {}).get('auto-route') or b'tun_mihomo' in self.run(['/sbin/route', '-n', 'get', '8.8.8.8'], check=False).stdout
                     if not (present and routed):
                         time.sleep(0.5)
                         continue
+                    # FreeBSD clears TUN addresses as soon as the last core
+                    # descriptor closes. Capture local ownership while the
+                    # ready core still exposes its configured addresses.
+                    try:
+                        self._host_dns_prepare(interface.stdout)
+                    except (Error, OSError):
+                        self.stop()
+                        raise
                 if not needs_dns:
                     return
                 try:
@@ -912,8 +925,131 @@ class System:
         self.destroy_tun()
 
     def destroy_tun(self):
-        if self.run(["/sbin/ifconfig", "tun_mihomo"], check=False).returncode == 0:
-            self.run(["/sbin/ifconfig", "tun_mihomo", "destroy"])
+        interface = self.run(["/sbin/ifconfig", "tun_mihomo"], check=False)
+        recovery = None
+        try:
+            # A dead child can remain visible to pgrep while it is reaped.
+            # Preserve ownership before removing TUN, but defer DNS reload
+            # until the independent global process guard confirms no core.
+            if not self.running():
+                recovery = self._host_dns_prepare(interface.stdout if interface.returncode == 0 else b'')
+        finally:
+            # A failed DNS recovery must not retain routes into a dead core.
+            if interface.returncode == 0:
+                self.run(["/sbin/ifconfig", "tun_mihomo", "destroy"])
+        if recovery is not None:
+            self._host_dns_recover(recovery)
+
+    @staticmethod
+    def _host_dns_paths():
+        return (Path('/etc/resolv.conf'), Path('/conf/config.xml'),
+                Path('/etc/resolv.conf.local'), Path(STATE) / 'host-dns-reload-pending')
+
+    @staticmethod
+    def _host_dns_read(path, private=False, limit=65536):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_size > limit or
+                    (private and (before.st_uid != 0 or stat.S_IMODE(before.st_mode) != 0o600))):
+                raise Error('The pending host DNS recovery file is invalid.')
+            content = stream.read(limit + 1)
+            after = os.fstat(stream.fileno())
+        if len(content) > limit or any(getattr(before, field) != getattr(after, field) for field in
+                ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+            raise Error('The host DNS configuration changed while it was read.')
+        return content
+
+    @staticmethod
+    def _host_dns_servers(content):
+        # This exact format is written by the bundled sing-tun FreeBSD core.
+        try:
+            lines = content.decode('ascii').splitlines()
+            if not 2 <= len(lines) <= 3 or lines[0] != 'search localdomain':
+                return None
+            servers = [str(ipaddress.ip_address(line.removeprefix('nameserver '))) for line in lines[1:]]
+            canonical = ('search localdomain\n' + ''.join('nameserver ' + server + '\n' for server in servers)).encode()
+            if content != canonical or len({ipaddress.ip_address(server).version for server in servers}) != len(servers):
+                return None
+            return servers
+        except (UnicodeError, ValueError, AttributeError):
+            return None
+
+    def _host_dns_core_stopped(self):
+        return not self.running() and self.run(['/usr/bin/pgrep', '-x', 'mihomo'], check=False).returncode == 1
+
+    def _host_dns_operator_owned(self, servers):
+        _, config, local, _ = self._host_dns_paths()
+        try:
+            root = ElementTree.fromstring(self._host_dns_read(config, limit=MAX_CONFIG) or b'')
+            explicit = [node.text or '' for node in root.findall('./system/dnsserver')]
+            for line in (self._host_dns_read(local) or b'').decode().splitlines():
+                tokens = line.partition('#')[0].split()
+                if len(tokens) >= 2 and tokens[0] == 'nameserver':
+                    explicit.append(tokens[1])
+            for value in explicit:
+                with contextlib.suppress(ValueError):
+                    if str(ipaddress.ip_address(value.strip())) in servers:
+                        return True
+            return False
+        except (OSError, Error, ElementTree.ParseError, UnicodeError):
+            # Without the native configuration, ownership cannot be established.
+            return True
+
+    def _host_dns_forget(self, record):
+        pending = self._host_dns_paths()[3]
+        if self._host_dns_read(pending, private=True, limit=4096) == record:
+            pending.unlink(missing_ok=True)
+
+    def _host_dns_prepare(self, interface):
+        resolver, _, _, pending = self._host_dns_paths()
+        content = self._host_dns_read(resolver)
+        servers = self._host_dns_servers(content)
+        record = self._host_dns_read(pending, private=True, limit=4096)
+        if record is not None:
+            try:
+                saved = json.loads(record)
+                if (not isinstance(saved, dict) or set(saved) != {'servers', 'checksum'} or
+                        not isinstance(saved['servers'], list) or
+                        not isinstance(saved['checksum'], str) or not re.fullmatch('[a-f0-9]{64}', saved['checksum'])):
+                    raise ValueError()
+                expected = ('search localdomain\n' + ''.join('nameserver ' + value + '\n' for value in saved['servers'])).encode()
+                if self._host_dns_servers(expected) != saved['servers']:
+                    raise ValueError()
+            except (ValueError, TypeError, KeyError):
+                raise Error('The pending host DNS recovery file is invalid.') from None
+            if (servers != saved['servers'] or content is None or
+                    hashlib.sha256(content).hexdigest() != saved['checksum'] or self._host_dns_operator_owned(servers)):
+                self._host_dns_forget(record)
+                # A later core can have used a different TUN address. A live
+                # interface supplies fresh ownership; an absent one does not.
+            else:
+                return record
+        expected = set()
+        for value in re.findall(rb'^\s+inet6?\s+([0-9a-fA-F:.]+)(?:%\S+)?\s', interface, re.MULTILINE):
+            with contextlib.suppress(ValueError):
+                expected.add(str(ipaddress.ip_address(value.decode()) + 1))
+        if not servers or not set(servers).issubset(expected) or self._host_dns_operator_owned(servers):
+            return None
+        record = json.dumps({'servers': servers, 'checksum': hashlib.sha256(content).hexdigest()}, sort_keys=True).encode() + b'\n'
+        # This local retry marker is never part of the XML configuration archive.
+        atomic_write(pending, record)
+        return record
+
+    def _host_dns_recover(self, record):
+        if not self._host_dns_core_stopped():
+            return
+        # Destroying the interface or a concurrent operator edit can change DNS.
+        # Recheck both native ownership and the fingerprint before regenerating.
+        if self._host_dns_prepare(b'') != record:
+            return
+        self.run(['/usr/local/sbin/configctl', 'dns', 'reload'], timeout=90)
+        if hashlib.sha256(self._host_dns_read(self._host_dns_paths()[0]) or b'').hexdigest() == json.loads(record)['checksum']:
+            raise Error('Host DNS recovery did not regenerate the resolver configuration and will be retried.')
+        self._host_dns_forget(record)
 
     def resolver_running(self):
         return self.run(["/usr/bin/pgrep", "-q", "-x", "unbound"], check=False).returncode == 0
@@ -2144,7 +2280,8 @@ class Manager:
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
                         'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
-                        'device_mode', 'device_list', *DNS_SERVER_FIELDS):
+                        'device_mode', 'device_list', 'mixed_port', 'socks_port',
+                        'allow_lan', 'bind_address', 'tun_stack', 'tun_mtu', *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
             if 'dashboard_any' in value:
@@ -2184,7 +2321,11 @@ class Manager:
                 self.stop(settings)
             if self.system.running():
                 self.system.watch()
-                return self.publish_status(settings, settings["transparent"])
+                generated = parse_yaml(self.config_file.read_bytes())
+                dns = generated.get('dns', {})
+                dns_active = bool(generated.get('tun', {}).get('enable') and dns.get('enable')
+                                  and dns.get('listen') == '127.0.0.1:1053' and not settings.get('router_dns'))
+                return self.publish_status(settings, dns_active)
             return self.start(settings)
         if action == "status":
             try:

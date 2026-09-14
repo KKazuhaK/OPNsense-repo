@@ -357,7 +357,8 @@ $(function () {
             dns_proxy_nameserver: $('#dns_proxy_nameserver').val()
         }};
         ['mixed_port', 'socks_port', 'tun_mtu', 'bind_address', 'tun_stack'].forEach(function (field) {
-            payload.settings[field] = $('#' + field).val();
+            // Preserve an existing disabled stack choice while TUN is off.
+            payload.settings[field] = $('#' + field).prop('value');
         });
         ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any',
          'allow_lan'].forEach(function (flag) {
@@ -584,12 +585,12 @@ $(function () {
                     <td>
                         <select id="tun_stack" class="selectpicker" data-style="btn-default" data-width="240px">
                             <option value="gvisor">{{ lang._('gVisor (default)') }}</option>
-                            <option value="system">{{ lang._('System') }}</option>
-                            <option value="mixed">{{ lang._('Mixed') }}</option>
+                            <option value="system" disabled>{{ lang._('System (unavailable on this build)') }}</option>
+                            <option value="mixed" disabled>{{ lang._('Mixed (unavailable on this build)') }}</option>
                         </select>
                         <span class="label label-warning mihomo-override" id="override_tun_stack" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_tunstack">
-                            {{ lang._('How the tunnel moves packets. gVisor runs in Mihomo and needs nothing from the host, which is why it is the default. System hands the work to the kernel and is faster where that works. Mixed uses the system stack for TCP and gVisor for UDP. Change it only if throughput is a problem, and watch that transparent routing still comes up afterwards.') }}
+                            {{ lang._('This FreeBSD core supports gVisor for transparent routing. System and Mixed are unavailable because their TCP forwarding does not work on this build.') }}
                         </div>
                     </td>
                 </tr>

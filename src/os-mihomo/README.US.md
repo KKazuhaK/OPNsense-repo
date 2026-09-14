@@ -23,7 +23,9 @@ complete subscription YAML
 
 Mappings deep-merge; scalars and plain lists replace. Empty mappings clear the existing mapping. `prepend-rules` / `append-rules`, `prepend-proxy-groups` / `append-proxy-groups` and `prepend-proxies` / `append-proxies` extend lists. Appending after a provider `MATCH` rule will not change its priority. No JavaScript/script execution layer is supported.
 
-Three YAML presets are shipped: `full.yaml` (TUN and fake-IP DNS), `tun-only.yaml` (TUN without Mihomo DNS interception), and `proxy-only.yaml`. Loading a preset replaces the entire merge file; preserve custom content first. The initial merge uses full-mode defaults, with activation gated off. The dashboard initially binds loopback; configure this router's dashboard address in merge YAML. Default TUN MTU is 1420; adjust it to the smallest effective node transport MTU.
+Three YAML presets are shipped: `full.yaml` (TUN and fake-IP DNS), `tun-only.yaml` (TUN without Mihomo DNS interception), and `proxy-only.yaml`. Loading a preset replaces the entire merge file; preserve custom content first. The initial merge uses full-mode defaults, with activation gated off. The authenticated dashboard initially binds all interfaces; its settings switch can restrict it to loopback. Default TUN MTU is 1420; adjust it to the smallest effective node transport MTU.
+
+TUN activation with the currently bundled FreeBSD core supports only `gvisor`. Its `system` and `mixed` TCP paths incorrectly classify traffic as broadcast, so the plugin rejects transparent routing with either stack; select gVisor before enabling it. This restriction applies to the bundled core and requires fresh validation for a future core.
 
 The code enforces `tun.device: tun_mihomo`, the stored dashboard secret and valid listener ports excluding 53, including extra listeners and the controller. Merge YAML cannot bypass disabled TUN activation. DNS forwarding integration is provided for `127.0.0.1:1053` when Mihomo DNS is enabled; custom listeners remain administrator-managed.
 
@@ -43,6 +45,8 @@ The switch leaves `dns-hijack`, enhanced mode and Unbound AAAA policy unchanged.
 
 IPv4 and IPv6 forwarding addresses are read from the router's generated DoT configuration; saved ownership state recovers original upstreams during a transition out of Mihomo DNS forwarding. Host routes and `DST-PORT,853,DIRECT` precede subscription and merge rules. The watchdog refreshes them when upstream addresses change. This avoids routing Unbound's own DNS transport through a node whose hostname it must resolve.
 
+Startup records a local fingerprint of system DNS written by the core. After a crash, native OPNsense DNS regeneration restores system resolution and retries on failure. Later operator edits or explicitly configured DNS are preserved. This temporary recovery record is excluded from XML backups.
+
 The current supported deployment scope is IPv4 clients. RA or DHCPv6 advertisement with disabled Mihomo IPv6 causes activation refusal and a visible runtime warning if enabled later. It does not suppress AAAA or configure RA/DHCPv6. Validate IPv6 end to end before enabling IPv6 for clients.
 
 ## Recovery and subscriptions
@@ -53,4 +57,4 @@ Subscriptions are fetched directly with `OPNsense-Mihomo/1 (device)`. HTTP 4xx n
 
 ## Build and publish
 
-Run `sh build.sh` on the recipe's native FreeBSD / OPNsense target with matching Python, PyYAML and curl. Current 26.7 uses `python3.13` / `python313` and produces `dist/FreeBSD:15:amd64/os-mihomo-1.2.1.pkg`. `TARGET_ABI`, `TARGET_PRODUCT_ABI` and `TARGET_PYTHON` can be explicit; the actual kernel, userland, dependencies and interpreter must match. Runtime Python entry points and product annotations follow the target. Bytecode is excluded and rejected in staging and archives. See [deployment](../../DEPLOYMENT.md) for per-target native tests, signed dependency setup and publication. Pages reruns the signed report's source tests and compares package content with that revision.
+Run `sh build.sh` on the recipe's native FreeBSD / OPNsense target with matching Python, PyYAML and curl. Current 26.7 uses `python3.13` / `python313` and produces `dist/FreeBSD:15:amd64/os-mihomo-1.2.2.pkg`. `TARGET_ABI`, `TARGET_PRODUCT_ABI` and `TARGET_PYTHON` can be explicit; the actual kernel, userland, dependencies and interpreter must match. Runtime Python entry points and product annotations follow the target. Bytecode is excluded and rejected in staging and archives. See [deployment](../../DEPLOYMENT.md) for per-target native tests, signed dependency setup and publication. Pages reruns the signed report's source tests and compares package content with that revision.

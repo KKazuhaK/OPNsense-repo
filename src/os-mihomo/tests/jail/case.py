@@ -37,6 +37,35 @@ def running():
 
 host_dns_marker = Path('/var/db/os-mihomo/host-dns-reload-pending')
 host_dns_resolver = Path('/etc/resolv.conf')
+gateway_cycle = {}
+
+
+def native_routes(fib):
+    """Parse genuine tables with the installed module's unchanged parser."""
+    spec = importlib.util.spec_from_file_location(
+        'native_routing', '/usr/local/opnsense/scripts/mihomo/routing.py')
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    routes = {}
+    for family, name in ((4, 'inet'), (6, 'inet6')):
+        output = command(['/usr/bin/netstat', '-rn', '-F', str(fib), '-f', name]).stdout.decode()
+        routes.update(helper.parse_routes(output, family))
+    return helper, routes
+
+
+def prepare_gateway_cycle():
+    """Model a foreign interface's cyclic numeric gateways before cold copying."""
+    command(['/sbin/ifconfig', 'lo2', 'create', 'inet', '192.0.3.10/32', 'up'])
+    command(['/sbin/route', '-n', 'add', '-host', '10.255.255.254', '-iface', 'lo2'])
+    command(['/sbin/route', '-n', 'add', '-net', '10.0.0.0/24', '10.255.255.254', '-ifp', 'lo2'])
+    command(['/sbin/route', '-n', 'delete', '-host', '10.255.255.254'])
+    command(['/sbin/route', '-n', 'add', '-host', '10.255.255.254', '10.0.0.1', '-ifp', 'lo2'])
+    helper, routes = native_routes(0)
+    for route in routes.values():
+        if route['destination'] in ('10.0.0.0/24', '10.255.255.254/32'):
+            assert route['interface'] == 'lo2' and route['gateway'] != 'interface'
+            gateway_cycle[helper.route_key(route)] = helper.route_identity(route)
+    assert len(gateway_cycle) == 2
 
 
 def assert_core_host_dns_marker():
@@ -62,6 +91,12 @@ def assert_private_routing(active):
         assert not active and not anchor.strip()
         return
     assert isinstance(saved['fib'], int) and saved['fib'] > 0
+    helper, routes = native_routes(saved['fib'])
+    for key, expected in gateway_cycle.items():
+        assert key in routes and helper.route_identity(routes[key]) == expected
+    _, main_routes = native_routes(0)
+    for key, expected in gateway_cycle.items():
+        assert helper.route_identity(main_routes[key]) == expected
     route = command(['/sbin/route', '-n', 'get', '-fib', str(saved['fib']), '8.8.8.8']).stdout
     assert (b'tun_mihomo' in route) is active
     if active:
@@ -196,6 +231,7 @@ passed('Actual core validator rejects invalid protocol while retaining the activ
 command(['/usr/local/sbin/configctl', 'template', 'reload', 'OPNsense/Unbound'])
 command(['/usr/local/sbin/configctl', 'unbound', 'restart'])
 assert_host_dns_restored()
+prepare_gateway_cycle()
 action('enable-transparent')
 assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
 assert action('status')['result']['dns_active']
@@ -228,7 +264,7 @@ insecure = Path('/var/unbound/private_domains.conf')
 assert 'domain-insecure: "."' not in (insecure.read_text() if insecure.exists() else '')
 passed('Transparent DNS adds no trust anchor for the root of its own')
 assert_private_routing(True)
-passed('FIB0 keeps native public routing while the owned FIB and real source-selection PF match rules capture eligible flows')
+passed('FIB0 keeps native routing while the cold owned FIB copies cyclic numeric gateways and real source-selection PF match rules capture eligible flows')
 # dns_active reports that the plumbing was configured. It does not report that a
 # query survives the TUN, and on a router it did not: the resolver was listening
 # and answering nothing, which is a transport failure rather than an rcode.
@@ -365,6 +401,8 @@ passed('Actual fresh package installation starts proxy ports without TUN or DNS 
 assert_private_routing(False)
 report = {'ok': True, 'checks': checks, 'package_sha256': hashlib.sha256(Path('/root/new.pkg').read_bytes()).hexdigest(),
           'package_version': new_manifest['version'], 'crash_recovery_seconds': round(recovery_seconds, 3),
+          'cold_numeric_gateway_cycle': {'routes': list(gateway_cycle.values()),
+                                         'interface': 'lo2', 'active_and_stopped_copy_verified': True},
           'boundary': {'core_pf_private_fib_and_unbound': 'genuine native execution',
                        'configd_filter_context_dns_templates_revision_service': 'synthetic private fixture adapters',
                        'lan_packet_flows': 'not exercised; covered separately by selective TUN packet and host integration tests'}}

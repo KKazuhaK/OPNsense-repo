@@ -40,6 +40,7 @@ BACKUP_WARNING = 'The operation completed, but the Mihomo configuration backup c
 BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. The current local configuration is retained. '
                             'Stop the service and use Repair saved backup to validate and import the edited backup.')
 UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
+UNBOUND_CONFIG_ROOT = '/var/unbound'
 FORWARDER = '127.0.0.1@1053'
 ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1
@@ -1131,6 +1132,43 @@ class System:
         except OSError:
             return False
 
+    def unbound_render_snapshot(self):
+        """Compare generated listeners and includes before avoiding a restart."""
+        root = Path(UNBOUND_CONFIG_ROOT)
+        try:
+            main = root / 'unbound.conf'
+            if not main.is_file():
+                return None
+            files = sorted(root.rglob('*.conf'))
+            if len(files) > 4096:
+                return None
+            digest = hashlib.sha256()
+            total = 0
+            for filename in files:
+                with filename.open('rb') as handle:
+                    data = handle.read(MAX_CONFIG - total + 1)
+                total += len(data)
+                if total > MAX_CONFIG:
+                    return None
+                for line in data.decode('utf-8').splitlines():
+                    if re.match(r'^\s*include(?:-toplevel)?\s*:', line):
+                        parts = shlex.split(line, comments=True)
+                        if len(parts) != 2 or parts[0] not in ('include:', 'include-toplevel:'):
+                            return None
+                        include = Path(parts[1])
+                        if (not include.is_absolute() or include.suffix != '.conf'
+                                or not include.parent.resolve().is_relative_to(root.resolve())
+                                or (include.name != '*.conf' and not include.is_file())):
+                            return None
+                name = filename.relative_to(root).as_posix().encode()
+                digest.update(len(name).to_bytes(4, 'big'))
+                digest.update(name)
+                digest.update(len(data).to_bytes(8, 'big'))
+                digest.update(data)
+            return digest.digest()
+        except (OSError, ValueError, UnicodeError):
+            return None
+
     def dns(self, enabled, settings, recovery_only=False):
         pending = Path(STATE) / "dns-reload-pending"
         was_pending = pending.exists()
@@ -1138,17 +1176,40 @@ class System:
         mode = 'rescue' if recovery_only else 'enable' if enabled else 'disable'
         result = self.run(["/usr/local/bin/php", HELPER, mode,
                   "1" if settings["dns_fallback"] else "0"], timeout=90)
+        expected_forwarding = enabled
+        integration = None
+        for line in result.stdout.splitlines():
+            if line.startswith(b'Mihomo integration state: '):
+                try:
+                    details = json.loads(line.split(b': ', 1)[1])
+                    fields = ('effective_forwarding', 'dns_changed', 'integration_changed')
+                    if isinstance(details, dict) and all(isinstance(details.get(field), bool) for field in fields):
+                        integration = details
+                        expected_forwarding = details['effective_forwarding']
+                except (ValueError, TypeError):
+                    pass
         # "unchanged" reports that the configuration already said this. It says
         # nothing about the file Unbound reads, which is generated from that
         # configuration separately and can still describe the previous state --
         # a stale one pointing at a stopped core leaves the network without DNS.
-        if b"unchanged" in result.stdout and not was_pending and self.forwarded() == enabled:
+        # DNSSEC can leave the effective forwarder disabled even when transparent
+        # DNS was requested. Older helpers keep the conservative intent check.
+        if b"unchanged" in result.stdout and not was_pending and self.forwarded() == expected_forwarding:
             pending.unlink(missing_ok=True)
             return
+        integration_only = bool(integration is not None and not integration['dns_changed']
+            and integration['integration_changed'] and not was_pending
+            and self.forwarded() == expected_forwarding)
+        previous_render = self.unbound_render_snapshot() if integration_only else None
         # The Unbound templates live in sub-containers, so the bare name matches
         # nothing: it generates no file and answers ERR. Without the wildcard the
         # configuration Unbound is about to be checked against is never rewritten.
         self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound/*"], timeout=90)
+        if (integration_only and previous_render is not None
+                and previous_render == self.unbound_render_snapshot() and self.resolver_running()):
+            self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
+            pending.unlink(missing_ok=True)
+            return
         # Taken before the restart, because the restart is what can destroy it:
         # OPNsense's start script re-fetches the root anchor whenever
         # unbound-checkconf is unhappy, and a fetch made while DNS is being
@@ -1482,6 +1543,8 @@ class Manager:
         if field == 'dns_state':
             if (str(value.get('forwarding')) not in ('0', '1') or
                     type(value.get('had_fake_ip_private_address')) is not bool or
+                    ('removed_fake_ip_private_address' in value and
+                     type(value['removed_fake_ip_private_address']) is not bool) or
                     not isinstance(value.get('roots'), dict) or len(value['roots']) > 512 or any(
                         not re.fullmatch(r'[A-Za-z0-9-]{1,128}', key) or str(enabled) not in ('0', '1')
                         for key, enabled in value['roots'].items())):

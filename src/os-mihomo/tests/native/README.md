@@ -54,6 +54,20 @@ assignments and filter/NAT references. The context fixture supplies synthetic
 interface data to check LAN selection and router/WAN exclusions. Neither check
 exercises actual packet forwarding or the native Core configuration writer.
 
+Run the numeric gateway transport fixture only inside a disposable FreeBSD
+VNET jail containing the installed Python helpers:
+
+```sh
+python3 -B test-native-route.py --run
+```
+
+It creates three private FIBs and two temporary loopback interfaces. It checks
+cold gateway cycles, an ambiguous gateway reachable through another interface,
+exclusive creation without appending an ECMP path, IPv6 scope, and reject and
+blackhole routes. It restores its FIB0 routes and interfaces; remove the
+disposable jail after the check to release the allocated private FIBs. It does
+not establish WireGuard peer connectivity or LAN packet forwarding.
+
 Run the Core writer and concurrency fixture as root on the matching OPNsense
 target, using the installed helper when validating a package:
 

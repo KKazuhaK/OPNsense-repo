@@ -23,6 +23,10 @@ def route(destination, gateway, interface, flags='US'):
             'gateway': gateway, 'interface': interface, 'flags': flags, 'discard': ''}
 
 
+def route_mutation(args):
+    return args[0] == '/sbin/route' or (args[0] == '/usr/local/bin/python3' and args[1].endswith('/mihomo/native_route.py'))
+
+
 def state(identifier, fib, policy=''):
     return ('all tcp 10.0.0.2:40000 -> 203.0.113.2:443 ESTABLISHED:ESTABLISHED\n'
             '   age 00:00:01, expires in 00:01:00, rule 1\n'
@@ -93,6 +97,17 @@ class Kernel:
             code = 1 if self.fail_kill else 0
             if not code:
                 self.killed.append(args[-1])
+        elif args[0] == '/usr/local/bin/python3' and args[1].endswith('/mihomo/native_route.py'):
+            assert args[2:4] == ['add', '--fib'] and args[5] == '--route', args
+            fib, value = int(args[4]), json.loads(args[6])
+            key = m.route_key(value)
+            source = self.tables[0].get(key)
+            if source is None or m.route_semantic(source) != m.route_semantic(value):
+                code = 1
+            elif self.fail_add or key == self.fail_key or key in self.tables[fib]:
+                code = 1
+            else:
+                self.tables[fib][key] = copy.deepcopy(value)
         elif args[0] == '/sbin/route':
             # Native modifiers must follow the command keyword.
             assert args[2] in ('add', 'delete') and args[3] == '-fib', args
@@ -174,6 +189,40 @@ class RoutingTests(unittest.TestCase):
         self.assertIn('4:10.0.0.0/24%', self.kernel.tables[record['fib']])
         self.routing.execute('disable')
         self.assertEqual(self.kernel.tables[record['fib']]['4:10.0.0.0/24%']['flags'], 'U')
+
+    def test_cold_gateway_cycle_uses_native_interface_add_and_preserves_main(self):
+        cyclic = [route('10.99.0.1/32', '10.255.255.1', 'wg0', 'UGHS'),
+                  route('10.255.255.1/32', '10.99.0.1', 'wg0', 'UGHS')]
+        for value in cyclic:
+            self.kernel.tables[0][m.route_key(value)] = value
+        original = copy.deepcopy(self.kernel.tables[0])
+        fib = self.routing.execute('enable')['fib']
+        for value in cyclic:
+            self.assertEqual(m.route_semantic(self.kernel.tables[fib][m.route_key(value)]), m.route_semantic(value))
+        numeric_cli = [args for args in self.kernel.calls if args[0] == '/sbin/route' and args[2] == 'add' and '-iface' not in args]
+        self.assertEqual(numeric_cli, [])
+        self.routing.execute('disable')
+        self.assertEqual(self.kernel.tables[0], original)
+        self.assertFalse(self.routing.load()['pending'])
+
+    def test_exclusive_add_race_does_not_claim_foreign_route(self):
+        original = self.kernel.run
+        foreign = route('10.2.0.0/24', '10.0.0.99', 'vtnet1', 'UGS')
+        injected = False
+        def concurrent(args, **options):
+            nonlocal injected
+            if args[0] == '/usr/local/bin/python3' and args[1].endswith('/mihomo/native_route.py') and json.loads(args[6])['destination'] == foreign['destination'] and not injected:
+                injected = True
+                self.kernel.tables[int(args[4])][m.route_key(foreign)] = foreign
+            return original(args, **options)
+        self.routing.runner = concurrent
+        with self.assertRaises(m.RoutingError):
+            self.routing.execute('enable')
+        self.assertTrue(injected)
+        record = self.routing.load()
+        self.assertNotIn(m.route_key(foreign), record['routes'])
+        self.assertEqual(self.kernel.tables[record['fib']][m.route_key(foreign)], foreign)
+        self.assertFalse(record['active'])
 
     def test_empty_native_fib_without_columns_can_be_allocated(self):
         self.kernel.empty_header_only = True
@@ -301,7 +350,7 @@ class RoutingTests(unittest.TestCase):
         self.routing.execute('disable')
         self.kernel.calls.clear()
         self.assertFalse(self.routing.execute('disable')['pending'])
-        self.assertFalse(any(args[0] == '/sbin/route' for args in self.kernel.calls))
+        self.assertFalse(any(route_mutation(args) for args in self.kernel.calls))
 
     def test_dead_core_refresh_disables_capture(self):
         self.routing.execute('enable')
@@ -313,7 +362,7 @@ class RoutingTests(unittest.TestCase):
         self.routing.execute('enable')
         self.kernel.calls.clear()
         self.routing.execute('refresh')
-        self.assertFalse(any(args[0] == '/sbin/route' for args in self.kernel.calls))
+        self.assertFalse(any(route_mutation(args) for args in self.kernel.calls))
         self.assertFalse(any(args[0] == '/sbin/pfctl' and '-f' in args for args in self.kernel.calls))
         self.kernel.anchor = ''
         self.routing.execute('refresh')
@@ -361,7 +410,7 @@ class RoutingTests(unittest.TestCase):
         desired = copy.deepcopy(self.kernel.tables[record['fib']])
         self.routing.sync(record, desired)
         self.assertEqual(sum(args[0] == '/usr/bin/netstat' for args in self.kernel.calls), 2)
-        self.assertFalse(any(args[0] == '/sbin/route' for args in self.kernel.calls))
+        self.assertFalse(any(route_mutation(args) for args in self.kernel.calls))
 
     def test_whitelist_and_blacklist_cover_routed_subnet_and_both_families(self):
         for mode in ('whitelist', 'blacklist'):

@@ -753,6 +753,11 @@ class StaleForwarderTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.generated = Path(self.temp.name) / 'dot.conf'
+        self.render_root = Path(self.temp.name) / 'unbound'
+        (self.render_root / 'etc').mkdir(parents=True)
+        (self.render_root / 'unbound.conf').write_text(f'include: {self.render_root}/etc/*.conf\n')
+        self.render_include = self.render_root / 'etc/listeners.conf'
+        self.render_include.write_text('server:\n  interface: 127.0.0.1\n')
         self.system = m.System()
         self.ran = []
 
@@ -765,6 +770,7 @@ class StaleForwarderTests(unittest.TestCase):
         state = Path(self.temp.name) / 'state'
         state.mkdir()
         self.patches = [patch.object(m, 'UNBOUND_GENERATED', str(self.generated)),
+                        patch.object(m, 'UNBOUND_CONFIG_ROOT', str(self.render_root)),
                         patch.object(m, 'STATE', str(state))]
         for entry in self.patches:
             entry.start()
@@ -794,8 +800,147 @@ class StaleForwarderTests(unittest.TestCase):
             self.system.dns(True, {'dns_fallback': True})
         self.assertTrue(self.reloaded())
 
+    def effective_record(self, effective):
+        def record(args, **kwargs):
+            result = self.record(args, **kwargs)
+            if args[0].endswith('php'):
+                result.stdout += b'\nMihomo integration state: ' + json.dumps(
+                    {'effective_forwarding': effective, 'dns_changed': False,
+                     'integration_changed': False}).encode() + b'\n'
+            return result
+        return record
+
+    def test_dnssec_effective_disabled_skips_an_unchanged_enable_restart(self):
+        with patch.object(self.system, 'run', side_effect=self.effective_record(False)):
+            self.system.dns(True, {'dns_fallback': True})
+        self.assertFalse(self.reloaded())
+        self.assertFalse(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_dnssec_effective_disabled_still_repairs_stale_generated_forwarding(self):
+        self.generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        with patch.object(self.system, 'run', side_effect=self.effective_record(False)):
+            self.system.dns(True, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_effective_enabled_still_repairs_a_missing_generated_forwarder(self):
+        with patch.object(self.system, 'run', side_effect=self.effective_record(True)):
+            self.system.dns(True, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_pending_dns_reload_is_not_skipped_when_dnssec_forwarding_agrees(self):
+        (Path(m.STATE) / 'dns-reload-pending').write_text('pending\n')
+        with patch.object(self.system, 'run', side_effect=self.effective_record(False)):
+            self.system.dns(True, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+
+    def test_invalid_effective_forwarding_metadata_keeps_the_legacy_guard(self):
+        for invalid in ('false', 0, None):
+            self.ran.clear()
+            with patch.object(self.system, 'run', side_effect=self.effective_record(invalid)):
+                self.system.dns(True, {'dns_fallback': True})
+            self.assertTrue(self.reloaded(), invalid)
+
+    def integration_record(self, change_render=None):
+        def record(args, **kwargs):
+            result = self.record(args, **kwargs)
+            if args[0].endswith('php'):
+                result.stdout = b'Mihomo integration updated.\nMihomo integration state: ' + json.dumps(
+                    {'effective_forwarding': False, 'dns_changed': False,
+                     'integration_changed': True}).encode() + b'\n'
+            elif 'template' in args and change_render is not None:
+                change_render()
+            return result
+        return record
+
+    def test_tun_only_change_reloads_filter_without_restarting_unchanged_resolver(self):
+        with patch.object(self.system, 'run', side_effect=self.integration_record()), \
+                patch.object(self.system, 'resolver_running', return_value=True):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(self.reloaded())
+        self.assertTrue(any(args[1:3] == ['filter', 'reload'] for args in self.ran))
+        self.assertFalse(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+        self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
+
+    def test_tun_assignment_changing_generated_listeners_still_restarts_resolver(self):
+        def changed():
+            self.render_include.write_text('server:\n  interface: 127.0.0.1\n  interface: 192.0.2.1\n')
+        with patch.object(self.system, 'run', side_effect=self.integration_record(changed)):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_top_level_generated_include_change_also_restarts_resolver(self):
+        advanced = self.render_root / 'advanced.conf'
+        advanced.write_text('server:\n  access-control: 192.0.2.0/24 allow\n')
+        def changed():
+            advanced.write_text('server:\n  access-control: 192.0.2.0/24 refuse\n')
+        with patch.object(self.system, 'run', side_effect=self.integration_record(changed)):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_unknown_external_include_cannot_prove_a_restart_unnecessary(self):
+        external = Path(self.temp.name) / 'operator.conf'
+        external.write_text('server:\n  interface: 127.0.0.1\n')
+        (self.render_root / 'unbound.conf').write_text(f'include: {external}\n')
+        with patch.object(self.system, 'run', side_effect=self.integration_record()):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_missing_generated_configuration_cannot_prove_a_restart_unnecessary(self):
+        (self.render_root / 'unbound.conf').unlink()
+        with patch.object(self.system, 'run', side_effect=self.integration_record()):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_tun_only_change_with_pending_reload_still_restarts_resolver(self):
+        (Path(m.STATE) / 'dns-reload-pending').write_text('pending\n')
+        with patch.object(self.system, 'run', side_effect=self.integration_record()):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_tun_only_change_does_not_skip_restart_of_a_stopped_resolver(self):
+        with patch.object(self.system, 'run', side_effect=self.integration_record()), \
+                patch.object(self.system, 'resolver_running', side_effect=[False, True]):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_filter_reload_failure_keeps_pending_and_retry_restarts_conservatively(self):
+        base_record = self.integration_record()
+        def failed(args, **kwargs):
+            result = base_record(args, **kwargs)
+            if args[1:3] == ['filter', 'reload']:
+                raise m.Error('The filter reload failed.')
+            return result
+        with patch.object(self.system, 'run', side_effect=failed), \
+                patch.object(self.system, 'resolver_running', return_value=True):
+            with self.assertRaises(m.Error):
+                self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue((Path(m.STATE) / 'dns-reload-pending').exists())
+        self.ran.clear()
+        with patch.object(self.system, 'run', side_effect=base_record):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+        self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
+
     def test_a_missing_file_counts_as_not_forwarding(self):
         self.assertFalse(self.system.forwarded())
+
+
+class DnsJournalOwnershipTests(unittest.TestCase):
+    def test_new_private_address_ownership_survives_backup_validation(self):
+        saved = {'forwarding': '0', 'roots': {}, 'had_fake_ip_private_address': True,
+                 'removed_fake_ip_private_address': False}
+        raw = json.dumps(saved)
+        self.assertEqual(raw, m.Manager._journal('dns_state', raw))
+
+    def test_private_address_ownership_rejects_non_boolean_coercion(self):
+        for invalid in ('false', 0, None):
+            with self.subTest(invalid=invalid):
+                saved = {'forwarding': '0', 'roots': {}, 'had_fake_ip_private_address': True,
+                         'removed_fake_ip_private_address': invalid}
+                with self.assertRaises(m.Error):
+                    m.Manager._journal('dns_state', json.dumps(saved))
 
 
 class ConfigctlContractTests(unittest.TestCase):

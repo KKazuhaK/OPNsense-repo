@@ -10,10 +10,11 @@ $lang = ['if','for','foreach','while','switch','return','echo','print','list','a
 function calls_in($src, $lang) {
     /* Drop strings and comments so regex literals cannot look like calls. */
     $src = preg_replace('/\'(?:\\\\.|[^\'\\\\])*\'|"(?:\\\\.|[^"\\\\])*"|\/\*.*?\*\/|\/\/[^\n]*/s', ' ', $src);
-    preg_match_all('/(?<![>:$\w])(new\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/', $src, $found, PREG_SET_ORDER);
+    /* Match complete qualified names so constructor tails cannot become calls. */
+    preg_match_all('/(?<![>:$\w\\\\])(new\s+)?(\\\\?[a-zA-Z_][a-zA-Z0-9_]*(?:\\\\[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\(/', $src, $found, PREG_SET_ORDER);
     $names = [];
     foreach ($found as $hit) {
-        if ($hit[1] !== '') { continue; }                 // new ClassName(...)
+        if ($hit[1] !== '') { continue; }                 // new ClassName(...) or new Namespace\ClassName(...)
         if (in_array(strtolower($hit[2]), $lang, true)) { continue; }
         $names[$hit[2]] = true;
     }

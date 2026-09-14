@@ -232,12 +232,15 @@ class StateTests(unittest.TestCase):
                 for action in ('boot', 'start'):
                     self.assertEqual(expected, self.manager.dispatch(action)['dns_active'])
 
-    def test_invalid_fake_ip_range_does_not_enable_transparency(self):
+    def test_transparent_migration_saves_real_dns_instead_of_using_legacy_fake_pool(self):
         self.manager.apply(SUBSCRIPTION.replace(b'198.18.0.1/16', b'28.0.0.1/8'))
-        before = self.snapshot()
-        with self.assertRaises(m.Error): self.manager.dispatch('enable-transparent')
-        self.assertEqual(before, self.snapshot())
-        self.assertFalse(self.system.forwarded)
+        settings = self.manager.settings()
+        settings['dns_mode'] = 'fake-ip'
+        self.manager.write_settings(settings)
+        self.manager.dispatch('enable-transparent')
+        self.assertEqual('redir-host', self.manager.settings()['dns_mode'])
+        self.assertEqual('redir-host', m.parse_yaml(self.manager.config_file.read_bytes())['dns']['enhanced-mode'])
+        self.assertTrue(self.system.forwarded)
 
     def test_log_failure_does_not_block_an_operation(self):
         path = self.manager.path('/var/log/mihomo_sub.log')

@@ -36,6 +36,68 @@ function mihomo_configure()
     ];
 }
 
+function mihomo_routing_context(iterable $mapping, array $lines): array
+{
+    $addresses = [];
+    $networks = [];
+    $device = '';
+    foreach ($lines as $line) {
+        if (preg_match('/^([a-zA-Z][a-zA-Z0-9_.:-]{0,63}):/', $line, $match)) {
+            $device = $match[1];
+        } elseif (preg_match('/^\s+inet ([0-9.]+)(?: --> [0-9.]+)? netmask (0x[0-9a-fA-F]+)/', $line, $match)) {
+            $addresses[] = $match[1];
+            $prefix = substr_count(decbin(hexdec($match[2])), '1');
+            $networks[$device][] = $match[1] . '/' . $prefix;
+        } elseif (preg_match('/^\s+inet6 ([0-9a-fA-F:]+)(?:%[^\s]+)? prefixlen ([0-9]+)/', $line, $match)) {
+            $addresses[] = $match[1];
+            $networks[$device][] = $match[1] . '/' . $match[2];
+        }
+    }
+    $interfaces = [];
+    foreach ($mapping as $name => $entry) {
+        $device = $entry['if'] ?? '';
+        if (!is_string($device) || !preg_match('/^[a-zA-Z][a-zA-Z0-9_.:-]{0,63}$/D', $device)) {
+            continue;
+        }
+        $interfaces[] = [
+            'name' => (string)$name, 'device' => $device,
+            'networks' => $networks[$device] ?? [],
+            'wan' => $name === 'wan' || !empty($entry['gateway']) || !empty($entry['gatewayv6']),
+        ];
+    }
+    return ['interfaces' => $interfaces,
+        'local_addresses' => array_values(array_unique($addresses))];
+}
+
+function mihomo_firewall(\OPNsense\Firewall\Plugin $fw)
+{
+    /* Source selection must not pass packets around the administrator's
+       filtering rules. The runtime anchor contains only non-quick matches. */
+    $fw->registerAnchor('mihomo', 'fw', 1, 'head', false);
+    $lines = [];
+    exec('/sbin/ifconfig -a', $lines);
+    $context = mihomo_routing_context($fw->getInterfaceMapping(), $lines);
+    $directory = '/var/db/os-mihomo';
+    if (!is_dir($directory) || is_link($directory)) {
+        return;
+    }
+    $temporary = tempnam($directory, '.routing-context-');
+    if ($temporary === false) {
+        throw new RuntimeException('Unable to prepare the Mihomo routing context.');
+    }
+    try {
+        chmod($temporary, 0600);
+        if (file_put_contents($temporary, json_encode($context, JSON_THROW_ON_ERROR)) === false
+            || !rename($temporary, $directory . '/routing-context.json')) {
+            throw new RuntimeException('Unable to save the Mihomo routing context.');
+        }
+    } finally {
+        if (is_file($temporary)) {
+            unlink($temporary);
+        }
+    }
+}
+
 function mihomo_restore_backup($verbose = false)
 {
     exec('/usr/local/bin/python3 /usr/local/opnsense/scripts/mihomo/mihomo.py reconcile-backup >/dev/null 2>&1', $output, $status);

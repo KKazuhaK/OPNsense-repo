@@ -256,9 +256,10 @@ $(function () {
             '{{ lang._('%p of %t devices, from %e entries') }}'
                 .replace('%p', picked).replace('%t', devices.length).replace('%e', entries)
             + (shown < devices.length ? ' \u00b7 ' + '{{ lang._('%s shown') }}'.replace('%s', shown) : ''));
-        const rules = found.rules || [];
-        $('#mihomo-device-rules').text(rules.length ? rules.join('\n')
-            : '{{ lang._('Saved settings produce no device rules.') }}');
+        const preview = Array.isArray(found.routing) ? found.routing
+            : (Array.isArray(found.rules) ? found.rules : []);
+        $('#mihomo-device-rules').text(preview.length ? preview.join('\n')
+            : '{{ lang._('No saved device policy preview is available.') }}');
         lastDevices = found;
     }
 
@@ -278,8 +279,7 @@ $(function () {
         const segment = $(this).val();
         let entries = listed().filter(function (entry) { return entry !== segment; });
         if ($(this).is(':checked')) {
-            /* An address the segment already covers would only add a rule that
-               can never be reached, so it goes when the segment arrives. */
+            /* Remove individual addresses already covered by the segment. */
             entries = entries.filter(function (entry) {
                 return entry.indexOf('/') !== -1 || segmentOf(entry) !== segment;
             });
@@ -300,8 +300,9 @@ $(function () {
             state = state || {};
             $('#mihomo-service').attr('class', 'label label-' + (state.running ? 'success' : 'default'))
                 .text(state.running ? '{{ lang._('Running') }}' : '{{ lang._('Stopped') }}');
-            $('#mihomo-transparent').attr('class', 'label label-' + (state.transparent ? 'success' : 'default'))
-                .text(state.transparent ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
+            const routed = state.routing_active === true;
+            $('#mihomo-transparent').attr('class', 'label label-' + (routed ? 'success' : 'default'))
+                .text(routed ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
             $('#mihomo-dns').attr('class', 'label label-' + (state.dns_active ? 'success' : 'default'))
                 .text(state.dns_active ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
             $('#mihomo-enable').toggle(!state.transparent);
@@ -436,10 +437,10 @@ $(function () {
                 <tr>
                     <td><a id="help_for_transparent" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Transparent routing') }}</td>
                     <td>
-                        <button type="button" class="btn btn-primary mihomo-action" id="mihomo-enable" data-action="enableTransparent" data-done="{{ lang._('Transparent routing enabled. LAN traffic and DNS now pass through Mihomo.') }}">{{ lang._('Enable transparent routing') }}</button>
+                        <button type="button" class="btn btn-primary mihomo-action" id="mihomo-enable" data-action="enableTransparent" data-done="{{ lang._('Transparent routing enabled. LAN traffic now follows the saved device policy.') }}">{{ lang._('Enable transparent routing') }}</button>
                         <button type="button" class="btn btn-default mihomo-action" id="mihomo-disable" style="display:none" data-action="disableTransparent" data-done="{{ lang._('Transparent routing disabled. Routing and DNS were returned to the router.') }}">{{ lang._('Disable transparent routing') }}</button>
                         <div class="hidden" data-for="help_for_transparent">
-                            {{ lang._('Hands LAN traffic and DNS to Mihomo using the validated merge YAML, including its TUN and DNS mode. This changes forwarding for every client on the network.') }}
+                            {{ lang._('Sends eligible LAN traffic through Mihomo according to the saved device policy. Bypassed devices keep their existing routes. Firewall rules still apply. The router itself and incoming WAN connections, including port forwards, keep their existing routing. Transparent routing requires DNS answers with real addresses.') }}
                         </div>
                     </td>
                 </tr>
@@ -561,7 +562,7 @@ $(function () {
                     <td><input type="checkbox" id="allow_lan">
                         <span class="label label-warning mihomo-override" id="override_allow_lan" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_allowlan">
-                            {{ lang._('Off means the two ports above answer only on the router itself. Turn it on to let other devices use the proxy directly, which is the way to proxy a single machine without turning on transparent routing for the whole network. The firewall still decides who reaches the port.') }}
+                            {{ lang._('Off means the two ports above answer only on the router itself. Turn it on to let other devices use explicitly configured HTTP/SOCKS proxies. Device policy applies to transparent traffic. The firewall still decides who reaches the proxy ports.') }}
                         </div>
                     </td>
                 </tr>
@@ -622,12 +623,12 @@ $(function () {
                     <td><a id="help_for_devmode" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Mode') }}</td>
                     <td>
                         <select id="device_mode" class="selectpicker" data-style="btn-default" data-width="320px">
-                            <option value="off">{{ lang._('Every device follows the subscription rules') }}</option>
-                            <option value="whitelist">{{ lang._('Only the listed devices may use the proxy') }}</option>
-                            <option value="blacklist">{{ lang._('The listed devices never use the proxy') }}</option>
+                            <option value="off">{{ lang._('All eligible LAN devices enter the tunnel') }}</option>
+                            <option value="whitelist">{{ lang._('Only listed LAN devices enter the tunnel') }}</option>
+                            <option value="blacklist">{{ lang._('Listed LAN devices bypass the tunnel') }}</option>
                         </select>
                         <div class="hidden" data-for="help_for_devmode">
-                            {{ lang._('Decides which sources the proxy is allowed to carry once transparent routing is on. Everything not covered goes out the ordinary way, so a device left off a whitelist keeps working -- it simply is not proxied. The router itself is never on the list, so with a whitelist its own traffic stays direct as well.') }}
+                            {{ lang._('Selects LAN source addresses before traffic enters the tunnel. A blacklist bypasses the listed sources; a whitelist sends only the listed sources through Mihomo. Bypassed traffic uses existing routes. Off or an empty list sends all eligible LAN sources through Mihomo. Existing firewall rules and user routing policies still apply. Router traffic and incoming WAN connections, including port forwards, are excluded in every mode. This setting does not restrict manually configured proxy clients.') }}
                         </div>
                     </td>
                 </tr>
@@ -659,7 +660,7 @@ $(function () {
                         <button type="button" class="btn btn-default btn-sm" id="mihomo-refresh-devices" style="margin-top:6px">
                             <i class="fa fa-refresh"></i> {{ lang._('Refresh') }}</button>
                         <div class="hidden" data-for="help_for_devpick">
-                            {{ lang._('Everything the router has a DHCP lease or a neighbour entry for, minus its own addresses and whatever is on the uplink. Ticking a device writes its address into the list below, because an address is the only thing a rule can match: by the time a packet reaches Mihomo the hardware address is gone. The hardware address is shown so the device can be recognised, and so the two ways its address can stop identifying it are visible.') }}
+                            {{ lang._('Shows devices from DHCP leases and neighbour entries, excluding router and uplink addresses. Selecting a device adds its IP address to the list below. Selection follows the address, so use a stable address or DHCP reservation. The hardware address helps identify the device; it is not used to select its traffic.') }}
                         </div>
                     </td>
                 </tr>
@@ -668,16 +669,16 @@ $(function () {
                     <td>
                         <textarea id="device_list" rows="4" class="form-control" spellcheck="false" style="font-family:monospace;font-size:12px" placeholder="192.168.10.50&#10;192.168.20.0/24"></textarea>
                         <div class="hidden" data-for="help_for_devlist">
-                            {{ lang._('One address or network per line; a bare address means that host alone. Both IPv4 and IPv6 are accepted. A device that is switched off has no entry above, so it is written here by hand. An empty list leaves every device on the subscription rules whatever the mode says, so a half-finished list cannot cut the network off.') }}
+                            {{ lang._('One address or network per line; a bare address selects that host alone. Both IPv4 and IPv6 are accepted; IPv6 forwarding also requires IPv6 support. Add devices that are offline by hand. An empty list sends all eligible LAN sources through Mihomo in every mode. Include every address a device uses if it must follow one policy.') }}
                         </div>
                     </td>
                 </tr>
                 <tr>
-                    <td><a id="help_for_devrules" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Rules this produces') }}</td>
+                    <td><a id="help_for_devrules" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Saved device policy') }}</td>
                     <td>
-                        <pre id="mihomo-device-rules" class="mihomo-log" style="max-height:120px">{{ lang._('Saved settings produce no device rules.') }}</pre>
+                        <pre id="mihomo-device-rules" class="mihomo-log" style="max-height:120px">{{ lang._('No saved device policy preview is available.') }}</pre>
                         <div class="hidden" data-for="help_for_devrules">
-                            {{ lang._('What the saved settings put in front of the subscription rules, generated by the same code that writes the configuration. Matching stops at the first rule that matches, so a whitelist cannot be written as a match on the listed devices; it is written as a match on everything else, which is why it reads inverted.') }}
+                            {{ lang._('Shows the saved policy for selecting LAN traffic before it enters the tunnel. Save settings to refresh this preview. Traffic that enters Mihomo then follows the subscription and merge rules.') }}
                         </div>
                     </td>
                 </tr>
@@ -723,13 +724,13 @@ $(function () {
                     <td><a id="help_for_dnsmode" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('DNS mode') }}</td>
                     <td>
                         <select id="dns_mode" class="selectpicker" data-style="btn-default" data-width="260px">
-                            <option value="fake-ip">{{ lang._('fake-ip (recommended)') }}</option>
-                            <option value="redir-host">{{ lang._('redir-host') }}</option>
+                            <option value="redir-host">{{ lang._('redir-host (recommended)') }}</option>
                             <option value="normal">{{ lang._('normal') }}</option>
+                            <option value="fake-ip">{{ lang._('fake-ip (legacy)') }}</option>
                         </select>
                         <span class="label label-warning mihomo-override" id="override_dns_mode" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_dnsmode">
-                            {{ lang._('fake-ip answers with a placeholder address and resolves the real name at connection time; it is the fastest and the default. redir-host resolves upstream and rewrites the destination. normal performs no rewriting and disables rule matching by domain for routed traffic.') }}
+                            {{ lang._('redir-host is the default and returns real addresses while retaining domain mappings. normal also returns real addresses. Real DNS answers are required so bypassed devices can connect without entering Mihomo. Legacy fake-ip may be saved while transparent routing is off. Enabling transparent routing or applying configuration while it is active converts an effective fake-ip mode, including a merge override, to redir-host and saves that choice in settings.') }}
                         </div>
                     </td>
                 </tr>
@@ -737,7 +738,7 @@ $(function () {
                     <td><a id="help_for_hijack" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Capture client DNS') }}</td>
                     <td><input type="checkbox" id="dns_hijack"> <span class="label label-warning mihomo-override" id="override_dns_hijack" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_hijack">
-                            {{ lang._('Default on. Redirects DNS queries that enter the tunnel to Mihomo. Required for fake-ip. This switch only takes effect while transparent routing is enabled.') }}
+                            {{ lang._('Default on. Redirects DNS queries that enter the tunnel to Mihomo. This switch only takes effect while transparent routing is enabled. Bypassed devices keep their existing DNS path; any resolver they share must return real addresses.') }}
                         </div>
                     </td>
                 </tr>

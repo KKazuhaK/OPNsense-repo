@@ -694,7 +694,13 @@ class PublishedSiteTests(SourceTree):
         package = SITE / 'repo/FreeBSD:15:amd64/All/os-unboundcustom-1.0.2.pkg'
         with self.assertRaisesRegex(ValueError, 'Package content differs from source'):
             verify.verify_source_package(package, root, plugin='os-unboundcustom')
-        with patch('builtins.print'):
+        # Keep the real reference package while making unrelated release
+        # availability explicit instead of depending on the current signed site.
+        published_versions = verify.published_versions
+        with patch.object(verify, 'published_versions',
+                          side_effect=lambda site, name, version:
+                          published_versions(site, name, version) if name == 'os-unboundcustom' else []), \
+                patch('builtins.print'):
             findings = dict((plugin, state) for plugin, state, _ in verify.audit_versions(SITE, root))
         self.assertEqual('changed without a version bump', findings['os-unboundcustom'])
         self.assertEqual('unpublished', findings['os-ddclient-opnwall'])

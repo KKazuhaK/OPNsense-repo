@@ -14,7 +14,7 @@ mkdir -p "$jail_root" "$jail_root/usr/local/bin" "$jail_root/usr/local/sbin" "$j
 chmod 1777 "$jail_root/tmp"
 for source in /bin /sbin /lib /libexec; do [ -d "$jail_root$source" ] || cp -a "$source" "$jail_root/"; done
 mkdir -p "$jail_root/usr/bin" "$jail_root/usr/lib"
-for name in awk sed date pkill pgrep env install tar touch find basename id whoami setfib freebsd-version uname; do source="$(command -v "$name")"; mkdir -p "$jail_root$(dirname "$source")"; cp -L "$source" "$jail_root$source"; done
+for name in awk sed date pkill pgrep env install tar touch find basename id whoami setfib freebsd-version uname netstat pfctl; do source="$(command -v "$name")"; mkdir -p "$jail_root$(dirname "$source")"; cp -L "$source" "$jail_root$source"; done
 # Keep the compatibility paths the plugin and resolver adapter execute directly.
 for source in /usr/bin/pgrep /usr/bin/pkill; do cp -L "$source" "$jail_root$source"; done
 cp -L "/usr/local/bin/$target_python" "$jail_root/usr/local/bin/$target_python"
@@ -78,7 +78,7 @@ for required in script/load_phalcon.php app/config/AppConfig.php app/config/conf
     [ -f "$jail_root/usr/local/opnsense/mvc/$required" ] || { echo "Missing native framework: $required" >&2; exit 1; }
 done
 printf '%s\n' 'include_path="/usr/local/etc/inc:/usr/local/opnsense/mvc"' 'memory_limit=1G' 'date.timezone=UTC' 'display_errors=stderr' 'html_errors=Off' > "$jail_root/usr/local/etc/php.ini"
-for binary in "/usr/local/bin/$target_python" /usr/local/bin/php /usr/local/bin/curl /usr/local/sbin/unbound /usr/local/sbin/unbound-checkconf /usr/bin/awk /usr/bin/sed /usr/bin/date /usr/bin/pkill /usr/bin/pgrep /usr/bin/install /usr/bin/tar /usr/local/lib/php/*/*.so /usr/local/lib/python"$python_version"/lib-dynload/*.so; do
+for binary in "/usr/local/bin/$target_python" /usr/local/bin/php /usr/local/bin/curl /usr/local/sbin/unbound /usr/local/sbin/unbound-checkconf /usr/bin/awk /usr/bin/sed /usr/bin/date /usr/bin/pkill /usr/bin/pgrep /usr/bin/install /usr/bin/tar /usr/bin/netstat /sbin/pfctl /usr/local/lib/php/*/*.so /usr/local/lib/python"$python_version"/lib-dynload/*.so; do
   [ -f "$binary" ] || continue
   ldd -f '%p\n' "$binary" 2>/dev/null | while read -r library; do
     case "$library" in /*) mkdir -p "$jail_root$(dirname "$library")"; [ -f "$jail_root$library" ] || cp -L "$library" "$jail_root$library" ;; esac
@@ -96,6 +96,8 @@ chroot "$jail_root" /usr/local/bin/php -r '
 '
 # The test resolver and OS configuration are synthetic; no production secrets are copied.
 printf 'nameserver 127.0.0.1\n' > "$jail_root/etc/resolv.conf"
+printf 'ip 0 IP\nicmp 1 ICMP\ntcp 6 TCP\nudp 17 UDP\nipv6 41 IPv6\nipv6-icmp 58 ICMPv6\n' > "$jail_root/etc/protocols"
+: > "$jail_root/etc/pf.os"
 printf 'root:*:0:0::0:0:root:/root:/bin/sh\nnobody:*:65534:65534::0:0:Nobody:/:/usr/sbin/nologin\n' > "$jail_root/etc/master.passwd"
 printf 'wheel:*:0:root\nnobody:*:65534:\n' > "$jail_root/etc/group"
 pwd_mkdb -d "$jail_root/etc" "$jail_root/etc/master.passwd"

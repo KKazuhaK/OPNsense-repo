@@ -184,12 +184,12 @@ class RuntimeBoundaryTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_TOKEN', str(error.exception))
         self.assertNotIn('state-secret', str(error.exception))
 
-    def test_dns_readiness_cannot_hide_missing_tun_routes(self):
+    def test_dns_readiness_cannot_hide_missing_tun_interface(self):
         config = self.manager.state / 'ready.yaml'
-        config.write_text("tun: {enable: true, auto-route: true}\ndns: {enable: true, listen: '127.0.0.1:1053'}\n")
+        config.write_text("tun: {enable: true, auto-route: false}\ndns: {enable: true, listen: '127.0.0.1:1053'}\n")
         system = m.System()
         def run(args, **kwargs):
-            rc = 1 if args[0] in {'/usr/sbin/service', '/usr/bin/pgrep'} else 0
+            rc = 1 if args[0] in {'/usr/sbin/service', '/usr/bin/pgrep', '/sbin/ifconfig'} else 0
             return subprocess.CompletedProcess(args, rc, b'interface: lo1', b'')
         with patch.object(system, 'run', side_effect=run), patch.object(system, 'running', side_effect=[False] + [True] * 30), patch.object(system, 'destroy_tun'), patch.object(system, 'stop') as stop, patch.object(m.time, 'sleep'), patch.object(m.socket, 'create_connection') as dns:
             with self.assertRaises(m.Error): system.start(config, True)
@@ -224,7 +224,7 @@ class SwitchTests(unittest.TestCase):
     def test_each_switch_reaches_the_rendered_configuration(self):
         default = self.generated()
         self.assertEqual(m.HIJACK_TARGETS, default['tun']['dns-hijack'])
-        self.assertEqual('fake-ip', default['dns']['enhanced-mode'])
+        self.assertEqual('redir-host', default['dns']['enhanced-mode'])
         self.assertIs(False, default['dns']['ipv6'])
         self.assertIs(False, default['ipv6'])
         self.assertEqual([], self.generated(dns_hijack=False)['tun']['dns-hijack'])
@@ -264,7 +264,7 @@ class SwitchTests(unittest.TestCase):
     def test_an_unknown_dns_mode_is_never_absorbed(self):
         overlay = {'dns': {'enhanced-mode': 'nonsense'}}
         lifted = m.absorb_switches(overlay, self.settings)
-        self.assertEqual('fake-ip', lifted['dns_mode'])
+        self.assertEqual('redir-host', lifted['dns_mode'])
         self.assertEqual(['dns_mode'], m.switch_overrides(overlay))
 
     def test_an_upgrade_adopts_the_behaviour_the_installation_already_had(self):
@@ -609,8 +609,8 @@ class DnsServerFieldTests(unittest.TestCase):
                          m.switch_overrides({'dns': {'nameserver': 'not-a-list'}}))
 
 
-class FakeIpRange6Tests(unittest.TestCase):
-    """Enabling IPv6 under fake-ip must also give AAAA answers a pool to draw from."""
+class TransparentDNSSelectionTests(unittest.TestCase):
+    """A bypassed device must receive addresses usable outside TUN."""
 
     def setUp(self):
         self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
@@ -624,20 +624,27 @@ class FakeIpRange6Tests(unittest.TestCase):
         base = m.merge_yaml(copy.deepcopy(self.preset), overlay or {})
         return m.parse_yaml(m.render(self.data, {**self.settings, **settings}, overlay=base))
 
-    def test_ipv6_under_fake_ip_gets_a_range(self):
-        self.assertNotIn('fake-ip-range6', self.generated()['dns'])
-        self.assertEqual(m.FAKE_IP_RANGE6_DEFAULT,
-                         self.generated(ipv6=True)['dns']['fake-ip-range6'])
+    def test_a_legacy_fake_ip_selection_uses_real_addresses_for_both_families(self):
+        for ipv6 in (False, True):
+            data = self.generated(dns_mode='fake-ip', ipv6=ipv6)
+            self.assertEqual('redir-host', data['dns']['enhanced-mode'])
+            self.assertEqual(ipv6, data['dns']['ipv6'])
 
-    def test_a_stated_range_is_kept_and_a_routable_one_refused(self):
-        kept = self.generated({'dns': {'fake-ip-range6': 'fd00::/64'}}, ipv6=True)
-        self.assertEqual('fd00::/64', kept['dns']['fake-ip-range6'])
-        for bad in ('2606:4700::/64', '198.18.0.0/16', 'nonsense'):
-            with self.assertRaises(m.Error, msg=bad):
-                self.generated({'dns': {'fake-ip-range6': bad}}, ipv6=True)
+    def test_merge_yaml_cannot_reenable_placeholder_answers_or_global_capture(self):
+        data = self.generated({'dns': {'enhanced-mode': 'fake-ip', 'fake-ip-range6': 'fd00::/64'},
+            'tun': {'auto-route': True, 'strict-route': True, 'auto-redirect': True}}, ipv6=True)
+        self.assertEqual('redir-host', data['dns']['enhanced-mode'])
+        for field in ('auto-route', 'strict-route', 'auto-redirect'):
+            self.assertFalse(data['tun'][field])
 
-    def test_other_dns_modes_need_no_pool(self):
-        self.assertNotIn('fake-ip-range6', self.generated(ipv6=True, dns_mode='normal')['dns'])
+    def test_normal_dns_remains_available(self):
+        self.assertEqual('normal', self.generated(ipv6=True, dns_mode='normal')['dns']['enhanced-mode'])
+
+    def test_transparent_device_selection_does_not_inject_direct_rules(self):
+        expected = self.generated()['rules']
+        for mode in ('blacklist', 'whitelist'):
+            self.assertEqual(expected, self.generated(device_mode=mode,
+                device_list=['192.168.10.50', 'fd00::/64'])['rules'])
 
 
 class OrphanPolicyTests(unittest.TestCase):
@@ -677,7 +684,7 @@ class DevicePolicyTests(unittest.TestCase):
     """Which sources the proxy may carry, expressed so matching order works."""
 
     def setUp(self):
-        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
+        self.settings = {'transparent': False, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
         self.data = m.parse_yaml(SUBSCRIPTION)
         self.preset = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
             / 'share/mihomo/presets/full.yaml').read_bytes())

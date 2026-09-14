@@ -7,11 +7,11 @@ tun:
   enable: true
   stack: gvisor
   mtu: 1420
-  auto-route: true
-  strict-route: true
+  auto-route: false
+  strict-route: false
   auto-detect-interface: true
   dns-hijack: [any:53, "tcp://any:53"]
 dns:
   enable: true
-  enhanced-mode: fake-ip
+  enhanced-mode: redir-host
   listen: 127.0.0.1:1053

@@ -131,7 +131,8 @@ class ServiceController extends ApiControllerBase
             ? $answer['result'] : [];
         /* Flattened, because a page that cannot list devices still has to draw
            the rest of the tab rather than render an error in place of it. */
-        return ['devices' => $found['devices'] ?? [], 'rules' => $found['rules'] ?? []];
+        return ['devices' => $found['devices'] ?? [], 'rules' => $found['rules'] ?? [],
+            'routing' => $found['routing'] ?? []];
     }
 
     public function logAction(): array

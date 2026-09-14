@@ -30,6 +30,9 @@ class HostDNSRecoveryTests(unittest.TestCase):
         self.fail_reload, self.noop_reload, self.destroy_edit = False, False, None
         self.commands = []
         self.system = m.System()
+        self.routing_patch = mock.patch.object(self.system, 'routing')
+        self.routing_patch.start()
+        self.addCleanup(self.routing_patch.stop)
         self.system.running = lambda: self.alive
         path_patch = mock.patch.object(m.System, '_host_dns_paths', return_value=
             (self.resolver, self.config, self.local, self.pending))

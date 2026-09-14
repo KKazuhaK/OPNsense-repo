@@ -133,9 +133,13 @@ try {
     $boundary = strpos($script, '$mode = $argv[1]');
     integration_check($boundary !== false, 'Unable to isolate the shipped integration lock functions.');
     file_put_contents($directory . '/functions.php', substr($script, 0, $boundary));
+    // Use the complete original plugin-owned baseline for the cleanup case.
     $original = '<opnsense><interfaces><lo0><if>lo0</if></lo0><wan><if>em0</if></wan>' .
-        '<opt9><if>tun_mihomo</if></opt9><opt10><if>em2</if><descr>retain</descr></opt10></interfaces>' .
-        '<filter><rule uuid="5a73c3dc-69b1-4e15-89cb-b542aa2c1154"><interface>opt9</interface></rule>' .
+        '<opt9><if>tun_mihomo</if><descr>Mihomo TUN</descr><enable>1</enable></opt9>' .
+        '<opt10><if>em2</if><descr>retain</descr></opt10></interfaces>' .
+        '<filter><rule uuid="5a73c3dc-69b1-4e15-89cb-b542aa2c1154"><type>pass</type><interface>opt9</interface>' .
+        '<ipprotocol>inet</ipprotocol><source><network>opt9</network></source><destination><any/></destination>' .
+        '<descr>Mihomo TUN Allow</descr></rule>' .
         '<rule uuid="retain-rule"><interface>wan</interface></rule></filter>' .
         '<unknown attr="retain"><value>SENTINEL_UNKNOWN_PRIVATE</value><unrecognized/></unknown>' .
         '<OPNsense><OtherPlugin><backup><archive>SENTINEL_EXISTING_BACKUP</archive></backup></OtherPlugin>' .

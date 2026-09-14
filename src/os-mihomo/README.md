@@ -12,6 +12,10 @@
 
 当前内置 FreeBSD 核心的 TUN 仅支持 `gvisor`。`system` 和 `mixed` 的 TCP 路径会错误地将流量判为广播，因此插件拒绝用这两种栈启用透明代理；启用前选择 gVisor。此限制针对当前内置核心，后续核心需重新验证。
 
+启用 `auto-route` 的 TUN 也可能接走 WAN 端口转发（DNAT）按普通路由返回的流量。多 WAN 部署须验证入站连接的 PF 状态将回包通过 `reply-to` 送回正确 WAN 网关。NAT 的内联 **Pass** 会跳过后续过滤规则，不能依靠 LAN 源设备策略保证回程。**Register rule** 创建关联 WAN 过滤规则；只有正确配置该 WAN 网关、且未全局或单条禁用 `reply-to` 时，才能依赖其默认回程绑定。若禁用了 `reply-to`，须由管理员配置并确认具有状态及正确回程绑定的 WAN 规则。详见官方 [NAT 规则关联](https://docs.opnsense.org/manual/nat.html#filter-rule-association)、[WAN 回程规则](https://docs.opnsense.org/manual/firewall.html)和 [Disable reply-to](https://docs.opnsense.org/manual/firewall_settings.html#disable-reply-to)。
+
+NAT 与 WAN 网关由管理员维护，插件不自动重写；1.2.2 未修复或改变上述回程策略。排查时查看路由、有效 PF 规则和状态，并同时抓取 WAN、LAN、TUN 的新连接；必要时仅清除受影响的旧状态。命令与示例见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。
+
 合并文件不能改变 `tun_mihomo` 设备名、覆盖持久化 secret、让任何监听器占用 53，或绕过未启用的 TUN 守卫。DNS 集成支持 `127.0.0.1:1053`，自定义监听器由管理员管理。
 
 “通过路由器 DNS 解析”默认关闭。开启时仅覆盖 nameserver、proxy-server-nameserver、default-nameserver、nameserver-policy 四项；不改变 DNS 劫持、增强模式和 Unbound 的 AAAA 策略。根据本机 DoT 配置为 IPv4/IPv6 上游地址和 853 端口注入优先 DIRECT 规则，上游改变时自动刷新，避免节点解析死锁。该模式不把 Unbound 再转发给 Mihomo；必须移除订阅的 DNS fallback，上游不可用时明确失败。

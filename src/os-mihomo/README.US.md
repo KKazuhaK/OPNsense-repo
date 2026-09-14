@@ -27,6 +27,10 @@ Three YAML presets are shipped: `full.yaml` (TUN and fake-IP DNS), `tun-only.yam
 
 TUN activation with the currently bundled FreeBSD core supports only `gvisor`. Its `system` and `mixed` TCP paths incorrectly classify traffic as broadcast, so the plugin rejects transparent routing with either stack; select gVisor before enabling it. This restriction applies to the bundled core and requires fresh validation for a future core.
 
+An `auto-route` TUN can also capture WAN port-forward (DNAT) replies that follow the normal routing table. On multi-WAN deployments, verify that inbound PF states return replies through the correct WAN gateway using `reply-to`. Inline NAT **Pass** bypasses subsequent filter rules; LAN source-device policy cannot guarantee this return path. **Register rule** creates an associated WAN filter rule whose default reply binding requires a correctly configured WAN gateway and `reply-to` enabled globally and on the rule. If disabled, the administrator must configure and verify a stateful WAN rule with the correct return binding. See the official [NAT association](https://docs.opnsense.org/manual/nat.html#filter-rule-association), [WAN reply routing](https://docs.opnsense.org/manual/firewall.html) and [Disable reply-to](https://docs.opnsense.org/manual/firewall_settings.html#disable-reply-to) documentation.
+
+The administrator maintains NAT and WAN gateways; the plugin does not rewrite them. Version 1.2.2 does not fix or change this return-routing policy. Inspect routes, effective PF rules and states, and capture new connections on WAN, LAN and TUN; if necessary, remove only affected old states. Commands and examples are in [DEPLOYMENT.md](../../DEPLOYMENT.md).
+
 The code enforces `tun.device: tun_mihomo`, the stored dashboard secret and valid listener ports excluding 53, including extra listeners and the controller. Merge YAML cannot bypass disabled TUN activation. DNS forwarding integration is provided for `127.0.0.1:1053` when Mihomo DNS is enabled; custom listeners remain administrator-managed.
 
 ## Resolve through router DNS

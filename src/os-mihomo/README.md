@@ -8,7 +8,9 @@
 
 在 **VPN → Proxy Suite** 管理服务、订阅与本地 YAML 合并配置。配置顺序为：完整订阅 → 路由器 DNS 开关覆盖 → 本地 `merge.yaml` → 代码约束与启用守卫 → mihomo 验证 → 事务应用。
 
-映射深度合并，普通值和列表替换；空映射清除已有映射。支持规则、代理组、代理的 `prepend-` / `append-` 六种列表扩展，不执行 JavaScript。三份预设为 `full.yaml`、`tun-only.yaml`、`proxy-only.yaml`。加载预设会替换整个合并文件，先保存自定义内容。Dashboard 默认绑定回环地址，在合并文件中设置本机的 LAN 地址；TUN 默认 MTU 1420，可按节点传输路径调整。
+映射深度合并，普通值和列表替换；空映射清除已有映射。支持规则、代理组、代理的 `prepend-` / `append-` 六种列表扩展，不执行 JavaScript。三份预设为 `full.yaml`、`tun-only.yaml`、`proxy-only.yaml`。加载预设会替换整个合并文件，先保存自定义内容。初始合并采用完整模式默认值，透明代理仍需显式启用。需凭据访问的 Dashboard 初始绑定所有接口，可在设置中限制为回环地址。TUN 默认 MTU 1420，可按节点传输路径调整。
+
+当前内置 FreeBSD 核心的 TUN 仅支持 `gvisor`。`system` 和 `mixed` 的 TCP 路径会错误地将流量判为广播，因此插件拒绝用这两种栈启用透明代理；启用前选择 gVisor。此限制针对当前内置核心，后续核心需重新验证。
 
 合并文件不能改变 `tun_mihomo` 设备名、覆盖持久化 secret、让任何监听器占用 53，或绕过未启用的 TUN 守卫。DNS 集成支持 `127.0.0.1:1053`，自定义监听器由管理员管理。
 
@@ -18,8 +20,10 @@
 
 核心异常退出后总会清除 TUN 路由；默认自动恢复原有直连 DNS，每台可配置。显式 Stop 即使 DNS 恢复失败也停止核心和 TUN，随后重试 DNS 恢复。WAN 事件不会重新启动手动停止的服务。关闭透明模式仅清除插件创建的接口和规则。
 
+启动时在本机记录核心写入的系统 DNS 指纹。异常退出后通过 OPNsense 原生 DNS 重载恢复系统解析，失败会重试；用户后来修改的解析文件或显式配置的 DNS 不会被覆盖。这份临时恢复记录不进入 XML 备份。
+
 订阅直连下载，UA 格式固定为 `OPNsense-Mihomo/1 (device)`。4xx 不重试、不回退；仅 timeout/5xx 有最多四次请求。URL 不进入进程参数、日志或页面的已保存值。CLI、configd 和 cron 使用同一入口。
 
 构建使用目标 Python minor，并核对实际版本与声明的依赖一致；当前为 `python3.13` / `python313`。排除 `__pycache__`、`.pyc`、`.pyo`，且在暂存区和最终归档再次检查。
 
-在目标原生环境运行 `sh build.sh`，当前生成 `dist/FreeBSD:15:amd64/os-mihomo-1.2.1.pkg`。`TARGET_ABI`、`TARGET_PRODUCT_ABI`、`TARGET_PYTHON` 可显式指定，实际内核、用户空间、Python 和依赖必须匹配；不能在 FreeBSD 15 上给包换标签冒充 16。已启用配方定义发布目录，未公布的下一版保持禁用。发布必须具备每个目标与包摘要匹配的真实 VNET jail 报告，Pages 再验证源码、测试和包内容。安装后调用官方窄范围插件登记。1.1.2 管理状态建立后的重装保留显式 TUN 选择和行政 Stop；未知旧状态仍安全关闭 TUN。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。
+在目标原生环境运行 `sh build.sh`，当前生成 `dist/FreeBSD:15:amd64/os-mihomo-1.2.2.pkg`。`TARGET_ABI`、`TARGET_PRODUCT_ABI`、`TARGET_PYTHON` 可显式指定，实际内核、用户空间、Python 和依赖必须匹配；不能在 FreeBSD 15 上给包换标签冒充 16。已启用配方定义发布目录，未公布的下一版保持禁用。发布必须具备每个目标与包摘要匹配的真实 VNET jail 报告，Pages 再验证源码、测试和包内容。安装后调用官方窄范围插件登记。1.1.2 管理状态建立后的重装保留显式 TUN 选择和行政 Stop；未知旧状态仍安全关闭 TUN。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。

@@ -1,14 +1,45 @@
 #!/usr/local/bin/python3
 """Run the real resolver with synthetic templates inside the VNET jail."""
 from pathlib import Path
+import ipaddress
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
+import xml.etree.ElementTree as ET
 args = sys.argv[1:]
 with Path('/root/actions.log').open('a') as stream:
     stream.write('configctl ' + ' '.join(args) + '\n')
 if Path('/root/fail-configctl').exists():
     print('Execute error')
+    sys.exit(0)
+if args == ['dns', 'reload']:
+    # This adapter models only the generated private fixture's DNS settings.
+    # Genuine OPNsense configd/template behavior requires the separate host test.
+    system = ET.parse('/conf/config.xml').find('system')
+    if system is None:
+        raise RuntimeError('The private DNS fixture has no system configuration.')
+    domain = system.findtext('domain') or 'localdomain'
+    if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*', domain) is None:
+        raise RuntimeError('The private DNS fixture has an invalid search domain.')
+    servers = [] if system.find('dnslocalhost') is not None else ['127.0.0.1']
+    for node in system.findall('dnsserver'):
+        address = str(ipaddress.ip_address(node.text or ''))
+        if address not in servers:
+            servers.append(address)
+    if not servers:
+        raise RuntimeError('The private DNS fixture has no resolver.')
+    content = 'search ' + domain + '\n' + ''.join('nameserver ' + address + '\n' for address in servers)
+    descriptor, temporary = tempfile.mkstemp(prefix='.resolv-test-', dir='/etc')
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o644)
+            stream.write(content)
+        os.replace(temporary, '/etc/resolv.conf')
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     sys.exit(0)
 if args == ['template', 'reload', 'OPNsense/Unbound']:
     Path('/var/unbound/unbound.conf').write_text('''server:

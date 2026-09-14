@@ -177,8 +177,10 @@ class RuntimeBoundaryTests(unittest.TestCase):
             with self.assertRaises(m.Error): system.run(['/bin/ps'])
 
     def test_validator_diagnostics_are_not_returned(self):
+        candidate = self.manager.state / 'private-candidate.yaml'
+        candidate.write_text('tun: {enable: false}\n')
         with patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, b'PRIVATE_TOKEN', b'state-secret')):
-            with self.assertRaises(m.Error) as error: m.System().validate(Path('/private-candidate.yaml'))
+            with self.assertRaises(m.Error) as error: m.System().validate(candidate)
         self.assertNotIn('PRIVATE_TOKEN', str(error.exception))
         self.assertNotIn('state-secret', str(error.exception))
 

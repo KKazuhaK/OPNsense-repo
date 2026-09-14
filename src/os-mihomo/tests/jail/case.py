@@ -8,6 +8,7 @@ import re
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import time
 import urllib.request
@@ -32,6 +33,36 @@ def action(name, argument=None, ok=True):
 
 def running():
     return action('status')['result']['running']
+
+
+host_dns_marker = Path('/var/db/os-mihomo/host-dns-reload-pending')
+host_dns_resolver = Path('/etc/resolv.conf')
+
+
+def assert_core_host_dns_marker():
+    """Check ownership captured while the genuine core still owns its TUN."""
+    info = host_dns_marker.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0
+    assert stat.S_IMODE(info.st_mode) == 0o600
+    saved = json.loads(host_dns_marker.read_bytes())
+    assert set(saved) == {'servers', 'checksum'}
+    assert saved['servers'] == ['198.18.0.2']
+    assert saved['checksum'] == hashlib.sha256(host_dns_resolver.read_bytes()).hexdigest()
+
+
+def host_dns_restored():
+    # Normal Core.Close can restore the original file without a search line;
+    # the synthetic reload adapter adds the fixture's localdomain search line.
+    lines = [line.split() for line in host_dns_resolver.read_text().splitlines() if line.strip()]
+    if lines and lines[0] == ['search', 'localdomain']:
+        lines = lines[1:]
+    return not host_dns_marker.exists() and lines == [['nameserver', '127.0.0.1']]
+
+
+def assert_host_dns_restored():
+    # configd DNS generation is synthetic; the private Unbound query is real.
+    assert host_dns_restored()
+    assert socket.gethostbyname('policy.test') == '192.0.2.20'
 
 
 checks = []
@@ -131,11 +162,14 @@ passed('Actual core validator rejects invalid protocol while retaining the activ
 # Configure and start a real isolated resolver; native configuration writes use fixtures.
 command(['/usr/local/sbin/configctl', 'template', 'reload', 'OPNsense/Unbound'])
 command(['/usr/local/sbin/configctl', 'unbound', 'restart'])
+assert_host_dns_restored()
 action('enable-transparent')
 assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
 assert action('status')['result']['dns_active']
 assert ET.parse('/conf/config.xml').find('./filter/rule') is not None
 passed('Explicit activation creates the actual TUN and owned DNS/interface/firewall configuration')
+assert_core_host_dns_marker()
+passed('Startup captures a root-only local DNS fingerprint matching the real core-written resolver')
 # The forward zone is a drop-in file, not an entry in the operator's Unbound
 # configuration. An entry naming the root as its domain makes OPNsense generate
 # domain-insecure: "." beside it -- a negative trust anchor for a zone that
@@ -188,8 +222,10 @@ assert json.loads(Path('/var/db/os-mihomo/settings.json').read_text()) == before
 assert running()
 assert action('status')['result']['dns_active']
 assert b'tun_mihomo' in command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
+assert_core_host_dns_marker()
 passed('Actual same-version reinstall preserves explicit TUN consent and restores its route/DNS policy')
 action('stop')
+assert_host_dns_restored()
 before_settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
 assert before_settings['service_enabled'] is False
 command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', '-o', 'REPOS_DIR=/root/repos', 'install', '-y', '-f', 'os-mihomo'])
@@ -199,24 +235,29 @@ action('wan-restart')
 assert not running()
 assert not action('status')['result']['dns_active']
 assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode != 0
+assert_host_dns_restored()
 passed('Actual same-version reinstall preserves administrative Stop without WAN or boot resurrection')
 action('start')
+assert_core_host_dns_marker()
 # Test crash handling with actual PID, daemon and split routes.
 pid = int(Path('/var/run/mihomo-child.pid').read_text())
 os.kill(pid, signal.SIGKILL)
 started = time.monotonic()
 while time.monotonic() - started < 20:
     status = action('status')['result']
-    if not status['running'] and not status['dns_active'] and command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode != 0:
+    if (not status['running'] and not status['dns_active']
+            and command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode != 0
+            and host_dns_restored()):
         break
     time.sleep(.5)
 else:
-    raise AssertionError('Watchdog did not restore DNS and remove TUN')
+    raise AssertionError('Watchdog did not restore private host DNS, clear its marker and remove TUN')
 route = command(['/sbin/route', '-n', 'get', '8.8.8.8']).stdout
 assert b'tun_mihomo' not in route
 assert ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled') == '1'
+assert_host_dns_restored()
 recovery_seconds = time.monotonic() - started
-passed('Actual SIGKILL triggers watchdog DNS restoration and TUN route teardown')
+passed('Actual SIGKILL clears local DNS recovery state through the synthetic reload adapter and tears down TUN routes')
 action('start')
 action('disable-transparent')
 assert ET.parse('/conf/config.xml').find('./filter/rule') is None

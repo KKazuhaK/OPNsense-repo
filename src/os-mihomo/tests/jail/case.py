@@ -10,6 +10,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -42,6 +43,9 @@ gateway_cycle = {}
 
 def native_routes(fib):
     """Parse genuine tables with the installed module's unchanged parser."""
+    script_directory = '/usr/local/opnsense/scripts/mihomo'
+    if script_directory not in sys.path:
+        sys.path.insert(0, script_directory)
     spec = importlib.util.spec_from_file_location(
         'native_routing', '/usr/local/opnsense/scripts/mihomo/routing.py')
     helper = importlib.util.module_from_spec(spec)

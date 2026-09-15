@@ -24,6 +24,8 @@
 
 “通过路由器 DNS 解析”默认关闭。开关本身仅覆盖 nameserver、proxy-server-nameserver、default-nameserver、nameserver-policy 四项，不改变 DNS 劫持或 Unbound 的 AAAA 策略；透明模式另行强制真实 DNS。根据本机 DoT 配置为 IPv4/IPv6 上游地址和 853 端口注入优先 DIRECT 规则，上游改变时自动刷新，避免节点解析死锁。该模式不把 Unbound 再转发给 Mihomo；必须移除订阅的 DNS fallback，上游不可用时明确失败。
 
+手动 DNS 字段使用 Mihomo URL 语法。“覆盖订阅 DNS”开关明确控制非空手动字段是否替换运行配置中的对应项目；关闭后立即恢复订阅 DNS，同时保留手动值供以后启用。订阅 YAML 原文件始终不会被改写，启用路由器 DNS 时则以路由器 DNS 为优先。Mihomo 把 `#` 后的第一个值解释为代理或接口，而 Unbound 的 `IP@端口#主机名` 用它表示 TLS 校验名。为避免复制后直到运行时才出现 `interface not found`，插件会把 Nameservers 和节点 DNS 中的 `tls://IP#长主机名` 规范化为 `tls://长主机名`；`#vtnet1`、`#RULES` 等接口或规则选择保持原样。Bootstrap 仍必须是字面 IP，因此复制来的同类写法会在该字段保存为其中的 IP，由规范化后的主机名字段执行加密查询，避免形成解析依赖环。
+
 当前发布范围是 IPv4 客户端。选择“通过路由器 DNS 解析”时，若 RA/DHCPv6 已向客户端提供 IPv6，而 Mihomo IPv6 关闭，插件拒绝启用；运行中出现这种变化会提示。插件不抑制 AAAA 或修改 RA/DHCPv6；Mihomo IPv6 关闭时，原生 IPv6 流量绕过 TUN。未来启用客户端 IPv6 代理应完成独立端到端验证。
 
 核心异常退出后清除插件的透明接管策略和 TUN 路由；默认自动恢复原有直连 DNS，每台可配置。显式 Stop 即使 DNS 恢复失败也停止核心和透明接管，随后重试 DNS 恢复。WAN 事件不会重新启动手动停止的服务。关闭透明模式仅清除插件创建的接口、策略和路由，不清空防火墙状态表。
@@ -34,4 +36,4 @@
 
 构建使用目标 Python minor，并核对实际版本与声明的依赖一致；当前为 `python3.13` / `python313`。排除 `__pycache__`、`.pyc`、`.pyo`，且在暂存区和最终归档再次检查。
 
-在目标原生环境运行 `sh build.sh`，当前生成 `dist/FreeBSD:15:amd64/os-mihomo-1.2.5.pkg`。`TARGET_ABI`、`TARGET_PRODUCT_ABI`、`TARGET_PYTHON` 可显式指定，实际内核、用户空间、Python 和依赖必须匹配；不能在 FreeBSD 15 上给包换标签冒充 16。已启用配方定义发布目录，未公布的下一版保持禁用。发布必须具备每个目标与包摘要匹配的真实 VNET jail 报告，Pages 再验证源码、测试和包内容。安装后调用官方窄范围插件登记。1.1.2 管理状态建立后的重装保留显式 TUN 选择和行政 Stop；未知旧状态仍安全关闭 TUN。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。
+在目标原生环境运行 `sh build.sh`，当前生成 `dist/FreeBSD:15:amd64/os-mihomo-1.2.6.pkg`。`TARGET_ABI`、`TARGET_PRODUCT_ABI`、`TARGET_PYTHON` 可显式指定，实际内核、用户空间、Python 和依赖必须匹配；不能在 FreeBSD 15 上给包换标签冒充 16。已启用配方定义发布目录，未公布的下一版保持禁用。发布必须具备每个目标与包摘要匹配的真实 VNET jail 报告，Pages 再验证源码、测试和包内容。安装后调用官方窄范围插件登记。1.1.2 管理状态建立后的重装保留显式 TUN 选择和行政 Stop；未知旧状态仍安全关闭 TUN。构建、签名、回退和生产维护检查见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。

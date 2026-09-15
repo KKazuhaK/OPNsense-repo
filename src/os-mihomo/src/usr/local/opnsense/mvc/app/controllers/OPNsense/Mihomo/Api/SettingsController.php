@@ -41,7 +41,7 @@ class SettingsController extends ApiControllerBase
     private const STATE = '/var/db/os-mihomo';
 
     /* Fields the form owns. Anything absent keeps whatever is stored. */
-    private const FLAGS = ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any',
+    private const FLAGS = ['dns_fallback', 'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dashboard_any',
                            'allow_lan'];
     private const CHOICES = ['dns_mode' => 'fake-ip', 'geo_source' => 'metacubex', 'device_mode' => 'off',
                              'tun_stack' => 'gvisor'];

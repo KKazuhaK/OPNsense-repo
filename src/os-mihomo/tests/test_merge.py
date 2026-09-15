@@ -577,12 +577,45 @@ class DnsServerFieldTests(unittest.TestCase):
         self.assertEqual(['9.9.9.9'], dns['default-nameserver'])
 
     def test_a_stated_field_replaces_them(self):
-        dns = self.generated(dns_nameserver=['tls://223.5.5.5', 'https://doh.pub/dns-query'],
+        dns = self.generated(dns_override=True,
+                             dns_nameserver=['tls://223.5.5.5', 'https://doh.pub/dns-query'],
                              dns_default=['223.6.6.6'])['dns']
         self.assertEqual(['tls://223.5.5.5', 'https://doh.pub/dns-query'], dns['nameserver'])
         self.assertEqual(['223.6.6.6'], dns['default-nameserver'])
         # Untouched fields still come from the subscription.
         self.assertEqual(['https://provider.invalid/dns-query'], dns['proxy-server-nameserver'])
+
+    def test_manual_fields_only_replace_subscription_dns_when_enabled(self):
+        manual = ['tls://dot.example.net']
+        inherited = self.generated(dns_override=False, dns_nameserver=manual)['dns']
+        overridden = self.generated(dns_override=True, dns_nameserver=manual)['dns']
+        self.assertEqual(['https://provider.invalid/dns-query'], inherited['nameserver'])
+        self.assertEqual(manual, overridden['nameserver'])
+
+    def test_unbound_style_dot_tls_name_is_normalized_without_claiming_an_interface(self):
+        settings = m.routing_settings({**self.settings, 'dns_override': True,
+            'dns_nameserver': ['tls://162.159.36.5#v5brh3pn84.cloudflare-gateway.com'],
+            'dns_proxy_nameserver': [
+                'tls://[2606:4700:4700::1111]:8853#resolver.example.net&disable-ipv6=true',
+                'tls://192.0.2.53#vtnet1', 'tls://192.0.2.54#RULES']})
+        self.assertEqual(['tls://v5brh3pn84.cloudflare-gateway.com'],
+                         settings['dns_nameserver'])
+        self.assertEqual([
+            'tls://resolver.example.net:8853#disable-ipv6=true',
+            'tls://192.0.2.53#vtnet1', 'tls://192.0.2.54#RULES'],
+            settings['dns_proxy_nameserver'])
+        dns = self.generated(**settings)['dns']
+        self.assertEqual(settings['dns_nameserver'], dns['nameserver'])
+        self.assertEqual(settings['dns_proxy_nameserver'], dns['proxy-server-nameserver'])
+
+    def test_bootstrap_repairs_unbound_style_tls_name_without_a_dependency_loop(self):
+        manager = m.Manager.__new__(m.Manager)
+        base = dict(self.settings, dns_fallback=True, service_enabled=True,
+                    device='router', subscription_url='')
+        stated = 'tls://162.159.36.5#v5brh3pn84.cloudflare-gateway.com'
+        manager.check_settings(dict(base, dns_default=[stated]))
+        self.assertEqual(['162.159.36.5'],
+                         m.routing_settings(dict(base, dns_default=[stated]))['dns_default'])
 
     def test_router_dns_keeps_every_upstream_even_when_fields_are_stated(self):
         dns = self.generated(router_dns=True, dns_nameserver=['tls://223.5.5.5'],
@@ -609,6 +642,7 @@ class DnsServerFieldTests(unittest.TestCase):
         overlay = {'dns': {'nameserver': ['tls://223.5.5.5'], 'enhanced-mode': 'fake-ip'}}
         lifted = m.absorb_switches(overlay, self.settings)
         self.assertEqual(['tls://223.5.5.5'], lifted['dns_nameserver'])
+        self.assertTrue(lifted['dns_override'])
         self.assertNotIn('dns', overlay)
         self.assertEqual([], m.switch_overrides({'dns': {}}))
         self.assertEqual(['dns_nameserver'],

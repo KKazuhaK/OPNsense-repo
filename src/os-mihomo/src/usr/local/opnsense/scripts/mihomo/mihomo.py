@@ -34,7 +34,8 @@ MAX_BACKUP = 24 * 1024 * 1024
 BACKUP_KEYS = ('subscription_url', 'secret', 'device', 'service_enabled', 'transparent',
                'transparent_consent', 'mixed_port', 'socks_port', 'bind_address', 'allow_lan',
                'tun_stack', 'tun_mtu', 'dns_mode', 'dns_hijack', 'dns_fallback', 'router_dns',
-               'ipv6', 'geo_source', 'dns_default', 'dns_nameserver', 'dns_proxy_nameserver',
+               'dns_override', 'ipv6', 'geo_source', 'dns_default', 'dns_nameserver',
+               'dns_proxy_nameserver',
                'device_mode', 'device_list', 'controller')
 BACKUP_WARNING = 'The operation completed, but the Mihomo configuration backup could not be updated.'
 BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. The current local configuration is retained. '
@@ -446,6 +447,11 @@ def routing_settings(settings):
     result = dict(settings)
     if result.get('transparent') and result.get('dns_mode') == 'fake-ip':
         result['dns_mode'] = 'redir-host'
+    for field in ('dns_default', 'dns_nameserver', 'dns_proxy_nameserver'):
+        values = result.get(field)
+        if isinstance(values, list):
+            result[field] = [normalize_dns_server(field, value)
+                             if isinstance(value, str) else value for value in values]
     return result
 
 
@@ -523,6 +529,37 @@ DNS_SERVER_LIMIT = 8
 DNS_SERVER_ALIASES = ('system', 'dhcp')
 
 
+def dot_tls_name_compat(value):
+    """Translate an Unbound-style IP plus TLS name into Mihomo's hostname form."""
+    try:
+        parsed = urlparse.urlsplit(value)
+        host, port = parsed.hostname, parsed.port
+        literal = str(ipaddress.ip_address(host))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if (parsed.scheme != 'tls' or parsed.username is not None or parsed.password is not None
+            or parsed.path or parsed.query or not parsed.fragment):
+        return None
+    server_name, separator, parameters = parsed.fragment.partition('&')
+    labels = server_name.split('.')
+    if (len(server_name) <= 15 or len(server_name) > 253 or len(labels) < 2
+            or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                   for label in labels)):
+        return None
+    normalized = 'tls://' + server_name + (':' + str(port) if port is not None else '')
+    return literal, normalized + ('#' + parameters if separator else '')
+
+
+def normalize_dns_server(field, value):
+    """Keep interface selectors while repairing a copied Unbound DoT endpoint."""
+    compatible = dot_tls_name_compat(value)
+    if compatible is None:
+        return value
+    # Bootstrap must stay addressable before DNS works. The copied TLS name is
+    # used by the encrypted upstream fields; its literal endpoint bootstraps it.
+    return compatible[0] if field == 'dns_default' else compatible[1]
+
+
 def dns_server_host(value):
     """The host a DNS upstream points at, whatever syntax states it."""
     text = value.split('#', 1)[0]
@@ -541,6 +578,7 @@ def check_dns_servers(field, values):
         if (not isinstance(value, str) or not value.strip() or value != value.strip()
                 or any(char in value for char in " \t\r\n\x00")):
             raise Error("A DNS server must be a single address without spaces.")
+        normalize_dns_server(field, value)
         if value in DNS_SERVER_ALIASES and field != 'dns_default':
             continue
         if field != 'dns_default':
@@ -558,12 +596,12 @@ def check_dns_servers(field, values):
 # UNDER the merge YAML, so a hand-written override always wins. When an overlay
 # states one of these keys in its canonical form, absorb_switches() lifts it into
 # the switch instead, so the UI never shows a value the config contradicts.
-SWITCH_DEFAULTS = {'router_dns': False, 'ipv6': False, 'dns_hijack': True,
+SWITCH_DEFAULTS = {'router_dns': False, 'dns_override': False, 'ipv6': False, 'dns_hijack': True,
                    'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT,
                    'mixed_port': 7890, 'socks_port': 7891, 'allow_lan': False,
                    'bind_address': '127.0.0.1', 'tun_stack': 'gvisor', 'tun_mtu': 1420}
 # Bumped only to re-seed the switches from an installation that predates them.
-SWITCH_SCHEMA = 3
+SWITCH_SCHEMA = 4
 # gVisor needs no kernel support and is what the presets ship; system is faster
 # where the host can carry it; mixed uses system for TCP and gVisor for UDP.
 TUN_STACKS = ('gvisor', 'system', 'mixed')
@@ -593,11 +631,11 @@ def switch_overlay(settings):
         'geodata-mode': True, 'geo-auto-update': True, 'geo-update-interval': GEO_UPDATE_HOURS,
     }
     # Router DNS owns every upstream, so a stated server would contradict it.
-    if not settings.get('router_dns'):
+    if not settings.get('router_dns') and settings.get('dns_override'):
         for field, key in DNS_SERVER_FIELDS.items():
             stated = settings.get(field)
             if stated:
-                overlay['dns'][key] = list(stated)
+                overlay['dns'][key] = [normalize_dns_server(field, value) for value in stated]
     return overlay
 
 
@@ -673,11 +711,15 @@ def absorb_switches(overlay, settings):
             settings['controller'] = controller
             overlay.pop('external-controller')
 
+    lifted_dns = False
     for field, key in DNS_SERVER_FIELDS.items():
         stated = dns.get(key)
         if isinstance(stated, list) and all(isinstance(v, str) for v in stated):
             settings[field] = list(stated)
             dns.pop(key)
+            lifted_dns = True
+    if lifted_dns:
+        settings['dns_override'] = True
 
     urls = overlay.get('geox-url')
     if isinstance(urls, dict):
@@ -2216,8 +2258,8 @@ class Manager:
             raise Error("Mihomo settings are missing or invalid; run initialization first.") from None
 
     def check_settings(self, settings):
-        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns', 'ipv6',
-                    'dns_hijack', 'allow_lan'):
+        for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns',
+                    'dns_override', 'ipv6', 'dns_hijack', 'allow_lan'):
             if key not in settings and key in SWITCH_DEFAULTS:
                 continue
             if not isinstance(settings.get(key), bool):
@@ -2379,6 +2421,10 @@ class Manager:
             if isinstance(rendered.get('external-controller'), str):
                 settings['controller'] = rendered['external-controller']
             settings.setdefault('controller', ANY_CONTROLLER)
+            # Before this switch existed, any populated manual field always
+            # replaced its subscription counterpart. Keep that effective intent.
+            if any(settings.get(field) for field in DNS_SERVER_FIELDS):
+                settings['dns_override'] = True
             settings['switch_schema'] = SWITCH_SCHEMA
         settings = routing_settings(settings)
         self.write_settings(settings)
@@ -2806,7 +2852,7 @@ class Manager:
             value = json.loads(Path(argument).read_bytes())
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
-                        'router_dns', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
+                        'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
                         'device_mode', 'device_list', 'mixed_port', 'socks_port',
                         'allow_lan', 'bind_address', 'tun_stack', 'tun_mtu', *DNS_SERVER_FIELDS):
                 if key in value:

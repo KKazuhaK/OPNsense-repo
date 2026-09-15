@@ -503,6 +503,17 @@ class TunPolicyRouting:
         """Allow only unchanged interface routes cloned from the main FIB."""
         return private_fib_occupied(self.routes(0), self.routes(fib))
 
+    def fib_count(self):
+        """Return the kernel's current routing-table count, if readable."""
+        value = self.command(['/sbin/sysctl', '-n', 'net.fibs'], check=False)
+        if value.returncode:
+            return None
+        try:
+            count = int(value.stdout.strip())
+        except ValueError:
+            return None
+        return count if count >= 1 else None
+
     def allocate(self, record):
         def count():
             try:
@@ -795,12 +806,24 @@ class TunPolicyRouting:
                     self.command(['/sbin/pfctl', '-k', 'id', '-k', identifier])
             except (RoutingError, UnicodeError) as error:
                 state_error = error
-        # Preserve ordinary routes, including the system default, for surviving
-        # explicit gateway states. This private table can be reused next start.
-        system = self.routes(0)
-        native = {key: route for key, route in system.items()
-                  if route['interface'] != self.TUN}
-        self.sync(record, native, strict=False, native=system)
+        count = self.fib_count()
+        if count is not None and record['fib'] >= count:
+            # net.fibs does not survive a reboot, so a journaled table number
+            # can fall outside the kernel's current range. A table the kernel
+            # never created cannot hold routes: never query or rewrite it, and
+            # release the number so the next start reserves a valid one.
+            record['routes'].clear()
+            record.pop('pending_route', None)
+            record.pop('route_recovery_ambiguous', None)
+            record['fib'] = None
+        else:
+            # Preserve ordinary routes, including the system default, for
+            # surviving explicit gateway states. This private table can be
+            # reused next start.
+            system = self.routes(0)
+            native = {key: route for key, route in system.items()
+                      if route['interface'] != self.TUN}
+            self.sync(record, native, strict=False, native=system)
         if (anchor_error is not None or state_error is not None
                 or collision_error is not None):
             raise RoutingError('Owned firewall state cleanup will be retried.') from None

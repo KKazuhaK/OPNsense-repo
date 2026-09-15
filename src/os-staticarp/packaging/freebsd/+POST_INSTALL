@@ -89,11 +89,11 @@ rm -f \
 
 echo "===> Reloading OPNsense menu, ACL and configd actions"
 service configd restart >/dev/null 2>&1 || true
-# The outgoing package resets interface modes and ARP entries during removal.
-if grep -q '^enabled=YES$' /usr/local/etc/staticarp/settings.conf; then
-    configctl staticarp apply >/dev/null 2>&1 || true
-fi
-configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
+# Reconcile pending and owned state even when the saved settings are disabled.
+/usr/local/sbin/staticarpctl apply >/dev/null || {
+    echo "===> Unable to apply the saved ARP bindings; ownership was retained for recovery." >&2
+    exit 1
+}
 
 echo "===> Static Binding for OPNsense installed. Refresh the browser and open Services > Static Binding."
 exit 0

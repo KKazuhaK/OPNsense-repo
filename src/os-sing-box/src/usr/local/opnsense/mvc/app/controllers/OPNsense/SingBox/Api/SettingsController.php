@@ -64,6 +64,27 @@ class SettingsController extends ApiControllerBase
         ]));
     }
 
+    public function setIntegrationAction(): array
+    {
+        if ($this->request->getMethod() !== 'POST') {
+            return ['status' => 'failed', 'error' => gettext('A POST is required.')];
+        }
+        $this->throwReadOnly();
+        $given = $this->request->getPost('integration');
+        $given = is_array($given) ? $given : [];
+        $devices = $given['device_list'] ?? [];
+        if (is_string($devices)) {
+            $devices = preg_split('/[\s,]+/', trim($devices), -1, PREG_SPLIT_NO_EMPTY);
+        }
+        return $this->run('set-integration', json_encode([
+            'transparent' => !empty($given['transparent']),
+            'transparent_consent' => !empty($given['transparent_consent']),
+            'device_mode' => (string)($given['device_mode'] ?? 'off'),
+            'device_list' => $devices,
+            'ipv6' => !empty($given['ipv6']),
+        ]));
+    }
+
     public function saveConfigAction(): array
     {
         if ($this->request->getMethod() !== 'POST') {

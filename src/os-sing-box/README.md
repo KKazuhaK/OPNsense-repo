@@ -41,58 +41,42 @@ bin/bsd-box-reF1nd-freebsd-amd64.xz
 ```text
 https://github.com/Vincent-Loeng/bsd-box/releases/latest/download/bsd-box-reF1nd-freebsd-amd64.xz
 ```
-## 注意事项
+## 路由、设备名单与基础服务
 
-1. 当前仅支持 x86_64 / amd64 平台。
-2. 安装完成，无需添加接口、防火墙规则。只需修改节点信息即可使用。
-3. 安装调试完成后，将日志层级调整为 `error`，避免长期运行产生过多日志。
-4. 不同版本之间配置格式可能存在差异，Release 中的默认配置仅保证匹配当前安装包内置版本。
-5. 默认配置会开启 Clash API，可通过 `http://LAN_IP:9091/ui` 访问仪表盘查看代理连接信息。
-6. 修改配置不要改动config.json文件中tun接口名称（tun_singbox），否则会影响安装程序生成的默认防火墙规则。
-7. 如果局域网客户端使用 OPNsense 作为 DNS，Unbound 会在请求到达 sing-box 之前在本地 Unbound 处理查询。若要让 sing-box 接管 DNS 规则，可以通过 NAT/rdr 重定向局域网的 DNS 流量，或者 Unbound 添加查询转发，或者通过 DHCP 为客户端指定一个外部 DNS 服务器。三种方法使用一种即可。
+首次安装不会启动服务，默认仅提供显式 SOCKS 代理。先配置有效节点，再点击
+“Start”。启动使用私有运行配置；保存的完整 JSON、订阅 URL、代理凭据和未来字段
+保持原样。旧版 JSON 中的 `auto_route: true` 不代表透明代理授权，升级后需重新明确
+选择透明接管。
 
-采用重定向 DNS 查询，导航到防火墙>NAT>目标 NAT，添加如下规则：
+在服务页面启用“Transparent LAN capture”，确认接管意图并保存、重启。配置必须
+保留一个 gVisor TUN 入站，使用不与现有路由重叠的私有地址段和真实 IP DNS。
+运行副本强制关闭内核自动路由，并移除新旧显式 TUN 路由范围；插件通过独立 FIB 和
+非 quick PF match 规则选择新的 LAN TCP／UDP 流量。主 FIB、路由器自身流量和
+WAN 回程保持原生路径；用户的阻断规则、显式网关和 VPN／静态路由优先。
 
-```text
-- 接口: LAN
-- 协议: TCP/UDP
-- 目标: 该防火墙
-- 目标端口: 53
-- 重定向目标: 1.1.1.1 或其他公共DNS地址
-- 重定向目标端口: 53
-```
-添加 Unbound 查询转发，需要在config.json中增加入站：
-```text
-    {
-      "type": "direct",
-      "tag": "dns-in",
-      "listen": "127.0.0.1",
-      "listen_port": 5353,
-      "override_address": "8.8.8.8",
-      "override_port": 53
-    },
-```
-然后在服务>Unbound DNS>查询转发，添加指向 5353 端口的转发记录并应用：
+设备名单使用 IP／CIDR：“Proxy only listed devices”只接管白名单设备，
+“Bypass listed devices”使黑名单设备在进入 TUN 之前绕过。空名单接管所有 LAN
+设备。名单不依赖内核中的 DIRECT 出站规则；重启应用策略时只清理插件所属的
+已接管状态。ICMP、DHCP、组播和邻居发现保持原生路径。IPv6 接管需单独开启且
+TUN 有 IPv6 地址，否则 IPv6 不接管，也不更改 DHCP／RA 设置。
 
-```text
-- 启用: 选中
-- 域: 留空
-- 服务器IP: 127.0.0.1
-- 服务器端口: 5353
-```
-也可以安装社区插件 os-unboundcustom，给 Unbound 增加一个自定义选项，然后在自定义选项框中输入以下内容并启用:
-```text
-server:
-    do-not-query-localhost: no
-forward-zone:
-    name: "."
-    forward-addr: 127.0.0.1@5353
-```
+插件不会重写 `/etc/resolv.conf`、更改 Unbound 转发或重启 DNS 服务。LAN 使用
+OPNsense DNS 时继续由 Unbound 解析，透明接管要求真实 IP，不能使用 fake IP。
+不要将系统 DNS 的根转发绑定到只有本代理运行时才可用的本地端口。多 WAN DNAT
+仍应使用关联过滤规则与正确的 `reply-to` 回程绑定；插件不修改管理员 NAT 或连接状态。
+
+独立监视进程在 Core 异常退出或暂停后撤销插件的接管规则、恢复私有 FIB 原生路由，并
+仅清理匹配所属 FIB／TUN 的状态；恢复失败会持续重试。暂停的 Core 仍保留进程归属，
+可以安全 Stop。恢复进程后继续使用原生网络，需显式 Restart 才恢复透明接管。
+服务页面显示暂停、恢复待处理及需重启接管的状态。关闭的 TUN 仅在内核接口编号、
+驱动名和随机归属标记仍匹配时删除；已打开或被管理员修改的设备保持不变。正常 Stop 和启动失败同样
+执行所属资源清理，不会按进程名称全局杀进程。卸载保留私有设置和恢复记录；只有
+仍与插件记录完全一致且未被其他规则引用的接口／规则才可删除。
 
 ## 安装命令
 将安装包上传到 OPNsense 后执行：
 ```sh
-pkg add -f os-sing-box-1.1.1.pkg
+pkg add -f os-sing-box-1.1.2.pkg
 ```
 刷新 OPNsense WebGUI，进入：
 ```text
@@ -128,11 +112,11 @@ make package
 生成文件：
 
 ```text
-dist/os-sing-box-1.1.1.pkg
+dist/os-sing-box-1.1.2.pkg
 ```
 检查包元数据：
 ```sh
-pkg info -F dist/os-sing-box-1.1.1.pkg
+pkg info -F dist/os-sing-box-1.1.2.pkg
 ```
 ## 常用命令
 服务控制：

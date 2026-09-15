@@ -9,9 +9,12 @@
 name="lucky"
 rcvar="lucky_enable"
 
+pidfile="/var/run/${name}.pid"
+
 # Reconcile restored XML before reading service enable and configuration paths.
 case "${1:-}" in
     start|onestart|faststart|forcestart)
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/process_control.py idle "$pidfile" "${name}:daemon" /usr/local/bin/lucky || exit 1
         /usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py reconcile >/dev/null || exit 1
         ;;
 esac
@@ -27,7 +30,6 @@ load_rc_config "$name"
 : "${lucky_conf_dir:=/usr/local/etc/lucky}"
 : "${lucky_http_port:=16601}"
 
-pidfile="/var/run/${name}.pid"
 logfile="/var/log/${name}.log"
 command="/usr/sbin/daemon"
 lucky_bin="/usr/local/bin/lucky"
@@ -45,41 +47,30 @@ lucky_prestart()
 		return 1
 	fi
 
+	# Refuse foreign PIDs before modifying service files.
+	lucky_control status >/dev/null 2>&1 && return 1
+	lucky_control stop || return $?
 	mkdir -p "$lucky_conf_dir"
 	touch "$logfile"
 	chmod 0600 "$logfile"
-	rm -f "$pidfile"
 }
 
 lucky_start()
 {
-	$command -P "$pidfile" -r -f -o "$logfile" -t "${name}:daemon" \
+	$command -P "$pidfile" -f -o "$logfile" -t "${name}:daemon" \
 		"$lucky_bin" -cd "$lucky_conf_dir" -port "$lucky_http_port" || return $?
+	lucky_control record || { lucky_control stop; return 1; }
 	/usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py mirror >/dev/null
+}
+
+lucky_control()
+{
+	/usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/process_control.py "$1" "$pidfile" "${name}:daemon" "$lucky_bin" -cd "$lucky_conf_dir" -port "$lucky_http_port"
 }
 
 lucky_stop()
 {
-	if [ -f "$pidfile" ]; then
-		daemon_pid="$(cat "$pidfile" 2>/dev/null)"
-		if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
-			children="$(pgrep -P "$daemon_pid" 2>/dev/null || true)"
-			kill -TERM "$daemon_pid" 2>/dev/null || true
-			for child in $children; do
-				kill -TERM "$child" 2>/dev/null || true
-				remaining=50
-				while kill -0 "$child" 2>/dev/null && [ "$remaining" -gt 0 ]; do
-					sleep 0.1
-					remaining=$((remaining - 1))
-				done
-				# Do not import or mirror while a writer can still flush old settings.
-				if kill -0 "$child" 2>/dev/null; then
-					return 1
-				fi
-			done
-		fi
-		rm -f "$pidfile"
-	fi
+	lucky_control stop || return $?
 	if [ "${1:-}" != "skip-backup" ]; then
 		/usr/local/bin/python3 /usr/local/opnsense/scripts/lucky/config_mirror.py mirror >/dev/null
 	fi
@@ -105,11 +96,10 @@ lucky_restart()
 
 lucky_status()
 {
-	if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-		echo "${name} is running as pid $(cat "$pidfile")."
+	if lucky_control status; then
+		echo "${name} is running."
 		return 0
 	fi
-
 	echo "${name} is not running."
 	return 1
 }

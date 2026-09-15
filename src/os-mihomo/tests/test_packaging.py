@@ -36,6 +36,11 @@ class BuildTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.project = self.root / 'project'
         self.project.mkdir()
+        (self.root / 'common').mkdir()
+        shutil.copyfile(REPO / 'src/common/process_identity.py', self.root / 'common/process_identity.py')
+        shutil.copyfile(REPO / 'src/common/route_control.py', self.root / 'common/route_control.py')
+        shutil.copyfile(REPO / 'src/common/tun_policy_routing.py',
+                        self.root / 'common/tun_policy_routing.py')
         shutil.copyfile(REPO / 'src/os-mihomo/build.sh', self.project / 'build.sh')
         (self.project / 'packaging').mkdir()
         for name in ('targets.json', 'target.py'):
@@ -312,6 +317,39 @@ class TargetTests(unittest.TestCase):
                          target_helper.transform_content(data, target))
         binary = b'\xff/usr/local/bin/python3\x00'
         self.assertEqual(binary, target_helper.transform_content(binary, target))
+
+    def test_shared_routing_source_rejects_file_and_parent_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'os-mihomo'
+            common = root / 'common'
+            project.mkdir()
+            common.mkdir()
+            source = common / 'route_control.py'
+            source.write_text('owned\n')
+            self.assertEqual(b'owned\n', target_helper.shared_source(project, 'route_control.py'))
+            outside = root / 'outside.py'
+            outside.write_text('foreign\n')
+            source.unlink()
+            source.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, 'missing or unsafe'):
+                target_helper.shared_source(project, 'route_control.py')
+            source.unlink()
+            common.rmdir()
+            common.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'missing or unsafe'):
+                target_helper.shared_source(project, 'route_control.py')
+
+            repository = root / 'repository'
+            actual = root / 'actual'
+            repository.mkdir()
+            (actual / 'src/os-mihomo').mkdir(parents=True)
+            (actual / 'src/common').mkdir()
+            (actual / 'src/common/route_control.py').write_text('foreign\n')
+            (repository / 'src').symlink_to(actual / 'src', target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'missing or unsafe'):
+                target_helper.shared_source(
+                    repository / 'src/os-mihomo', 'route_control.py')
 
 
 class ArchiveTests(unittest.TestCase):

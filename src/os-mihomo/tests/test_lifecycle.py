@@ -121,3 +121,17 @@ with Path(os.environ['TEST_CALLS']).open('a') as stream:
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(['os-ddclient', 'os-other'], json.loads(self.plugins.read_text()))
         self.assertEqual(1, self.calls.read_text().count('register remove os-mihomo'))
+
+    def test_post_deinstall_restarts_unbound_only_after_removing_a_remnant(self):
+        result = self.run_hook('+POST_DEINSTALL')
+        self.assertEqual(0, result.returncode, result.stderr)
+        calls = self.calls.read_text() if self.calls.exists() else ''
+        self.assertNotIn('configctl unbound restart', calls)
+
+        fragment = self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
+        fragment.parent.mkdir(parents=True)
+        fragment.write_text('forward-zone fixture')
+        result = self.run_hook('+POST_DEINSTALL')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(fragment.exists())
+        self.assertEqual(1, self.calls.read_text().count('configctl unbound restart'))

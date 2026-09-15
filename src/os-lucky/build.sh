@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-lucky}"
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.1.2}"
 ORIGIN="${ORIGIN:-opnsense/os-lucky}"
 COMMENT="${COMMENT:-Lucky network toolbox integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -133,7 +133,12 @@ prepare_lucky_binary() {
 echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.py" "$STAGEDIR/usr/local/opnsense/scripts/lucky/config_backup.py"
+install -m 0644 "$SCRIPT_DIR/../common/process_control.py" "$STAGEDIR/usr/local/opnsense/scripts/lucky/process_control.py"
+install -m 0644 "$SCRIPT_DIR/../common/process_identity.py" "$STAGEDIR/usr/local/opnsense/scripts/lucky/process_identity.py"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.php" "$STAGEDIR/usr/local/opnsense/scripts/lucky/config_backup.php"
+PRODUCT_VERSION="$(sed -n 's/.*"product_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+	"$STAGEDIR/usr/local/opnsense/version/lucky")"
+[ "$PRODUCT_VERSION" = "$VERSION" ] || die "VERSION does not match the committed Lucky product metadata"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-lucky-backup"
 prepare_lucky_binary
 install -m 0755 "$DOWNLOADDIR/lucky" "$STAGEDIR/usr/local/bin/lucky"

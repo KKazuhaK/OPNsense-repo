@@ -1,6 +1,11 @@
 #!/bin/sh
+set -eu
 
-/usr/local/sbin/staticarpctl reset >/dev/null 2>&1 || true
-/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py mirror >/dev/null 2>&1 || true
+# Upgrades keep the ownership journal and bindings until the incoming package
+# reconciles them. Never run the legacy global ARP reset during an upgrade.
+if [ -z "${PKG_UPGRADE+x}" ]; then
+    /usr/local/sbin/staticarpctl reset >/dev/null
+fi
+/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py mirror >/dev/null
 service os-staticarp-backup onestop >/dev/null 2>&1 || true
 exit 0

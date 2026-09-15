@@ -2,7 +2,6 @@
 import json
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import tempfile
 import unittest
@@ -143,22 +142,13 @@ class RoutingLifecycleTests(unittest.TestCase):
         system = m.System()
         live = {'core': True, 'capture': True}
         events = []
-        pid = self.manager.state / 'isolated-core.pid'
-        daemon_pid = self.manager.state / 'isolated-daemon.pid'
 
         def routing(action):
             self.assertEqual('disable', action)
             live['capture'] = False
             events.append('remove-capture')
 
-        def valid_pid(path, expected):
-            return 123 if path == str(pid) and live['core'] else None
-
-        def kill(process, sig):
-            self.assertEqual(123, process)
-            if sig == 0:
-                raise ProcessLookupError()
-            self.assertEqual(signal.SIGTERM, sig)
+        def terminate():
             self.assertFalse(live['capture'])
             live['core'] = False
             events.append('terminate-core')
@@ -172,12 +162,20 @@ class RoutingLifecycleTests(unittest.TestCase):
                 events.append('destroy-tun')
             return subprocess.CompletedProcess(args, 0, b'', b'')
 
-        with mock.patch.object(m, 'PID', str(pid)), mock.patch.object(m, 'DAEMON_PID', str(daemon_pid)), \
-                mock.patch.object(system, 'routing', side_effect=routing), \
-                mock.patch.object(system, 'valid_pid', side_effect=valid_pid), \
+        def destroy_owned(prepare=None):
+            prepared = prepare() if prepare is not None else None
+            command(['/sbin/ifconfig', 'tun_mihomo', 'destroy'])
+            return True, prepared
+
+        owned = mock.Mock()
+        owned.stop.side_effect = terminate
+        with mock.patch.object(system, 'routing', side_effect=routing), \
+                mock.patch.object(system, '_core_group', return_value=owned), \
+                mock.patch.object(system, 'running', side_effect=lambda: live['core']), \
                 mock.patch.object(system, 'run', side_effect=command), \
+                mock.patch.object(system, 'destroy_owned_tun', side_effect=destroy_owned), \
                 mock.patch.object(system, '_host_dns_prepare', return_value=None), \
-                mock.patch.object(m.os, 'kill', side_effect=kill), mock.patch.object(m.time, 'sleep'):
+                mock.patch.object(m.time, 'sleep'):
             system.stop()
 
         self.assertLess(events.index('remove-capture'), events.index('terminate-core'))
@@ -195,8 +193,29 @@ class RoutingLifecycleTests(unittest.TestCase):
         self.assertFalse(status['dns_active'])
         self.assertFalse(status['routing_active'])
         self.assertIn('Routing cleanup failed', status['error'])
+        self.assertIn('Injected state cleanup failure', status['error'])
         self.assertLess(self.system.events.index('destroy-tun'),
                         self.system.events.index('dns-off'))
+
+    def test_native_routing_stderr_is_single_line_bounded_and_reaches_status(self):
+        system = m.System()
+        native = ('Mihomo routing could not be applied safely.\n\x00\x1b[31mNative routing operation failed: '
+                  + '\N{SNOWMAN}' * 600).encode()
+        failure = subprocess.CompletedProcess([], 1, b'', native)
+        with mock.patch.object(system, 'run', return_value=failure) as command:
+            with self.assertRaises(m.Error) as caught:
+                system.routing('enable')
+        command.assert_called_once_with(
+            ['/usr/local/bin/python3', m.ROUTING_HELPER, 'enable'], timeout=90, check=False)
+        detail = str(caught.exception)
+        self.assertNotIn('\n', detail)
+        self.assertNotIn('\x00', detail)
+        self.assertNotIn('\x1b', detail)
+        self.assertLessEqual(len(detail.encode()), m.ROUTING_DIAGNOSTIC_LIMIT)
+        self.assertIn('Native routing operation failed', detail)
+
+        status = self.manager.publish_status(error=caught.exception)
+        self.assertEqual(status['error'], detail)
 
     def test_backup_guard_failure_still_recovers_dns_after_routing_cleanup_error(self):
         self.activate()

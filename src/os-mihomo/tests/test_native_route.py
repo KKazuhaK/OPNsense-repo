@@ -9,7 +9,7 @@ import struct
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'src/usr/local/opnsense/scripts/mihomo/native_route.py'
+SCRIPT = Path(__file__).resolve().parents[2] / 'common/route_control.py'
 spec = importlib.util.spec_from_file_location('mihomo_native_route', SCRIPT)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
@@ -174,10 +174,11 @@ class NativeRouteTests(unittest.TestCase):
                 attrs = m.attributes(sock.sent[-1][m.HEADER.size + m.ROUTE.size:])
                 self.assertTrue(m.U32.unpack(attrs[m.RTFLAGS])[0] & flag)
 
-    def test_lost_acknowledgement_adopts_the_route_the_kernel_installed(self):
+    def test_lost_acknowledgement_preserves_equal_route_without_adoption(self):
         wanted = route()
         sock = LostAcknowledgement(wanted, fib=2023)
-        m.add(2023, wanted, lambda: (sock, 1234), lambda _: 4)
+        with self.assertRaisesRegex(m.RouteAmbiguous, 'ownership was not established'):
+            m.add(2023, wanted, lambda: (sock, 1234), lambda _: 4)
         self.assertEqual(len(sock.sent), 3)
         readback = sock.sent[2]
         self.assertEqual(m.HEADER.unpack_from(readback)[1], m.GETROUTE)

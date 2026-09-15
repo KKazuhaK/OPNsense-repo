@@ -14,6 +14,5 @@ rmdir \
 	/usr/local/opnsense/mvc/app/models/OPNsense/Lucky 2>/dev/null || true
 
 service configd restart >/dev/null 2>&1 || true
-configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 
 exit 0

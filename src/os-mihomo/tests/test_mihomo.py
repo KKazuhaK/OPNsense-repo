@@ -5,12 +5,15 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 import yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'src/usr/local/opnsense/scripts/mihomo/mihomo.py'
+sys.path.insert(0, str(SCRIPT.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'common'))
 spec = importlib.util.spec_from_file_location('mihomo', SCRIPT)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
@@ -557,7 +560,8 @@ class IntegrationHelperTests(unittest.TestCase):
         self.assertEqual(0, repeated.returncode)
         self.assertIn('unchanged', repeated.stdout)
         self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
-                          'integration_changed': False}, self.helper_state(repeated))
+                          'integration_changed': False, 'filter_changed': False,
+                          'cron_changed': False}, self.helper_state(repeated))
 
     def test_forwarding_metadata_follows_enable_and_disable(self):
         enabled = self.helper('enable')
@@ -580,7 +584,8 @@ class IntegrationHelperTests(unittest.TestCase):
         disabled = self.helper('disable')
         self.assertEqual(0, disabled.returncode)
         self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
-                          'integration_changed': True}, self.helper_state(disabled))
+                          'integration_changed': True, 'filter_changed': True,
+                          'cron_changed': False}, self.helper_state(disabled))
 
     def test_real_dns_modes_preserve_operator_private_address_and_journal(self):
         for mode in ('redir-host', 'normal'):
@@ -598,7 +603,8 @@ class IntegrationHelperTests(unittest.TestCase):
                 self.assertEqual(0, repeated.returncode)
                 self.assertEqual(saved, journal.read_bytes())
                 self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
-                                  'integration_changed': False}, self.helper_state(repeated))
+                                  'integration_changed': False, 'filter_changed': False,
+                                  'cron_changed': False}, self.helper_state(repeated))
                 disabled = self.helper('disable')
                 self.assertEqual(0, disabled.returncode)
                 self.assertFalse(self.helper_state(disabled)['dns_changed'])

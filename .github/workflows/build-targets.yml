@@ -5,6 +5,22 @@ on:
     branches: [main]
     paths:
       - 'src/os-mihomo/**'
+      - 'src/os-sing-box/**'
+      - 'src/os-easytier/**'
+      - 'src/os-staticarp/**'
+      - 'src/os-lucky/**'
+      - 'src/os-ddns-go/**'
+      - 'src/os-ddclient-opnwall/**'
+      - 'src/os-unboundcustom/**'
+      - 'src/common/process_control.py'
+      - 'src/common/process_identity.py'
+      - 'src/common/route_control.py'
+      - 'src/common/tun_policy_routing.py'
+      - 'src/common/tests/**'
+      - 'tests/check-shared-route-packages.py'
+      - 'tests/test_shared_route_packages.py'
+      - 'packaging/plugins.json'
+      - 'verify-repo.py'
       - 'src/os-kazuha-repo/**'
       - '.github/workflows/build-targets.yml'
 permissions:
@@ -54,16 +70,46 @@ jobs:
           run: |
             set -eu
             sh src/os-mihomo/build.sh
+            ABI="$TARGET_ABI" sh src/os-sing-box/build.sh
+            ABI="$TARGET_ABI" sh src/os-easytier/build.sh
+            TARGET_ABI="$TARGET_ABI" sh src/os-staticarp/build.sh
+            ABI="$TARGET_ABI" sh src/os-lucky/build.sh
+            ABI="$TARGET_ABI" sh src/os-ddns-go/build.sh
+            TARGET_ABI='FreeBSD:*:amd64' sh src/os-ddclient-opnwall/build.sh
+            sh src/os-unboundcustom/build.sh
             sh src/os-kazuha-repo/build.sh
+            python${TARGET_PYTHON} -B -m unittest discover -s src/common/tests -v
             python${TARGET_PYTHON} -B -m unittest discover -s src/os-mihomo/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-sing-box/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-easytier/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-staticarp/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-lucky/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-ddns-go/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-ddclient-opnwall/tests -v
+            python${TARGET_PYTHON} -B -m unittest discover -s src/os-unboundcustom/tests -v
             python${TARGET_PYTHON} -B -m unittest discover -s src/os-kazuha-repo/tests -v
             python${TARGET_PYTHON} -B -m unittest discover -s tests -v
+            test -z "$(git status --porcelain --untracked-files=all)" || {
+              git status --short
+              exit 1
+            }
+            mkdir -p native-artifacts
+            python${TARGET_PYTHON} -B tests/check-shared-route-packages.py \
+              --source-commit "$(git rev-parse HEAD)" \
+              --output native-artifacts/shared-route-binding.json \
+              src/os-mihomo/dist/"$TARGET_ABI"/os-mihomo-*.pkg \
+              src/os-sing-box/dist/os-sing-box-*.pkg \
+              src/os-easytier/dist/os-easytier.pkg
             python${TARGET_PYTHON} -B verify-repo.py --help
       - name: Archive candidates with their native directory layout
         run: |
           mkdir -p native-artifacts
           tar -czf "native-artifacts/unsigned-candidates-${TARGET_PROFILE}.tar.gz" \
-            src/os-mihomo/dist src/os-kazuha-repo/dist
+            native-artifacts/shared-route-binding.json \
+            src/os-mihomo/dist src/os-sing-box/dist src/os-easytier/dist \
+            src/os-staticarp/dist src/os-lucky/dist src/os-ddns-go/dist \
+            src/os-ddclient-opnwall/dist src/os-unboundcustom/dist \
+            src/os-kazuha-repo/dist
       - uses: actions/upload-artifact@v4
         with:
           name: unsigned-candidates-${{ matrix.profile }}

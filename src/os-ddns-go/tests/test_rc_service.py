@@ -43,12 +43,72 @@ if sys.argv[1]=='reconcile' and os.environ.get('TEST_APPLY')=='1':
     Path(os.environ['TEST_CONFIGURATION']).write_text('RESTORED_CONFIGURATION')
 """)
         daemon = self.root / 'daemon'
+        self.daemon = daemon
         daemon.write_text('#!' + sys.executable + '\n' + r"""import json,os,sys
 from pathlib import Path
-with (Path(os.environ['TEST_ROOT'])/'events').open('a') as output:output.write(json.dumps({'call':'daemon','args':sys.argv[1:]})+'\n')
-sys.exit(6 if os.environ.get('TEST_DAEMON_FAIL') else 0)
+root=Path(os.environ['TEST_ROOT']); a=sys.argv[1:]
+with (root/'events').open('a') as output: output.write(json.dumps({'call':'daemon','args':a})+'\n')
+if os.environ.get('TEST_DAEMON_FAIL'): sys.exit(6)
+pidfile=Path(a[a.index('-P')+1]); tag=a[a.index('-t')+1]; argv=a[a.index('-t')+2:]
+state={'111': {'pid':111,'ppid':1,'uid':os.geteuid(),'birth':'1770000000:1','stopped':False,
+ 'executable':'/usr/sbin/daemon','argv':['daemon: '+tag+'[222]']},
+ '222': {'pid':222,'ppid':111,'uid':os.geteuid(),'birth':'1770000000:2','stopped':False,
+ 'executable':str(Path(argv[0]).resolve()),'argv':argv}}
+(root/'kernel.json').write_text(json.dumps(state)); pidfile.write_text('111\n')
 """)
         daemon.chmod(0o755)
+        common = PACKAGE.parent / 'common'
+        controller = self.root / 'process_control_actual.py'
+        controller.write_bytes((common / 'process_control.py').read_bytes())
+        identity = self.root / 'process_identity.py'
+        identity.write_text(r"""import json,os
+from pathlib import Path
+def state():
+    path=Path(os.environ['TEST_ROOT'])/'kernel.json'
+    return json.loads(path.read_text()) if path.exists() else {}
+def process(pid):
+    if type(pid) is not int or not 0 < pid < 2147483648: raise RuntimeError('invalid PID')
+    return state().get(str(pid))
+""")
+        wrapper = self.root / 'process_control.py'
+        self.controller = wrapper
+        wrapper.write_text(r"""import json,os,signal,sys
+from pathlib import Path
+import process_control_actual as actual
+from process_identity import state
+root=Path(os.environ['TEST_ROOT'])
+with (root/'events').open('a') as output: output.write(json.dumps({'call':'control:'+sys.argv[1]})+'\n')
+actual.boot=lambda:'fixture-boot'
+actual.children=lambda pid:[int(key) for key,value in state().items() if value['ppid']==pid]
+def send(pid,sig):
+    assert type(pid) is int and 0 < pid < 2147483648
+    values=state(); item=values.get(str(pid))
+    if item is None: raise ProcessLookupError
+    if sig==signal.SIGSTOP: item['stopped']=True
+    elif sig==signal.SIGCONT:
+        item['stopped']=False
+        if item.pop('term',False): values.pop(str(pid),None)
+    elif sig==signal.SIGTERM:
+        if item['executable']=='/usr/sbin/daemon':
+            with (root/'events').open('a') as output:output.write(json.dumps({'call':'supervisor_stop'})+'\n')
+            if item['stopped']:item['term']=True
+            else:values.pop(str(pid),None)
+        else:
+            with (root/'events').open('a') as output:output.write(json.dumps({'call':'writer_stop'})+'\n')
+            Path(os.environ['TEST_CONFIGURATION']).write_text('OLD_SHUTDOWN_CONFIGURATION')
+            if os.environ.get('TEST_STUCK')!='yes':values.pop(str(pid),None)
+    (root/'kernel.json').write_text(json.dumps(values))
+actual.os.kill=send
+clock=[0]
+def tick(): clock[0]+=.25; return clock[0]
+actual.time.monotonic=tick; actual.time.sleep=lambda value:None
+original=actual.persist
+def persist(path,value):
+    if os.environ.get('TEST_RECORD_FAIL')=='yes' and sys.argv[1]=='record':raise OSError('fixture disk failure')
+    return original(path,value)
+actual.persist=persist
+sys.exit(actual.main())
+""")
         framework = self.root / 'rc.subr'
         prefix = '. /etc/rc.subr\n' if NATIVE else ''
         framework.write_text(prefix + r"""load_rc_config() {
@@ -56,27 +116,6 @@ sys.exit(6 if os.environ.get('TEST_DAEMON_FAIL') else 0)
     if [ -f "$TEST_RC" ]; then . "$TEST_RC"; fi
 }
 checkyesno() { eval "value=\${$1}"; [ "$value" = "YES" ]; }
-pgrep() { [ "$2" = 111 ] && echo 222; }
-kill() {
-    if [ "$1" = "-0" ]; then
-        case "$2" in
-            111) [ -f "$TEST_ROOT/parent-alive" ]; return $? ;;
-            222) [ -f "$TEST_ROOT/child-alive" ]; return $? ;;
-            *) return 1 ;;
-        esac
-    fi
-    if [ "$2" = 111 ]; then
-        printf '{"call":"supervisor_stop"}\n' >> "$TEST_ROOT/events"
-        rm -f "$TEST_ROOT/parent-alive"
-    elif [ "$2" = 222 ]; then
-        printf '{"call":"writer_stop"}\n' >> "$TEST_ROOT/events"
-        printf '%s' OLD_SHUTDOWN_CONFIGURATION > "$TEST_CONFIGURATION"
-        [ "${TEST_STUCK:-}" = yes ] || rm -f "$TEST_ROOT/child-alive"
-    else
-        return 1
-    fi
-}
-sleep() { :; }
 """)
         if not NATIVE:
             with framework.open('a') as output:
@@ -104,6 +143,9 @@ sleep() { :; }
         driver = f'/usr/local/bin/python3 /usr/local/opnsense/scripts/{ROUTE}/config_mirror.py'
         self.assertGreater(script.count(driver), 0)
         script = script.replace(driver, shlex.quote(sys.executable) + ' ' + shlex.quote(str(mirror)))
+        process_driver = f'/usr/local/bin/python3 /usr/local/opnsense/scripts/{ROUTE}/process_control.py'
+        self.assertGreater(script.count(process_driver), 0)
+        script = script.replace(process_driver, shlex.quote(sys.executable) + ' ' + shlex.quote(str(wrapper)))
         fallback = '/usr/local/etc/lucky' if ROUTE == 'lucky' else '/usr/local/etc/ddns-go/config.yaml'
         script = script.replace(fallback, str(self.root / 'default-application'))
         self.candidate = self.root / SERVICE
@@ -122,12 +164,17 @@ sleep() { :; }
         return subprocess.run(['sh', str(self.candidate), action], env={**self.environment, **environment}, capture_output=True, text=True, timeout=10)
 
     def calls(self):
-        return [json.loads(line) for line in self.events.read_text().splitlines()] if self.events.exists() else []
+        return [json.loads(line) for line in self.events.read_text().splitlines() if not json.loads(line)['call'].startswith('control:')] if self.events.exists() else []
 
     def running(self):
+        Path(str(self.pid) + '.identity.json').unlink(missing_ok=True)
+        arguments = ['-cd', str(self.application), '-port', '16601'] if ROUTE == 'lucky' else ['-c', str(self.config), '-l', ':9876', '-f', '300']
+        values = {'111': {'pid': 111, 'ppid': 1, 'uid': os.geteuid(), 'birth': '1770000000:1', 'stopped': False,
+            'executable': '/usr/sbin/daemon', 'argv': ['daemon: ' + ROUTE + ':daemon[222]']},
+            '222': {'pid': 222, 'ppid': 111, 'uid': os.geteuid(), 'birth': '1770000000:2', 'stopped': False,
+                'executable': str(self.daemon.resolve()), 'argv': [str(self.daemon), *arguments]}}
+        (self.root / 'kernel.json').write_text(json.dumps(values))
         self.pid.write_text('111\n')
-        (self.root / 'parent-alive').touch()
-        (self.root / 'child-alive').touch()
 
     def test_status_does_not_initialize_or_mirror_configuration(self):
         self.rc.unlink()
@@ -145,6 +192,7 @@ sleep() { :; }
         calls = self.calls()
         self.assertEqual([event['call'] for event in calls], ['reconcile', 'load_rc', 'daemon', 'mirror'])
         arguments = calls[2]['args']
+        self.assertNotIn('-r', arguments)
         if ROUTE == 'lucky':
             self.assertEqual(arguments[-4:], ['-cd', str(self.application), '-port', '16602'])
         else:
@@ -211,6 +259,35 @@ sleep() { :; }
         self.assertNotIn('reconcile', calls)
         self.assertFalse(self.pid.exists())
         self.assertEqual(self.config.read_text(), 'OLD_SHUTDOWN_CONFIGURATION')
+
+    def test_positive_pid_guard_preserves_foreign_files_and_blocks_import(self):
+        for value in ('0', '-1', '2147483648', 'text'):
+            with self.subTest(value=value):
+                self.events.unlink(missing_ok=True)
+                self.pid.write_text(value + '\n')
+                original = self.config.read_bytes()
+                result = self.request('restart')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.pid.read_text(), value + '\n')
+                self.assertEqual(self.config.read_bytes(), original)
+                self.assertEqual(self.calls(), [{'call': 'load_rc'}])
+
+    def test_start_guard_blocks_reconciliation_with_a_running_writer(self):
+        self.running()
+        before = self.config.read_bytes()
+        result = self.request('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.calls())
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_failed_identity_record_stops_spawned_instance_without_mirroring(self):
+        result = self.request('start', TEST_RECORD_FAIL='yes')
+        self.assertNotEqual(result.returncode, 0)
+        calls = [event['call'] for event in self.calls()]
+        self.assertIn('writer_stop', calls)
+        self.assertNotIn('mirror', calls)
+        self.assertEqual(json.loads((self.root/'kernel.json').read_text()), {})
+        self.assertFalse(self.pid.exists())
 
 
 if __name__ == '__main__':

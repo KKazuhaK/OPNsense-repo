@@ -28,6 +28,12 @@ SYSTEM_CONFIG = Path('/conf/config.xml')
 MARKER = '__EASYTIER_KEEP_'
 REQUEST_ROOT = Path('/tmp')
 REQUEST_PREFIX = 'easytier_mvc_'
+
+# Load the adjacent helper when tests import this script without changing sys.path.
+import importlib.util
+_network_spec = importlib.util.spec_from_file_location('easytier_network', Path(__file__).with_name('network.py'))
+network = importlib.util.module_from_spec(_network_spec)
+_network_spec.loader.exec_module(network)
 SENSITIVE = re.compile(r'(secret|password|passwd|token|credential|private.?key|api.?key|authorization|username)', re.I)
 
 
@@ -207,7 +213,7 @@ def status():
             'pid': PID.read_text().strip() if PID.exists() else '',
             'hostname': scrub(str(data.get('hostname', '')), data),
             'ipv4': scrub(str(data.get('ipv4', '')), data),
-            'network_name': scrub(str(identity.get('network_name', '')), data)}
+            'network_name': scrub(str(identity.get('network_name', '')), data), **network.public_status()}
 
 
 def request_text(argument):
@@ -234,6 +240,7 @@ def save_configuration(text):
     # Parse before and after restoring masked values. Never send parser errors
     # back because they may include credentials from the submitted document.
     parsed = restore(tomllib.loads(text), replacements)
+    network.validate_live_configuration(parsed)
     output = render(parsed)
     tomllib.loads(output)
     CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -302,6 +309,12 @@ def dispatch(action, argument=None):
             pass
         return {'status': 'ok'}
     if action in {'start', 'stop', 'restart'}:
+        if action == 'restart':
+            enabled = run(['/usr/sbin/sysrc', '-n', '-f', '/etc/rc.conf.d/easytier', 'easytier_enable'], 5)
+            if enabled.returncode or enabled.stdout.strip().upper() not in {'YES', 'TRUE', 'ON', '1'} or not running():
+                return {'status': 'failed', 'error': 'EasyTier is stopped or disabled. Use Start to enable it explicitly.'}
+        if action in {'start', 'restart'}:
+            network.validate_live_configuration(stored())
         if action in {'start', 'stop'}:
             enabled = 'YES' if action == 'start' else 'NO'
             SAVE_LOCK.parent.mkdir(parents=True, exist_ok=True)
@@ -332,6 +345,8 @@ def main():
         else:
             result = dispatch(action, argument)
         print(json.dumps(result, ensure_ascii=False))
+    except network.PolicyError as error:
+        print(json.dumps({'status': 'failed', 'error': str(error)}))
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
         if len(sys.argv) > 1 and sys.argv[1] == 'rpc-portal':
             print('Unable to read the EasyTier RPC portal.', file=sys.stderr)

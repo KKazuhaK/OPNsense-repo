@@ -25,6 +25,12 @@ $(function () {
             }
             $('#singbox-config').val(htmlDecode(data.config || ''));
             configRevision = data.revision || '';
+            const integration = data.integration || {};
+            $('#singbox-transparent').prop('checked', !!integration.transparent);
+            $('#singbox-consent').prop('checked', !!integration.transparent_consent);
+            $('#singbox-ipv6').prop('checked', !!integration.ipv6);
+            $('#singbox-device-mode').val(integration.device_mode || 'off');
+            $('#singbox-device-list').val((integration.device_list || []).join('\n'));
             $('#singbox-url').val('').attr('placeholder', data.has_url
                 ? '{{ lang._('Leave empty to keep the stored URL') }}'
                 : '{{ lang._('Enter a direct Sing-box JSON subscription URL') }}');
@@ -34,10 +40,14 @@ $(function () {
     function refresh() {
         ajaxGet('/api/singbox/service/status', {}, function (data) {
             data = data || {};
-            $('#singbox-service').attr('class', 'label label-' + (data.running ? 'success' : 'default'))
+            $('#singbox-service').attr('class', 'label label-' + (data.paused || data.restart_required || data.recovery_pending ? 'warning' : data.running ? 'success' : 'default'))
                 .text(data.status !== 'ok' ? '{{ lang._('Unavailable') }}'
+                    : data.recovery_pending ? '{{ lang._('Routing recovery pending') }}'
+                    : data.paused ? (data.routing_fallback ? '{{ lang._('Suspended; native routing') }}' : '{{ lang._('Suspended; routing recovery in progress') }}')
+                    : data.restart_required ? '{{ lang._('Running; restart to resume capture') }}'
                     : data.running ? '{{ lang._('Running') }}' : '{{ lang._('Stopped') }}');
-            $('#singbox-warning').toggle(data.status !== 'ok').text(htmlDecode(data.error || ''));
+            $('#singbox-warning').toggle(data.status !== 'ok' || !!data.routing_error)
+                .text(htmlDecode(data.error || data.routing_error || ''));
         });
         ajaxGet('/api/singbox/service/updateStatus', {}, function (data) {
             data = data || {};
@@ -76,6 +86,15 @@ $(function () {
             clear_url: $('#singbox-clear-url').is(':checked') ? 1 : 0
         }}, '{{ lang._('Subscription settings saved.') }}', true);
     });
+    $('#singbox-save-integration').on('click', function () {
+        call($(this), '/api/singbox/settings/setIntegration', {integration: {
+            transparent: $('#singbox-transparent').is(':checked') ? 1 : 0,
+            transparent_consent: $('#singbox-consent').is(':checked') ? 1 : 0,
+            ipv6: $('#singbox-ipv6').is(':checked') ? 1 : 0,
+            device_mode: $('#singbox-device-mode').val(),
+            device_list: $('#singbox-device-list').val()
+        }}, '{{ lang._('LAN capture settings saved. Restart the service to apply them.') }}', true);
+    });
     load();
     refresh();
     setInterval(function () { if (!document.hidden) { refresh(); } }, 10000);
@@ -106,9 +125,28 @@ $(function () {
                             <button type="button" class="btn btn-default singbox-action" data-action="start" data-done="{{ lang._('Service started.') }}"><i class="fa fa-play"></i> {{ lang._('Start') }}</button>
                             <button type="button" class="btn btn-default singbox-action" data-action="stop" data-done="{{ lang._('Service stopped.') }}"><i class="fa fa-stop"></i> {{ lang._('Stop') }}</button>
                             <button type="button" class="btn btn-default singbox-action" data-action="restart" data-done="{{ lang._('Service restarted.') }}"><i class="fa fa-refresh"></i> {{ lang._('Restart') }}</button>
-                            <div class="hidden" data-for="help_for_singbox_service">{{ lang._('Start uses the saved JSON configuration and existing TUN interface. Restart applies a saved configuration. Stop leaves the configuration intact. Sing-box cannot start while Mihomo is running.') }}</div>
+                            <div class="hidden" data-for="help_for_singbox_service">{{ lang._('Start uses a private runtime copy of the saved JSON. Proxy-only mode leaves router routing and DNS unchanged. Restart applies saved settings; Stop restores native routing. Transparent capture cannot run while Mihomo is running.') }}</div>
                         </td>
                     </tr>
+                    <tr><td>{{ lang._('Transparent LAN capture') }}</td><td>
+                        <label><input type="checkbox" id="singbox-transparent"> {{ lang._('Enable transparent LAN capture') }}</label>
+                        <p>{{ lang._('Default is proxy only. Capture uses a separate routing table and preserves router traffic, WAN replies and native firewall policy. Saved JSON must contain one gVisor TUN inbound with real-address DNS.') }}</p>
+                        <label><input type="checkbox" id="singbox-consent"> {{ lang._('I want the selected LAN devices to use transparent capture') }}</label>
+                    </td></tr>
+                    <tr><td>{{ lang._('Device policy') }}</td><td>
+                        <select id="singbox-device-mode" class="form-control">
+                            <option value="off">{{ lang._('All LAN devices') }}</option>
+                            <option value="whitelist">{{ lang._('Proxy only listed devices') }}</option>
+                            <option value="blacklist">{{ lang._('Bypass listed devices') }}</option>
+                        </select>
+                        <textarea id="singbox-device-list" rows="4" class="form-control" spellcheck="false"></textarea>
+                        <p>{{ lang._('Enter device IP addresses or CIDRs, one per line. Excluded devices bypass TUN before capture. An empty list selects all LAN devices. Existing captured connections are cleared when applying changed policy.') }}</p>
+                    </td></tr>
+                    <tr><td>{{ lang._('IPv6 capture') }}</td><td>
+                        <label><input type="checkbox" id="singbox-ipv6"> {{ lang._('Include selected IPv6 device traffic') }}</label>
+                        <p>{{ lang._('Requires an IPv6 address on the saved TUN inbound. IPv6 otherwise keeps the native path; DHCP and router advertisements are unchanged.') }}</p>
+                        <button type="button" class="btn btn-primary" id="singbox-save-integration">{{ lang._('Save capture settings') }}</button>
+                    </td></tr>
                     <tr>
                         <td><a id="help_for_singbox_config" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Configuration') }}</td>
                         <td>

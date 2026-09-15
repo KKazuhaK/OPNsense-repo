@@ -1,4 +1,4 @@
-"""Exercise the real RC dispatch and stop with harmless isolated commands."""
+"""Exercise real RC dispatch and restoration order with a scoped controller fixture."""
 import os
 from pathlib import Path
 import subprocess
@@ -75,6 +75,17 @@ if os.environ['TEST_ABSENT_RC']=='1': rc.unlink(missing_ok=True)
 else: rc.write_bytes(Path(os.environ['TEST_RESTORED_RC']).read_bytes())
 Path(os.environ['TEST_DEFAULT_CONFIG']).write_text('RESTORED_CONFIGURATION')
 ''')
+        integration = root / 'integration.py'
+        integration.write_text("""import os,sys
+from pathlib import Path
+args=sys.argv[1:]
+assert args[0]=='stop'
+if os.environ['TEST_FAIL_STOP']=='1': sys.exit(1)
+config=Path(args[args.index('--config')+1]); pid=Path(args[args.index('--pidfile')+1])
+with Path(os.environ['TEST_EVENTS']).open('a') as output: output.write(f'stop:{config}:{pid}\\n')
+config.write_text('OLD_SHUTDOWN_CONFIGURATION')
+Path(os.environ['TEST_ALIVE']).unlink(missing_ok=True)
+""")
         source = (PACKAGE / 'src/usr/local/etc/rc.d/sing-box').read_text()
         source = source.replace('. /etc/rc.subr', f'. "{subr}"', 1)
         source = source.replace('pidfile="/var/run/sing-box.pid"', 'pidfile="$TEST_DEFAULT_PID"', 1)
@@ -82,6 +93,8 @@ Path(os.environ['TEST_DEFAULT_CONFIG']).write_text('RESTORED_CONFIGURATION')
         source = source.replace('start_cmd="${name}_start"', 'start_cmd="fixture_start"', 1)
         source = source.replace('/usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py',
                                 f'"{sys.executable}" "{mirror}"')
+        source = source.replace('/usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/integration.py',
+                                f'"{sys.executable}" "{integration}"')
         candidate = root / 'sing-box'
         candidate.write_text(source)
         environment = {**os.environ, 'TEST_EVENTS': str(events), 'TEST_RC': str(rc),

@@ -26,6 +26,15 @@ if [ -f /etc/rc.conf.d/sing_box ]; then
     install -m 0600 /etc/rc.conf.d/sing_box "$BACKUP_DIR/sing_box"
 fi
 rm -f "$BACKUP_DIR/running"
-if service sing-box status >/dev/null 2>&1; then
+PROCESS_ALIVE="no"
+if [ -f /usr/local/opnsense/scripts/singbox/integration.py ]; then
+    status_json="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/integration.py status 2>/dev/null || true)"
+    if printf '%s' "$status_json" | /usr/local/bin/python3 -c \
+        'import json,sys; value=json.load(sys.stdin); sys.exit(0 if value.get("ok") is True and value.get("process_alive") is True else 1)' \
+        >/dev/null 2>&1; then
+        PROCESS_ALIVE="yes"
+    fi
+fi
+if [ "$PROCESS_ALIVE" = "yes" ] || service sing-box status >/dev/null 2>&1; then
     touch "$BACKUP_DIR/running"
 fi

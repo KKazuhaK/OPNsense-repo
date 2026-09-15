@@ -22,40 +22,23 @@ stop_cmd=ddclient_opn_stop
 
 ddclient_opn_poststart()
 {
-  # give the daemon some time to initialize its configuration
-  for i in 1 2 3 4 5; do
-    sleep 1
-
-    if [ -s ${rc_pid} ]; then
-      break
-    fi
-  done
+    # The daemon creates pidfile after forking; rc_pid is a numeric PID, not a path.
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/ddclient/process_owner.py \
+        record "$pidfile" "$command" "$command_interpreter" || {
+            # A failed ownership receipt must not leave a daemon running outside
+            # future Stop operations. Cleanup still verifies the same PID first.
+            /usr/local/bin/python3 /usr/local/opnsense/scripts/ddclient/process_owner.py \
+                stop "$pidfile" "$command" "$command_interpreter" >/dev/null 2>&1 || true
+            return 1
+        }
 }
 
 ddclient_opn_stop()
 {
-    if [ -z "$rc_pid" ]; then
-        [ -n "$rc_fast" ] && return 0
-        _run_rc_notrunning
-        return 1
-    fi
-    echo -n "Stopping ${name}."
-    kill -15 ${rc_pid}
-    # wait max 2 seconds for gentle exit
-    for i in $(seq 1 20);
-    do
-      if [ -z "`/bin/ps -ex | /usr/bin/awk '{print $1;}' | /usr/bin/grep "^${rc_pid}"`" ]; then
-        break
-      fi
-      sleep 0.1
-    done
-
-    for ddclient_pid in `/bin/ps -ex | grep 'ddclient_opn.py' | /usr/bin/awk '{print $1;}' `
-    do
-      kill -9 $ddclient_pid >/dev/null 2>&1
-    done
-
-    echo  "..done"
+    # Verify exact executable, NUL-delimited argv, birth and PID file before
+    # each signal. Other DDClient instances and unrelated children are preserved.
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/ddclient/process_owner.py \
+        stop "$pidfile" "$command" "$command_interpreter"
 }
 
 run_rc_command $1

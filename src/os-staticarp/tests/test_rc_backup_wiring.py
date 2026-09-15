@@ -1,4 +1,5 @@
 """Run real service scripts with isolated command stubs and no live services."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,12 @@ REPOSITORY = Path(__file__).resolve().parents[3]
 
 
 class RcBackupWiringTests(unittest.TestCase):
+    def test_post_install_reconciles_runtime_even_when_saved_settings_are_disabled(self):
+        hook = (REPOSITORY / 'src/os-staticarp/packaging/freebsd/+POST_INSTALL').read_text()
+        self.assertEqual(hook.count('/usr/local/sbin/staticarpctl apply'), 1)
+        self.assertNotIn("grep -q '^enabled=YES$'", hook)
+        self.assertIn('Unable to apply the saved ARP bindings', hook)
+
     def test_staticarp_status_does_not_create_configuration_or_update_the_backup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -25,96 +32,18 @@ class RcBackupWiringTests(unittest.TestCase):
             self.assertFalse(configuration.exists())
 
     def test_restart_stops_writers_before_import_and_reloads_restored_rc_values(self):
-        for package, route, service in [('os-lucky', 'lucky', 'os-lucky'), ('os-ddns-go', 'ddnsgo', 'os-ddns-go')]:
-            for enabled, action in [('YES', 'restart'), ('NO', 'restart'), ('NO', 'onerestart')]:
-                with self.subTest(route=route, enabled=enabled, action=action), tempfile.TemporaryDirectory() as temporary:
-                    root = Path(temporary)
-                    application = root / 'application'
-                    application.mkdir()
-                    configuration = application / 'config.conf'
-                    configuration.write_text('OLD_RUNNING_CONFIGURATION')
-                    rc = root / 'service.rc'
-                    restored_rc = root / 'restored.rc'
-                    if route == 'lucky':
-                        original = f'lucky_enable="YES"\nlucky_conf_dir="{application}"\nlucky_http_port="16601"\n'
-                        restored = original.replace('enable="YES"', f'enable="{enabled}"').replace('16601', '16602')
-                        new_argument = '16602'
-                    else:
-                        original = f'ddnsgo_enable="YES"\nddnsgo_config="{configuration}"\nddnsgo_listen=":9876"\nddnsgo_interval="300"\nddnsgo_extra_args=""\n'
-                        restored = original.replace('enable="YES"', f'enable="{enabled}"').replace(':9876', ':9877')
-                        new_argument = ':9877'
-                    rc.write_text(original)
-                    restored_rc.write_text(restored)
-                    (root / 'supervisor.pid').write_text('111\n')
-                    (root / 'alive').touch()
-                    events = root / 'events'
-                    events.touch()
-                    stub = root / 'rc.subr'
-                    stub.write_text('''load_rc_config() { . "$TEST_RC"; }
-checkyesno() { eval "value=\\${$1}"; [ "$value" = "YES" ]; }
-pgrep() { echo 222; }
-kill() {
-    if [ "$1" = "-0" ]; then
-        [ "$2" = "111" ] && [ -f "$TEST_ALIVE" ]
-        return $?
-    fi
-    if [ "$2" = "111" ]; then
-        rm -f "$TEST_ALIVE"
-    else
-        printf '%s\\n' writer_stop >> "$TEST_EVENTS"
-        printf '%s' OLD_SHUTDOWN_CONFIGURATION > "$TEST_CONFIGURATION"
-    fi
-}
-run_rc_command() {
-    if [ "$1" = "restart" ] && ! checkyesno "$rcvar"; then return 1; fi
-    "$restart_cmd"
-}
-''')
-                    mirror = root / 'config_mirror.py'
-                    mirror.write_text('''import os,sys
-from pathlib import Path
-events=Path(os.environ['TEST_EVENTS'])
-with events.open('a') as output: output.write(sys.argv[1]+'\\n')
-configuration=Path(os.environ['TEST_CONFIGURATION'])
-if sys.argv[1]=='reconcile':
-    Path(os.environ['TEST_RC']).write_bytes(Path(os.environ['TEST_RESTORED_RC']).read_bytes())
-    configuration.write_text('RESTORED_CONFIGURATION')
-elif configuration.read_text()!='RESTORED_CONFIGURATION':
-    sys.exit(1)
-''')
-                    daemon = root / 'daemon'
-                    daemon.write_text('''#!/bin/sh
-printf '%s\\n' daemon >> "$TEST_EVENTS"
-printf '%s\\n' "$*" > "$TEST_ARGUMENTS"
-''')
-                    daemon.chmod(0o755)
-                    source = REPOSITORY / 'src' / package / 'src/usr/local/etc/rc.d' / service
-                    script = source.read_text()
-                    script = script.replace('. /etc/rc.subr', f'. "{stub}"', 1)
-                    script = script.replace('pidfile="/var/run/${name}.pid"', 'pidfile="$TEST_PID"', 1)
-                    script = script.replace('logfile="/var/log/${name}.log"', 'logfile="$TEST_LOG"', 1)
-                    script = script.replace('command="/usr/sbin/daemon"', f'command="{daemon}"', 1)
-                    binary = 'lucky' if route == 'lucky' else 'ddns-go'
-                    script = script.replace(f'{route}_bin="/usr/local/bin/{binary}"', f'{route}_bin="{daemon}"', 1)
-                    script = script.replace(f'/usr/local/bin/python3 /usr/local/opnsense/scripts/{route}/config_mirror.py',
-                                            f'"{sys.executable}" "{mirror}"')
-                    candidate = root / service
-                    candidate.write_text(script)
-                    environment = {**os.environ, 'TEST_RC': str(rc), 'TEST_RESTORED_RC': str(restored_rc),
-                                   'TEST_CONFIGURATION': str(configuration), 'TEST_EVENTS': str(events),
-                                   'TEST_ALIVE': str(root / 'alive'), 'TEST_PID': str(root / 'supervisor.pid'),
-                                   'TEST_LOG': str(root / 'log'), 'TEST_ARGUMENTS': str(root / 'arguments')}
-                    result = subprocess.run(['sh', str(candidate), action], env=environment, capture_output=True)
-                    self.assertEqual(result.returncode, 0, result.stderr.decode())
-                    calls = events.read_text().splitlines()
-                    self.assertLess(calls.index('writer_stop'), calls.index('reconcile'))
-                    self.assertLess(calls.index('reconcile'), calls.index('mirror'))
-                    self.assertEqual(configuration.read_text(), 'RESTORED_CONFIGURATION')
-                    should_start = enabled == 'YES' or action == 'onerestart'
-                    self.assertEqual('daemon' in calls, should_start)
-                    if should_start:
-                        self.assertLess(calls.index('daemon'), calls.index('mirror'))
-                        self.assertIn(new_argument, (root / 'arguments').read_text())
+        # Reuse each service's real-controller fixture instead of maintaining
+        # a second shell kill stub that can diverge from process ownership.
+        for package in ('os-lucky', 'os-ddns-go'):
+            with self.subTest(package=package):
+                source = REPOSITORY / 'src' / package / 'tests/test_rc_service.py'
+                spec = importlib.util.spec_from_file_location('cross_rc_' + package.replace('-', '_'), source)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                case = module.ServiceLifecycleTests('test_restart_stops_writers_before_import_and_obeys_restored_enable_choice')
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertTrue(result.wasSuccessful(), str(result.errors + result.failures))
 
 
 @unittest.skipUnless(sys.platform.startswith('freebsd'), 'Requires the genuine native OPNsense PHP includes')

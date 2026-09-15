@@ -6,12 +6,15 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 import yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'src/usr/local/opnsense/scripts/mihomo/routing.py'
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'common'))
+sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location('mihomo_routing', SCRIPT)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
@@ -90,6 +93,10 @@ class Kernel:
             output = b'/usr/local/bin/mihomo -d /var/db/os-mihomo' if self.alive else b''
         elif args == ['/sbin/ifconfig', m.TUN]:
             output = b'tun_mihomo: flags=8043\n inet 198.18.0.1 netmask 0xfffffffc\n inet6 fdfe:dcba:9876::1 prefixlen 126\n'
+        elif args == ['/sbin/pfctl', '-a', '*', '-sr']:
+            rules = [line for line in self.anchor.splitlines() if line.startswith('match ')]
+            output = (('anchor "mihomo" all {\n' + '\n'.join(rules) + '\n}\n')
+                      if rules else '').encode()
         elif args[:4] == ['/sbin/pfctl', '-a', m.ANCHOR, '-sr']:
             # Real pfctl -sr omits table definitions.
             output = ('\n'.join(line for line in self.anchor.splitlines() if line.startswith('match '))).encode()
@@ -144,6 +151,9 @@ class RoutingTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.kernel = Kernel()
         self.routing = m.Routing(self.root, self.kernel.run, self.kernel.delay)
+        # Route mechanics are isolated here; exact process ownership has its
+        # own journal and PID-reuse suite in test_process_owner.py.
+        self.routing.core_alive = lambda: self.kernel.alive
         self.routing.state.mkdir(parents=True)
         self.settings = {'service_enabled': True, 'transparent': True, 'transparent_consent': True,
                          'device_mode': 'off', 'device_list': []}
@@ -259,7 +269,7 @@ class RoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(m.RoutingError, r'The route operation failed with status 1\.$'):
             self.routing.execute('enable')
 
-    def test_unrecorded_copy_of_a_system_route_is_adopted_despite_kernel_flags(self):
+    def test_unrecorded_copy_of_a_system_route_is_preserved_as_foreign(self):
         value = route('10.5.0.0/24', '10.0.0.6', 'vtnet1', 'UG')
         self.kernel.tables[0][m.route_key(value)] = value
         key = m.route_key(value)
@@ -269,9 +279,11 @@ class RoutingTests(unittest.TestCase):
         # An add whose ownership write never landed leaves exactly this state.
         del record['routes'][key]
         self.routing.save(record)
-        self.assertTrue(self.routing.execute('enable')['active'])
+        with self.assertRaises(m.RoutingError):
+            self.routing.execute('enable')
         self.assertEqual(self.kernel.tables[fib][key]['gateway'], '10.0.0.6')
         self.assertEqual(self.kernel.tables[fib][key]['flags'], 'UGS')
+        self.assertNotIn(key, self.routing.load()['routes'])
 
     def test_empty_native_fib_without_columns_can_be_allocated(self):
         self.kernel.empty_header_only = True
@@ -457,7 +469,7 @@ class RoutingTests(unittest.TestCase):
         self.kernel.calls.clear()
         record = self.routing.load()
         desired = copy.deepcopy(self.kernel.tables[record['fib']])
-        self.routing.sync(record, desired)
+        self.routing.sync(record, desired, native=self.kernel.tables[0])
         self.assertEqual(sum(args[0] == '/usr/bin/netstat' for args in self.kernel.calls), 2)
         self.assertFalse(any(route_mutation(args) for args in self.kernel.calls))
 

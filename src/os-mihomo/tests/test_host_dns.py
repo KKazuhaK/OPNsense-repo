@@ -34,6 +34,23 @@ class HostDNSRecoveryTests(unittest.TestCase):
         self.routing_patch.start()
         self.addCleanup(self.routing_patch.stop)
         self.system.running = lambda: self.alive
+        self.system.claim_tun = mock.Mock()
+
+        def destroy_owned(prepare=None):
+            if not self.present:
+                return False, None
+            prepared, preparation_error = None, None
+            if prepare is not None:
+                try:
+                    prepared = prepare()
+                except (m.Error, OSError) as error:
+                    preparation_error = error
+            self.system.run(['/sbin/ifconfig', 'tun_mihomo', 'destroy'])
+            if preparation_error is not None:
+                raise preparation_error
+            return True, prepared
+
+        self.system.destroy_owned_tun = destroy_owned
         path_patch = mock.patch.object(m.System, '_host_dns_paths', return_value=
             (self.resolver, self.config, self.local, self.pending))
         path_patch.start()
@@ -171,24 +188,25 @@ class HostDNSRecoveryTests(unittest.TestCase):
         self.assertEqual(self.reload_count(), 0)
         self.assertFalse(self.pending.exists())
 
-    def test_running_or_foreign_core_prevents_host_reset(self):
-        for own, foreign in ((True, False), (False, True)):
-            with self.subTest(own=own, foreign=foreign):
-                self.present, self.alive, self.foreign_core = True, own, foreign
-                self.system.destroy_tun()
-                self.assertFalse(self.present)
-                self.assertEqual(self.reload_count(), 0)
-                self.assertEqual(self.pending.exists(), foreign)
-                self.pending.unlink(missing_ok=True)
+    def test_only_the_exact_owned_core_prevents_host_reset(self):
+        self.alive = True
+        self.system.destroy_tun()
+        self.assertFalse(self.present)
+        self.assertEqual(self.reload_count(), 0)
+        self.assertFalse(self.pending.exists())
 
-    def test_global_zombie_entry_retains_proof_until_child_is_reaped(self):
+        # A same-name process outside the ownership journal neither receives a
+        # signal nor gets to retain DNS written by the exited plugin core.
+        self.present, self.alive, self.foreign_core = True, False, True
+        self.system.destroy_tun()
+        self.assertFalse(self.present)
+        self.assertEqual(self.reload_count(), 1)
+        self.assertFalse(self.pending.exists())
+
+    def test_unowned_zombie_name_does_not_retain_dead_core_dns(self):
         self.foreign_core = True
         self.system.destroy_tun()
         self.assertFalse(self.present)
-        self.assertTrue(self.pending.exists())
-        self.assertEqual(self.reload_count(), 0)
-        self.foreign_core = False
-        self.system.destroy_tun()
         self.assertEqual(self.reload_count(), 1)
         self.assertFalse(self.pending.exists())
 
@@ -199,7 +217,10 @@ class HostDNSRecoveryTests(unittest.TestCase):
         candidate.write_text('mixed-port: 7890\nbind-address: 127.0.0.1\n'
                              'tun: {enable: true, auto-route: true}\n'
                              "dns: {enable: true, listen: '127.0.0.1:1053'}\n")
-        with mock.patch.object(m.socket, 'create_connection'):
+        owned = mock.Mock()
+        owned.record_started.return_value = {'owned': True}
+        with mock.patch.object(m.socket, 'create_connection'), \
+                mock.patch.object(self.system, '_core_group', return_value=owned):
             self.system.start(candidate, transparent=True)
         self.assertTrue(self.alive)
         self.assertTrue(self.pending.exists())
@@ -215,11 +236,11 @@ class HostDNSRecoveryTests(unittest.TestCase):
         self.assertFalse(self.pending.exists())
 
     def test_core_start_during_cleanup_defers_recovery(self):
-        self.destroy_edit = lambda: setattr(self, 'foreign_core', True)
+        self.destroy_edit = lambda: setattr(self, 'alive', True)
         self.system.destroy_tun()
         self.assertEqual(self.reload_count(), 0)
         self.assertTrue(self.pending.exists())
-        self.foreign_core, self.destroy_edit = False, None
+        self.alive, self.destroy_edit = False, None
         self.system.destroy_tun()
         self.assertEqual(self.reload_count(), 1)
 

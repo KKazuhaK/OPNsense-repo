@@ -40,22 +40,42 @@ python3 -B tests/run.py --native --device-policy --bandwidth
 结果和进度保存在临时目录。两项实际运行测试必须显式启用；包筛选不能静默
 省略已请求的实际运行测试。
 
+## 全新安装验收
+
+最终验收使用全新安装的 OPNsense，记录官方镜像摘要/签名、首次启动及插件
+安装前的包、配置和运行状态。被测插件不得有历史安装、恢复的插件设置或
+遗留运行文件。首次安装必须从签名的软件包仓库正常执行 `pkg install`，
+包含依赖解析和安装钩子。候选测试仓库的首装用于发布前验证；正式最终验收
+必须从已经发布的软件包仓库首装，两个阶段分别记录。
+升级、重装、进程命令夹具和 VNET jail 检查均属于附加覆盖，不能替代这项
+验收，也不能证明管理界面/configd/原生 PF 集成全部正常。
+
+Sing-box 的附加检查见 `src/os-sing-box/tests/native/README.md`。
+EasyTier 的实际 TUN/远端私网/PF/故障测试入口是
+`src/os-easytier/tests/native/native_network_fixture.py`。
+Staticarp 的逐接口 ARP/模式恢复测试是
+`src/os-staticarp/tests/native/test-owned-arp.py`；DDClient 的实例进程测试是
+`src/os-ddclient-opnwall/tests/native/test-process-owner.py`、
+`test-perl-backend.py` 和 `test-service-actions.py`。
+涉及写内核路由、ARP 或临时 PF 的脚本必须在专用一次性 VNET jail 中执行，
+并满足脚本的显式环境门禁；不得在生产系统直接启用这些夹具。
+
 ## 覆盖范围
 
 | 软件包 | 自动化验证的主要行为 |
 | --- | --- |
 | Mihomo | YAML 合并、凭据、订阅与服务失败、DNS/TUN 状态恢复、原生备份、实际设备策略、打包 |
-| Sing-box | 订阅转换、受保护配置修改、凭据保留、失败与临时文件清理、备份、原生设置迁移和安装钩子 |
+| Sing-box | 完整 JSON 订阅、受保护配置修改、设备名单在 TUN 前绕过、独立 FIB、DNS/回程保护、路由归属、故障恢复、备份与安装钩子 |
 | FRP | TOML、服务和启动状态、配置 XML 字段保真与并发、备份恢复、安装钩子 |
 | Speedtest | 阶段和单位解析、实际后台 fork 锁交接、执行失败与超时、进程组清理、原子结果写入、设置备份、实际测速 |
-| EasyTier | TOML 和凭据占位符、请求权限与失败、原子写入、服务及 RPC、日志脱敏、真实内核与自定义 RPC 端口、备份 |
+| EasyTier | TOML、禁用/启停意图、私网路由筛选、原生路由和接口归属、真实 TUN TCP/UDP/PF、Core 崩溃及 RPC 卡死恢复、备份 |
 | Ttyd | SSH 端口、命令参数、启动失败、PID 身份与陈旧 PID、真实 daemon 和 PTY/WebSocket、备份 watcher、固定摘要的 FreeBSD 15 打包 |
-| Staticarp | 绑定和接口校验、保存事务与权限回滚、恢复标记、PHP/Python/lockf 并发、内核命令与安装钩子、备份 |
-| Lucky | 类型和路径校验、原子设置、RC 引号、API 权限与失败、启动/停止、原生备份和 watcher |
-| DDNS-Go | 自定义 YAML 路径、凭据与占位符、RC 引号和监听地址、写入失败、API、服务和原生备份 watcher |
+| Staticarp | 绑定和接口校验、逐接口 ARP/模式归属及恢复、管理员修改保留、保存事务、PHP/Python/lockf 并发、安装钩子与备份 |
+| Lucky | 类型和路径校验、原子设置、精确 PID/创建身份、守护进程及子进程停止、锁超时、API、原生备份和 watcher |
+| DDNS-Go | 自定义 YAML 路径、凭据、精确 PID/创建身份、守护进程及子进程停止、RC 引号和监听地址、API 与原生备份 |
 | Lang | ZIP 成员、权限、大小与校验和、下载及完整安装流程、队列并发、目录创建竞争、进度、失败和中断、真实 daemon |
-| DDClient-opnwall | 提供商签名与错误、模板、实际模型校验、凭据 XML 保真、统计、API、原生 ABI 和安装路径 |
-| Unboundcustom | 片段生成与安装、复制/校验/重启失败回滚、模板、API、实际 XML 保真、原生 ABI 和安装钩子 |
+| DDClient-opnwall | 提供商签名、Python/Perl 创建身份、改写标题后的监督器停止、后端切换/禁用/Force、模板与 API、凭据 XML 保真、原生 ABI |
+| Unboundcustom | 片段及完整配置校验、重复 Apply 不重启、精确进程重启、真实 DNS 启动失败恢复、损坏记录拒绝、卸载归属、API 与安装钩子 |
 | Pftop | 全部视图/排序/数量组合、过滤器的字面参数、输出边界、异常输入和 API、实际只读 PF 快照、安装钩子 |
 | Kazuha Repo | 仓库配置、原生插件清单和锁、签名与构建流程、失败和安装钩子 |
 
@@ -70,10 +90,10 @@ XML compare-and-swap；发布测试核对源码、共享文件、依赖、归档
 Staticarp 保存/恢复、Lucky/DDNS-Go 配置解析、Lang 目录竞争、Ttyd PID
 身份、EasyTier RPC 启动参数，以及 Speedtest 临时文件与进程清理问题。
 
-完整原生运行与受影响套件补测覆盖当前 802 项 Python 检查，799 通过、
+完整原生运行与受影响套件补测覆盖当时的 802 项 Python 检查，799 通过、
 3 项条件跳过。完整运行包含 21 个 Python 套件、39 个入口命令和 793 项
 检查；随后复测最新 Mihomo 194 项、FRP 117 项、Speedtest 46 项和 Lang
-受影响套件，替换旧结果后得到当前总计。17 个独立 PHP/Core/API 检查和
+受影响套件，替换旧结果后得到当时的总计。17 个独立 PHP/Core/API 检查和
 全部 15 个 Volt 视图检查通过。
 3 项跳过分别为不在干净源码中的 2 个发布快照测试，以及原生队列中仅适用于
 模拟启动器的 1 个失败注入测试；该启动失败测试在可移植队列套件中已经执行。

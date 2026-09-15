@@ -16,7 +16,6 @@ from pathlib import Path
 import re
 import secrets
 import shlex
-import signal
 import socket
 import stat
 import subprocess
@@ -28,6 +27,7 @@ import zlib
 from urllib import parse as urlparse, request as urlrequest
 
 import yaml
+from process_owner import OwnershipError, core_group, valid_identity, watch_group
 
 MAX_CONFIG = 16 * 1024 * 1024
 MAX_BACKUP = 24 * 1024 * 1024
@@ -57,6 +57,10 @@ DAEMON_PID = "/var/run/mihomo.pid"
 WATCH_PID = "/var/run/mihomo-watch.pid"
 WATCH_CHILD_PID = "/var/run/mihomo-watch-child.pid"
 DEFAULT_UI_URL = "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
+ROUTING_DIAGNOSTIC_LIMIT = 512
+INTEGRATION_PREFIX = b'Mihomo integration state: '
+INTEGRATION_FIELDS = frozenset(('effective_forwarding', 'dns_changed',
+                                'integration_changed', 'filter_changed', 'cron_changed'))
 
 
 class Error(Exception):
@@ -65,6 +69,69 @@ class Error(Exception):
 
 class BackupIntegrityError(Error):
     pass
+
+
+def bounded_routing_diagnostic(value):
+    """Keep a native routing diagnosis single-line and safe for public status."""
+    text = ' '.join(''.join(character if character.isprintable() else ' '
+                            for character in str(value)).split())
+    return text.encode('utf-8', errors='replace')[:ROUTING_DIAGNOSTIC_LIMIT].decode('utf-8', errors='ignore')
+
+
+def routing_status_error(message, error):
+    detail = bounded_routing_diagnostic(error)
+    return message + (' ' + detail if detail else '')
+
+
+def integration_state(output):
+    """Accept exactly one complete, boolean decision from the bundled helper."""
+    lines = [line for line in output.splitlines() if line.startswith(INTEGRATION_PREFIX)]
+    if len(lines) != 1 or len(lines[0]) > 4096:
+        raise Error('The Mihomo integration helper returned no unique reload decision.')
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('duplicate key')
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(lines[0][len(INTEGRATION_PREFIX):].decode('utf-8', errors='strict'),
+                           object_pairs_hook=unique_object)
+    except (UnicodeError, ValueError, TypeError):
+        raise Error('The Mihomo integration helper returned an invalid reload decision.') from None
+    if (not isinstance(value, dict) or set(value) != INTEGRATION_FIELDS
+            or any(type(value[field]) is not bool for field in INTEGRATION_FIELDS)):
+        raise Error('The Mihomo integration helper returned an invalid reload decision.')
+    return value
+
+
+def reload_receipt(path, actions):
+    """Read a private reload receipt without following a replaced path."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 4096):
+            raise Error('A Mihomo integration reload receipt is invalid.')
+        content = stream.read(4097)
+        after = os.fstat(stream.fileno())
+    if len(content) > 4096 or any(getattr(before, field) != getattr(after, field) for field in
+            ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+        raise Error('A Mihomo integration reload receipt changed while it was read.')
+    try:
+        value = json.loads(content)
+    except (UnicodeError, ValueError, TypeError):
+        raise Error('A Mihomo integration reload receipt is invalid.') from None
+    if (not isinstance(value, dict) or set(value) != {'action', 'version'}
+            or value.get('version') != 1 or value.get('action') not in actions):
+        raise Error('A Mihomo integration reload receipt is invalid.')
+    return value['action']
 
 
 class LocalAPIHandler(urlrequest.HTTPRedirectHandler):
@@ -372,24 +439,6 @@ def known_devices(run, root=Path('/')):
     devices.sort(key=lambda d: (ipaddress.ip_address(d['address']).version,
                                 ipaddress.ip_address(d['address'])))
     return devices
-
-
-def device_rules(settings):
-    """Rules that decide which sources the proxy is allowed to carry.
-
-    Matching ends at the first rule that matches, so "listed devices follow the
-    provider rules" cannot be written as a match on the listed devices; it is
-    written as a match on everything else.
-    """
-    mode = settings.get('device_mode', 'off')
-    networks = device_networks(settings.get('device_list'))
-    if mode == 'off' or not networks:
-        return []
-    if mode == 'blacklist':
-        return ['SRC-IP-CIDR,%s,DIRECT' % net for net in networks]
-    matchers = ['(SRC-IP-CIDR,%s)' % net for net in networks]
-    inner = matchers[0] if len(matchers) == 1 else '(OR,(%s))' % ','.join(matchers)
-    return ['NOT,(%s),DIRECT' % inner]
 
 
 def routing_settings(settings):
@@ -789,7 +838,9 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
         port = listener.get('port', 0)
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535 or port == 53:
             raise Error("Additional listeners cannot bind port 53.")
-    result['rules'] = ([] if tun.get('enable') else device_rules(settings)) + result.get('rules', [])
+    # Device selection belongs to native source routing before the TUN. It must
+    # never rewrite provider rules or restrict clients using an explicit proxy.
+    result['rules'] = result.get('rules', [])
     if router_dns:
         if ipv6_advertised and not (result.get('ipv6') is True and dns.get('ipv6') is True):
             raise Error("Clients are being offered IPv6 while Mihomo IPv6 is disabled. Validate IPv6 before enabling router DNS.")
@@ -820,8 +871,30 @@ def atomic_write(path, content, mode=0o600):
 
 
 class System:
+    def __init__(self, process_reader=None):
+        self.process_reader = process_reader
+
+    def _core_group(self, config=None):
+        return core_group(process_reader=self.process_reader, signaler=os.kill,
+                          sleeper=time.sleep, config=str(config or Path(STATE) / 'config.yaml'))
+
+    def _watch_group(self):
+        return watch_group(process_reader=self.process_reader, signaler=os.kill,
+                           sleeper=time.sleep)
+
+    @staticmethod
+    def _ownership(operation):
+        try:
+            return operation()
+        except OwnershipError as error:
+            raise Error('Exact Mihomo process ownership could not be established; no process was signalled.') from error
+
     def routing(self, action):
-        return self.run(['/usr/local/bin/python3', ROUTING_HELPER, action], timeout=90)
+        result = self.run(['/usr/local/bin/python3', ROUTING_HELPER, action], timeout=90, check=False)
+        if result.returncode:
+            detail = bounded_routing_diagnostic(result.stderr.decode(errors='replace'))
+            raise Error(detail or 'Transparent routing failed without a native diagnostic.')
+        return result
 
     def run(self, args, timeout=45, check=True, cwd=None, input=None):
         try:
@@ -837,22 +910,21 @@ class System:
             raise Error("A system operation failed; the previous configuration was retained.")
         return result
 
-    def valid_pid(self, path, expected):
-        try:
-            pid = int(Path(path).read_text().strip())
-            if pid <= 1:
-                return None
-            result = self.run(["/bin/ps", "-p", str(pid), "-o", "command="], check=False)
-            command = shlex.split(result.stdout.decode(errors='replace'))
-            matches = expected in command if expected == SCRIPT else bool(command and (command[0] == expected or (expected == 'daemon' and Path(command[0]).name in {'daemon', 'daemon:'})))
-            if result.returncode == 0 and matches:
-                return pid
-        except (OSError, ValueError):
-            pass
-        return None
-
     def running(self):
-        return self.valid_pid(PID, "/usr/local/bin/mihomo") is not None
+        return self._ownership(self._core_group().running)
+
+    def process_running(self, path, executable, arguments):
+        """Check a non-signalled worker by exact kernel argv and executable."""
+        try:
+            text = Path(path).read_text().strip()
+            if not re.fullmatch(r'[1-9][0-9]{0,9}', text):
+                return False
+            identity = self._core_group().identity(int(text))
+            return bool(identity and identity['uid'] == os.geteuid()
+                        and identity['executable'] == executable
+                        and identity['argv'] == arguments)
+        except (OSError, OwnershipError):
+            return False
 
     def validate(self, candidate):
         data = parse_yaml(Path(candidate).read_bytes())
@@ -863,16 +935,266 @@ class System:
         if result.returncode:
             raise Error("Mihomo rejected the configuration. No configuration was applied.")
 
+    def recover_reloads(self):
+        """Finish reloads whose configuration write was already made durable."""
+        cron_pending = Path(STATE) / 'cron-reload-pending.json'
+        if reload_receipt(cron_pending, {'remove', 'restore-cron'}) is not None:
+            self.restore_cron()
+        filter_pending = Path(STATE) / 'filter-reload-pending.json'
+        if reload_receipt(filter_pending, {'enable-tun', 'remove'}) is not None:
+            self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
+            filter_pending.unlink(missing_ok=True)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _tun_lock():
+        state = Path(STATE)
+        if state.is_symlink():
+            raise Error('The Mihomo TUN ownership directory is unsafe.')
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = state.stat()
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+                or stat.S_IMODE(directory.st_mode) != 0o700):
+            raise Error('The Mihomo TUN ownership directory is not private.')
+        path = state / 'tun-runtime-identity.lock'
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'a') as lock:
+            info = os.fstat(lock.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                raise Error('The Mihomo TUN ownership lock is invalid.')
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as error:
+                    if time.monotonic() >= deadline:
+                        raise Error('Mihomo TUN ownership is busy and will be retried.') from error
+                    time.sleep(0.02)
+            yield
+
+    def tun_snapshot(self):
+        result = self.run(['/sbin/ifconfig', '-v', 'tun_mihomo'], check=False)
+        if result.returncode:
+            return None
+        try:
+            text = result.stdout.decode('utf-8', errors='strict')
+            header = re.match(r'tun_mihomo: flags=([0-9a-fA-F]+)\b.*\bmetric ([0-9]+) mtu ([0-9]+)', text)
+            driver = re.search(r'^\s*drivername: (tun[0-9]+)\s*$', text, re.M)
+            description = re.search(r'^\s*description: (.*)$', text, re.M)
+            opener = re.search(r'^\s*Opened by PID ([0-9]+)\s*$', text, re.M)
+            if header is None or driver is None:
+                raise ValueError
+            flags, metric, mtu = int(header.group(1), 16), int(header.group(2)), int(header.group(3))
+            opened_by = int(opener.group(1)) if opener else None
+            addresses = []
+            for family, raw in re.findall(r'^\s*(inet6?)\s+(\S+)', text, re.M):
+                address = ipaddress.ip_address(raw.split('%', 1)[0])
+                if (family == 'inet') != (address.version == 4):
+                    raise ValueError
+                addresses.append(family + ':' + str(address))
+            addresses = sorted(set(addresses))
+            if (not 0 <= flags <= 0xffffffffffffffff
+                    or not 0 <= metric < 2147483648 or not 0 < mtu <= 1048576
+                    or len(addresses) > 16
+                    or opened_by is not None and not 1 < opened_by < 2147483648):
+                raise ValueError
+            index = socket.if_nametoindex('tun_mihomo')
+            value = {'name': 'tun_mihomo', 'index': index, 'driver': driver.group(1),
+                     'metric': metric, 'mtu': mtu,
+                     'description': description.group(1) if description else '',
+                     'opened_by': opened_by, 'flags': flags, 'addresses': addresses}
+            value['closed'] = not (flags & 0x41) and opened_by is None \
+                and not addresses
+            return value
+        except (OSError, UnicodeError, ValueError):
+            raise Error('The exact Mihomo TUN interface identity could not be read.') from None
+
+    def _tun_receipt(self):
+        path = Path(STATE) / 'tun-runtime-identity.json'
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 65536):
+                raise Error('The Mihomo TUN ownership receipt is invalid; the interface was preserved.')
+            raw = stream.read(65537)
+            after = os.fstat(stream.fileno())
+        if len(raw) > 65536 or any(getattr(before, field) != getattr(after, field) for field in
+                ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+            raise Error('The Mihomo TUN ownership receipt changed while it was read.')
+        try:
+            receipt = json.loads(raw)
+        except (UnicodeError, ValueError, TypeError):
+            raise Error('The Mihomo TUN ownership receipt is invalid; the interface was preserved.') from None
+        stable = ('name', 'index', 'driver', 'metric', 'mtu')
+        common = {'version', 'phase', *stable, 'description', 'core', 'opened'}
+        phase = receipt.get('phase') if isinstance(receipt, dict) else None
+        expected = common | ({'preclaim'} if phase == 'claiming' else set())
+        core = receipt.get('core') if isinstance(receipt, dict) else None
+        opened = receipt.get('opened') if isinstance(receipt, dict) else None
+        if (not isinstance(receipt, dict) or set(receipt) != expected or receipt.get('version') != 1
+                or phase not in ('claiming', 'owned') or receipt.get('name') != 'tun_mihomo'
+                or type(receipt.get('index')) is not int or receipt['index'] <= 0
+                or not re.fullmatch(r'tun[0-9]+', str(receipt.get('driver', '')))
+                or type(receipt.get('metric')) is not int or not 0 <= receipt['metric'] < 2147483648
+                or type(receipt.get('mtu')) is not int or not 0 < receipt['mtu'] <= 1048576
+                or not re.fullmatch(r'Mihomo owner [0-9a-f]{32}', str(receipt.get('description', '')))
+                or not valid_identity(core) or not self._core_group().child_matches(core)
+                or not isinstance(opened, dict) or set(opened) != {'flags', 'addresses', 'opened_by'}
+                or type(opened.get('flags')) is not int or not 0 <= opened['flags'] <= 0xffffffffffffffff
+                or opened['flags'] & 0x41 != 0x41 or opened.get('opened_by') != core['pid']
+                or not isinstance(opened.get('addresses'), list)
+                or not 1 <= len(opened['addresses']) <= 16
+                or any(not isinstance(value, str) for value in opened['addresses'])):
+            raise Error('The Mihomo TUN ownership receipt is invalid; the interface was preserved.')
+        try:
+            canonical = []
+            for value in opened['addresses']:
+                family, separator, raw = value.partition(':')
+                address = ipaddress.ip_address(raw)
+                if not separator or family not in ('inet', 'inet6') \
+                        or (family == 'inet') != (address.version == 4):
+                    raise ValueError
+                canonical.append(family + ':' + str(address))
+            if opened['addresses'] != sorted(set(canonical)):
+                raise ValueError
+        except ValueError:
+            raise Error('The Mihomo TUN ownership receipt is invalid; the interface was preserved.') from None
+        if phase == 'claiming':
+            preclaim = receipt['preclaim']
+            if (not isinstance(preclaim, dict)
+                    or set(preclaim) != {*stable, 'description', 'opened_by'}
+                    or any(preclaim.get(key) != receipt[key] for key in stable)
+                    or not isinstance(preclaim.get('description'), str)
+                    or len(preclaim['description'].encode('utf-8')) > 255
+                    or preclaim.get('opened_by') != core['pid']):
+                raise Error('The pending Mihomo TUN ownership receipt is invalid; the interface was preserved.')
+        return receipt
+
+    @staticmethod
+    def _write_tun_receipt(receipt):
+        atomic_write(Path(STATE) / 'tun-runtime-identity.json',
+                     (json.dumps(receipt, sort_keys=True) + '\n').encode())
+
+    @staticmethod
+    def _clear_tun_receipt():
+        path = Path(STATE) / 'tun-runtime-identity.json'
+        path.unlink(missing_ok=True)
+        try:
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def claim_tun(self, process_record):
+        with self._tun_lock():
+            core = process_record.get('child') if isinstance(process_record, dict) else None
+            owner = self._core_group()
+            if (not valid_identity(core) or not owner.child_matches(core) or not owner.same(core)):
+                raise Error('The Mihomo TUN was not opened by the verified core.')
+            current = self.tun_snapshot()
+            if current is None or current['opened_by'] != core['pid']:
+                raise Error('The Mihomo TUN was not opened by the verified core.')
+            stable = ('name', 'index', 'driver', 'metric', 'mtu')
+            receipt = self._tun_receipt()
+            if receipt is None:
+                receipt = {key: current[key] for key in stable}
+                receipt.update(version=1, phase='claiming',
+                               description='Mihomo owner ' + secrets.token_hex(16), core=core,
+                               opened={key: current[key] for key in ('flags', 'addresses', 'opened_by')},
+                               preclaim={key: current[key] for key in (*stable, 'description', 'opened_by')})
+                self._write_tun_receipt(receipt)
+            elif receipt['core'] != core:
+                raise Error('The Mihomo TUN ownership belongs to another core identity.')
+            exact = all(current.get(key) == receipt[key] for key in stable)
+            opened = all(current.get(key) == receipt['opened'][key]
+                         for key in ('flags', 'addresses', 'opened_by'))
+            if receipt['phase'] == 'owned':
+                if not exact or not opened or current['description'] != receipt['description']:
+                    raise Error('The Mihomo TUN ownership marker changed externally.')
+                return
+            preclaim = receipt['preclaim']
+            if (not exact or not opened
+                    or current['description'] not in (preclaim['description'], receipt['description'])
+                    or not owner.same(core)):
+                raise Error('The Mihomo TUN changed during ownership claim.')
+            if current['description'] == preclaim['description']:
+                if self.tun_snapshot() != current or not owner.same(core):
+                    raise Error('The Mihomo TUN changed before ownership could be marked.')
+                self.run(['/sbin/ifconfig', 'tun_mihomo', 'description', receipt['description']])
+            verified = self.tun_snapshot()
+            if (verified is None or any(verified.get(key) != receipt[key] for key in (*stable, 'description'))
+                    or verified['opened_by'] != core['pid'] or not owner.same(core)):
+                raise Error('The Mihomo TUN ownership marker could not be verified.')
+            receipt['phase'] = 'owned'
+            receipt.pop('preclaim')
+            self._write_tun_receipt(receipt)
+
+    def destroy_owned_tun(self, prepare=None):
+        with self._tun_lock():
+            receipt = self._tun_receipt()
+            current = self.tun_snapshot()
+            if current is None:
+                if receipt is not None:
+                    self._clear_tun_receipt()
+                return False, None
+            if receipt is None:
+                raise Error('An unowned interface named tun_mihomo was preserved.')
+            stable = ('name', 'index', 'driver', 'metric', 'mtu')
+            exact = all(current.get(key) == receipt[key] for key in stable)
+            preclaim = receipt.get('preclaim', {})
+            marked = current.get('description') == receipt['description']
+            unmarked = receipt['phase'] == 'claiming' and current.get('description') == preclaim.get('description')
+            if not exact or not (marked or unmarked) or not current['closed']:
+                raise Error('The Mihomo TUN is open or its ownership changed; the interface was preserved.')
+            if self.tun_snapshot() != current:
+                raise Error('The Mihomo TUN changed during cleanup; the interface was preserved.')
+            prepared, preparation_error = None, None
+            if prepare is not None:
+                try:
+                    prepared = prepare()
+                except (Error, OSError) as error:
+                    # DNS proof and TUN ownership are independent. Once the
+                    # exact closed interface is known, a damaged DNS receipt
+                    # must not retain routes or a stale plugin TUN.
+                    preparation_error = error
+            if self.tun_snapshot() != current:
+                raise Error('The Mihomo TUN changed while cleanup was prepared; the interface was preserved.')
+            result = self.run(['/sbin/ifconfig', 'tun_mihomo', 'destroy'], check=False)
+            if result.returncode and self.tun_snapshot() is not None:
+                raise Error('Owned Mihomo TUN destruction failed and will be retried.')
+            self._clear_tun_receipt()
+            if preparation_error is not None:
+                raise preparation_error
+            return True, prepared
+
     def start(self, config, transparent):
         data = parse_yaml(Path(config).read_bytes())
         needs_dns = data.get('dns', {}).get('enable') and data.get('dns', {}).get('listen') == '127.0.0.1:1053'
         if transparent and self.run(["/usr/sbin/service", "sing-box", "onestatus"], check=False).returncode == 0:
             raise Error("Sing-box already owns transparent routing.")
-        if self.running() or self.run(["/usr/bin/pgrep", "-x", "mihomo"], check=False).returncode == 0:
+        if self.running():
             raise Error("Mihomo is already running; an existing process must be stopped before starting another.")
+        self.recover_reloads()
         self.destroy_tun()
         self.run(["/usr/sbin/daemon", "-P", DAEMON_PID, "-p", PID, "-f", "-o", "/var/log/mihomo.log",
                   "-t", "mihomo", "/usr/local/bin/mihomo", "-d", HOME, "-f", str(config)])
+        owner = self._core_group(config)
+        try:
+            process_record = self._ownership(owner.record_started)
+        except Error:
+            with contextlib.suppress(Error):
+                self._ownership(owner.stop)
+            raise
+        tun_claimed = False
         for _ in range(30):
             if self.running():
                 port = data.get('mixed-port') or data.get('socks-port') or data.get('port')
@@ -895,6 +1217,9 @@ class System:
                     # descriptor closes. Capture local ownership while the
                     # ready core still exposes its configured addresses.
                     try:
+                        if not tun_claimed:
+                            self.claim_tun(process_record)
+                            tun_claimed = True
                         self._host_dns_prepare(interface.stdout)
                     except (Error, OSError):
                         self.stop()
@@ -916,31 +1241,7 @@ class System:
             self.routing('disable')
         except (Error, OSError) as error:
             routing_error = error
-        pids = [self.valid_pid(PID, "/usr/local/bin/mihomo"), self.valid_pid(DAEMON_PID, "daemon")]
-        for pid in pids:
-            if pid:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGTERM)
-        for _ in range(50):
-            remaining = []
-            for pid in pids:
-                if pid:
-                    try:
-                        os.kill(pid, 0)
-                        remaining.append(pid)
-                    except ProcessLookupError:
-                        pass
-            if not remaining:
-                break
-            time.sleep(0.1)
-        for pid in remaining if pids else []:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        time.sleep(0.1)
-        if self.running():
-            raise Error("Mihomo could not be stopped.")
-        for path in (PID, DAEMON_PID):
-            Path(path).unlink(missing_ok=True)
+        self._ownership(self._core_group().stop)
         self.destroy_tun()
         if routing_error is not None:
             raise routing_error
@@ -953,16 +1254,17 @@ class System:
             routing_error = error
         interface = self.run(["/sbin/ifconfig", "tun_mihomo"], check=False)
         recovery = None
-        try:
-            # A dead child can remain visible to pgrep while it is reaped.
-            # Preserve ownership before removing TUN, but defer DNS reload
-            # until the independent global process guard confirms no core.
-            if not self.running():
-                recovery = self._host_dns_prepare(interface.stdout if interface.returncode == 0 else b'')
-        finally:
-            # A failed DNS recovery must not retain routes into a dead core.
-            if interface.returncode == 0:
-                self.run(["/sbin/ifconfig", "tun_mihomo", "destroy"])
+        stopped = not self.running()
+        if interface.returncode == 0:
+            # Ownership is checked before DNS proof is written and again before
+            # destruction. An operator's same-name TUN is left untouched.
+            _, recovery = self.destroy_owned_tun(
+                lambda: self._host_dns_prepare(interface.stdout)) if stopped \
+                else self.destroy_owned_tun()
+        else:
+            self.destroy_owned_tun()
+            if stopped:
+                recovery = self._host_dns_prepare(b'')
         if recovery is not None:
             self._host_dns_recover(recovery)
         if routing_error is not None:
@@ -1007,7 +1309,7 @@ class System:
             return None
 
     def _host_dns_core_stopped(self):
-        return not self.running() and self.run(['/usr/bin/pgrep', '-x', 'mihomo'], check=False).returncode == 1
+        return not self.running()
 
     def _host_dns_operator_owned(self, servers):
         _, config, local, _ = self._host_dns_paths()
@@ -1226,28 +1528,19 @@ class System:
         mode = 'rescue' if recovery_only else 'enable' if enabled else 'disable'
         result = self.run(["/usr/local/bin/php", HELPER, mode,
                   "1" if settings["dns_fallback"] else "0"], timeout=90)
-        expected_forwarding = enabled
-        integration = None
-        for line in result.stdout.splitlines():
-            if line.startswith(b'Mihomo integration state: '):
-                try:
-                    details = json.loads(line.split(b': ', 1)[1])
-                    fields = ('effective_forwarding', 'dns_changed', 'integration_changed')
-                    if isinstance(details, dict) and all(isinstance(details.get(field), bool) for field in fields):
-                        integration = details
-                        expected_forwarding = details['effective_forwarding']
-                except (ValueError, TypeError):
-                    pass
+        integration = integration_state(result.stdout)
+        expected_forwarding = integration['effective_forwarding']
         # "unchanged" reports that the configuration already said this. It says
         # nothing about the file Unbound reads, which is generated from that
         # configuration separately and can still describe the previous state --
         # a stale one pointing at a stopped core leaves the network without DNS.
         # DNSSEC can leave the effective forwarder disabled even when transparent
         # DNS was requested. Older helpers keep the conservative intent check.
-        if b"unchanged" in result.stdout and not was_pending and self.forwarded() == expected_forwarding:
+        if (not integration['integration_changed'] and not was_pending
+                and self.forwarded() == expected_forwarding):
             pending.unlink(missing_ok=True)
             return
-        integration_only = bool(integration is not None and not integration['dns_changed']
+        integration_only = bool(not integration['dns_changed']
             and integration['integration_changed'] and not was_pending
             and self.forwarded() == expected_forwarding)
         previous_render = self.unbound_render_snapshot() if integration_only else None
@@ -1257,7 +1550,8 @@ class System:
         self.run(["/usr/local/sbin/configctl", "template", "reload", "OPNsense/Unbound/*"], timeout=90)
         if (integration_only and previous_render is not None
                 and previous_render == self.unbound_render_snapshot() and self.resolver_running()):
-            self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
+            if integration['filter_changed']:
+                self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
             pending.unlink(missing_ok=True)
             return
         # Taken before the restart, because the restart is what can destroy it:
@@ -1265,19 +1559,55 @@ class System:
         # unbound-checkconf is unhappy, and a fetch made while DNS is being
         # changed has nothing to ask. See restore_anchor().
         anchor = self.anchor_snapshot()
-        for args in (["unbound", "restart"], ["unbound", "cache", "flush"], ["filter", "reload"]):
+        actions = [["unbound", "restart"], ["unbound", "cache", "flush"]]
+        # Interface/rule XML is independent of resolver XML. Avoid disrupting
+        # all firewall states when this operation changed only DNS; a retry
+        # remains conservative because the older pending marker predates the
+        # helper's exact decision.
+        if integration['filter_changed'] or was_pending:
+            actions.append(["filter", "reload"])
+        for args in actions:
             self.run(["/usr/local/sbin/configctl", *args], timeout=90)
         self.repair_resolver(anchor)
         pending.unlink(missing_ok=True)
 
     def remove(self):
-        self.run(["/usr/local/bin/php", HELPER, "remove"], timeout=90)
-        self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
-        self.run(["/usr/local/sbin/configctl", "cron", "restart"], timeout=90)
+        filter_pending = Path(STATE) / 'filter-reload-pending.json'
+        cron_pending = Path(STATE) / 'cron-reload-pending.json'
+        retry_filter = reload_receipt(filter_pending, {'enable-tun', 'remove'}) is not None
+        retry_cron = reload_receipt(cron_pending, {'remove', 'restore-cron'}) is not None
+        atomic_write(filter_pending, b'{"action":"remove","version":1}\n')
+        atomic_write(cron_pending, b'{"action":"remove","version":1}\n')
+        result = self.run(["/usr/local/bin/php", HELPER, "remove"], timeout=90)
+        integration = integration_state(result.stdout)
+        if retry_filter or integration['filter_changed']:
+            self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
+        filter_pending.unlink(missing_ok=True)
+        if retry_cron or integration['cron_changed']:
+            self.run(["/usr/local/sbin/configctl", "cron", "restart"], timeout=90)
+        cron_pending.unlink(missing_ok=True)
+
+    def restore_cron(self):
+        pending = Path(STATE) / 'cron-reload-pending.json'
+        retry = reload_receipt(pending, {'remove', 'restore-cron'}) is not None
+        atomic_write(pending, b'{"action":"restore-cron","version":1}\n')
+        result = self.run(['/usr/local/bin/php', HELPER, 'restore-cron'], timeout=90)
+        integration = integration_state(result.stdout)
+        if retry or integration['cron_changed']:
+            self.run(['/usr/local/sbin/configctl', 'cron', 'restart'], timeout=90)
+        pending.unlink(missing_ok=True)
 
     def tun(self):
-        self.run(['/usr/local/bin/php', HELPER, 'enable-tun'], timeout=90)
-        self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
+        pending = Path(STATE) / 'filter-reload-pending.json'
+        retry = reload_receipt(pending, {'enable-tun', 'remove'}) is not None
+        atomic_write(pending, b'{"action":"enable-tun","version":1}\n')
+        result = self.run(['/usr/local/bin/php', HELPER, 'enable-tun'], timeout=90)
+        integration = integration_state(result.stdout)
+        context = Path(STATE) / 'routing-context.json'
+        missing_context = context.is_symlink() or not context.is_file()
+        if retry or integration['filter_changed'] or missing_context:
+            self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
+        pending.unlink(missing_ok=True)
         self.routing('enable')
 
     def restore_integration(self, settings, payload):
@@ -1313,17 +1643,19 @@ class System:
             raise Error('The router DNS resolver did not answer successfully. No provider DNS fallback is used.') from None
 
     def watch(self):
-        if not self.valid_pid(WATCH_CHILD_PID, SCRIPT):
+        owner = self._watch_group()
+        if not self._ownership(owner.running):
             self.run(["/usr/sbin/daemon", "-P", WATCH_PID, "-p", WATCH_CHILD_PID, "-f", "-o", "/var/log/mihomo.log",
                       "-t", "mihomo-watch", "/usr/local/bin/python3", SCRIPT, "watch"])
+            try:
+                self._ownership(owner.record_started)
+            except Error:
+                with contextlib.suppress(Error):
+                    self._ownership(owner.stop)
+                raise
 
     def stop_watch(self):
-        for path, expected in ((WATCH_CHILD_PID, SCRIPT), (WATCH_PID, "daemon")):
-            pid = self.valid_pid(path, expected)
-            if pid:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGTERM)
-            Path(path).unlink(missing_ok=True)
+        self._ownership(self._watch_group().stop)
 
 
 def fetch_subscription(url, user_agent, proxy="127.0.0.1:7891", run=subprocess.run, sleep=time.sleep):
@@ -1962,7 +2294,7 @@ class Manager:
                   "routing_active": routing_active,
                   "dns_active": dns_active, "dns_fallback": settings["dns_fallback"],
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
-                  "error": error, "backup_warning": self.backup_warning_file.read_text()
+                  "error": bounded_routing_diagnostic(error), "backup_warning": self.backup_warning_file.read_text()
                       if self.backup_warning_file.exists() else BACKUP_WARNING
                       if self.proxy_warning_file.exists() else '', "updated": time.time()}
         atomic_write(self.status_file, json.dumps(status).encode(), 0o644)
@@ -2308,9 +2640,10 @@ class Manager:
     def queue_update(self):
         self.settings()
         path = self.path("/var/run/mihomo-update.pid")
-        if self.system.valid_pid(str(path), SCRIPT):
+        worker = ['/usr/local/bin/python3', SCRIPT, 'sub-update']
+        if self.system.process_running(str(path), worker[0], worker):
             raise Error("A subscription update is already queued or running.")
-        process = subprocess.Popen(["/usr/local/bin/python3", SCRIPT, "sub-update"],
+        process = subprocess.Popen(worker,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, start_new_session=True)
         atomic_write(path, str(process.pid).encode())
@@ -2330,8 +2663,9 @@ class Manager:
             if not self.system.running():
                 try:
                     self.system.destroy_tun()
-                except (Error, OSError):
-                    rescue_error = 'Routing cleanup failed and will be retried. '
+                except (Error, OSError) as routing_failure:
+                    rescue_error = routing_status_error(
+                        'Routing cleanup failed and will be retried.', routing_failure) + ' '
                 pending_dns = (self.state / 'dns-reload-pending').exists()
                 if pending_dns or (active and (settings['dns_fallback'] or not settings['service_enabled'])):
                     try:
@@ -2363,8 +2697,9 @@ class Manager:
             routing_error = ''
             try:
                 self.system.destroy_tun()
-            except (Error, OSError):
-                routing_error = 'Routing cleanup failed and will be retried. '
+            except (Error, OSError) as error:
+                routing_error = routing_status_error(
+                    'Routing cleanup failed and will be retried.', error) + ' '
             if active and (settings['dns_fallback'] or not settings['service_enabled'] or (self.state / 'dns-reload-pending').exists()):
                 try:
                     self.system.dns(False, settings)
@@ -2377,8 +2712,9 @@ class Manager:
         elif settings.get('transparent') and hasattr(self.system, 'routing'):
             try:
                 self.system.routing('refresh')
-            except (Error, OSError):
-                return self.publish_status(settings, active, error='Transparent routing recovery failed and will be retried.')
+            except (Error, OSError) as error:
+                return self.publish_status(settings, active, error=routing_status_error(
+                    'Transparent routing recovery failed and will be retried.', error))
         if settings.get('router_dns'):
             upstreams, ipv6 = self.router_context(settings)
             data = parse_yaml(self.config_file.read_bytes())
@@ -2425,12 +2761,12 @@ class Manager:
                     self.system.stop()
             self._restore_for_start()
         mutation = action not in {'status', 'devices', 'clear-log', 'clear-sub-log', 'queue-update'}
-        if mutation and action not in {'init', 'stop', 'suspend', 'remove', 'start', 'restart', 'boot'}:
+        if mutation and action not in {'init', 'restore-cron', 'stop', 'suspend', 'remove', 'start', 'restart', 'boot'}:
             self._guard_backup()
         if action in {'stop', 'suspend', 'remove'}:
             self.proxy_tick()
         result = self._dispatch(action, argument)
-        if mutation and action not in {'init', 'sub-update', 'save-config', 'save-merge',
+        if mutation and action not in {'init', 'restore-cron', 'sub-update', 'save-config', 'save-merge',
                 'load-preset', 'set-settings', 'enable-transparent', 'disable-transparent'}:
             result = self._mirrored_result(result)
         return result
@@ -2443,9 +2779,12 @@ class Manager:
             return {"cleared": True}
         if action == "init":
             return self.initialize(argument == "upgrade")
+        if action == 'restore-cron':
+            self.system.restore_cron()
+            return {'restored': True}
         if action == 'devices':
             return {'devices': known_devices(self.system.run, self.root),
-                    'rules': device_rules(self.settings()),
+                    'rules': [],
                     'routing': device_routing_policy(self.settings())}
         if action == "queue-update":
             return self.queue_update()

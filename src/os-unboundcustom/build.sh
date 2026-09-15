@@ -3,7 +3,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-unboundcustom}"
-VERSION="${VERSION:-1.0.4}"
+VERSION="${VERSION:-1.0.5}"
 ORIGIN="${ORIGIN:-opnsense/os-unboundcustom}"
 COMMENT="${COMMENT:-Safe custom options for Unbound DNS}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -58,9 +58,10 @@ rm -rf "$WORKDIR"
 mkdir -p "$STAGEDIR/usr/local/opnsense" "$METADIR" "$DISTDIR"
 
 echo "==> Staging plugin files"
-(cd "$SCRIPT_DIR/src/opnsense" && tar --exclude '.DS_Store' --exclude '._*' -cf - .) |
+(cd "$SCRIPT_DIR/src/opnsense" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' --exclude '*.pyc' --exclude '*.pyo' -cf - .) |
     (cd "$STAGEDIR/usr/local/opnsense" && tar -xf -)
 chmod 0755 "$STAGEDIR/usr/local/opnsense/scripts/OPNsense/Unboundcustom/apply.sh"
+install -m 0644 "$SCRIPT_DIR/../common/process_identity.py" "$STAGEDIR/usr/local/opnsense/scripts/OPNsense/Unboundcustom/process_identity.py"
 mkdir -p "$STAGEDIR/usr/local/opnsense/version"
 {
     printf '{\n'
@@ -113,6 +114,7 @@ echo "==> Generating package metadata for $PKG_ABI"
     printf '  product_version: "%s",\n' "$VERSION"
     printf '  product_website: "%s"\n' "$WWW"
     printf '}\n'
+    printf 'deps: { python313: { origin: "lang/python313", version: ">=3.13" } }\n'
     printf 'desc: <<EOD\n'
     cat "$SCRIPT_DIR/pkg-descr"
     printf '\nEOD\n'

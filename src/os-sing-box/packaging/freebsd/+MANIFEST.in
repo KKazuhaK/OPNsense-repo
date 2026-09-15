@@ -9,6 +9,10 @@ arch: "@ARCH@"
 prefix: "@PREFIX@"
 flatsize: @FLATSIZE@
 deps: {
+    python313: {
+        origin: "lang/python313"
+        version: ">=0"
+    },
     jq: {
         origin: "textproc/jq"
         version: ">=0"

@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-sing-box}"
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.1.2}"
 ORIGIN="${ORIGIN:-opnsense/os-sing-box}"
 COMMENT="${COMMENT:-sing-box proxy integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -58,12 +58,18 @@ need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/SingBox/index.volt"
 need_file "src/usr/local/opnsense/scripts/singbox/singbox.php"
 need_file "src/usr/local/opnsense/scripts/singbox/config_mirror.py"
 need_file "src/usr/local/opnsense/scripts/singbox/config_setup.php"
+need_file "src/usr/local/opnsense/scripts/singbox/integration.py"
+need_file "src/usr/local/opnsense/scripts/singbox/routing.py"
+need_file "src/usr/local/opnsense/scripts/singbox/native_route.py"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/SingBox/Backup.php"
 need_file "src/usr/local/opnsense/mvc/app/models/OPNsense/SingBox/Backup.xml"
 need_file "src/usr/local/etc/rc.d/sing-box-backup"
 need_file "src/usr/local/etc/rc.syshook.d/start/15-singbox-backup"
 need_file "../common/config_backup.py"
 need_file "../common/config_backup.php"
+need_file "../common/process_identity.py"
+need_file "../common/route_control.py"
+need_file "../common/tun_policy_routing.py"
 need_file "src/usr/bin/sing_box_sub"
 need_file "src/usr/local/bin/$SING_BOX_ASSET"
 need_file "packaging/freebsd/+MANIFEST.in"
@@ -157,6 +163,12 @@ echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.py" "$STAGEDIR/usr/local/opnsense/scripts/singbox/config_backup.py"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.php" "$STAGEDIR/usr/local/opnsense/scripts/singbox/config_backup.php"
+install -m 0644 "$SCRIPT_DIR/../common/process_identity.py" "$STAGEDIR/usr/local/opnsense/scripts/singbox/process_identity.py"
+install -m 0644 "$SCRIPT_DIR/../common/route_control.py" "$STAGEDIR/usr/local/opnsense/scripts/singbox/route_control.py"
+install -m 0644 "$SCRIPT_DIR/../common/tun_policy_routing.py" "$STAGEDIR/usr/local/opnsense/scripts/singbox/tun_policy_routing.py"
+PRODUCT_VERSION="$(sed -n 's/.*"product_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$STAGEDIR/usr/local/opnsense/version/sing-box")"
+[ "$PRODUCT_VERSION" = "$VERSION" ] || die "VERSION does not match the committed sing-box product metadata"
 prepare_binary "$SING_BOX_ASSET" "$SING_BOX_DOWNLOAD_URL" "$DOWNLOADDIR/sing-box"
 mkdir -p "$STAGEDIR/usr/local/bin"
 install -m 0755 "$DOWNLOADDIR/sing-box" "$STAGEDIR/usr/local/bin/sing-box"
@@ -193,7 +205,8 @@ manifest = {
     'name': name, 'origin': origin, 'version': version, 'comment': comment,
     'maintainer': maintainer, 'www': www, 'abi': abi, 'arch': arch,
     'prefix': prefix, 'flatsize': int(flatsize),
-    'deps': {'jq': {'origin': 'textproc/jq', 'version': '>=0'},
+    'deps': {'python313': {'origin': 'lang/python313', 'version': '>=0'},
+             'jq': {'origin': 'textproc/jq', 'version': '>=0'},
              'curl': {'origin': 'ftp/curl', 'version': '>=0'}},
     'desc': (source / 'packaging/freebsd/pkg-descr').read_text(),
     'files': {file: '1$' + hashlib.sha256((stage / file.lstrip('/')).read_bytes()).hexdigest()

@@ -31,11 +31,9 @@ if [ "$restore_ready" = YES ]; then
         store_ready=NO
         echo 'Warning: the Mihomo settings store could not be prepared. Review the plugin settings in the web interface before starting the service.' >&2
     fi
-    if ! cron_result="$(/usr/local/bin/php /usr/local/opnsense/scripts/mihomo/setup_unbound.php restore-cron)"; then
-        cron_result=
+    if ! /usr/local/bin/python3 "$control" restore-cron; then
         echo 'Warning: the Mihomo subscription schedule could not be restored. Save the subscription settings once to recreate it.' >&2
     fi
-    case "$cron_result" in *updated*) configctl cron restart ;; esac
     # Retire known workaround entry points only after successful migration.
     # A store that was never prepared still needs the old ones to answer for it.
     if [ "$store_ready" = YES ] && [ -f /var/db/os-mihomo/migrate/actions_mihomolocal.conf ]; then

@@ -1,5 +1,5 @@
 PKG_NAME?=	os-lucky
-VERSION?=	1.1.1
+VERSION?=	1.1.2
 ABI?=		native
 
 .PHONY: package install clean

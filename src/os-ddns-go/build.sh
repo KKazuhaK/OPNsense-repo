@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ddns-go}"
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.1.2}"
 ORIGIN="${ORIGIN:-opnsense/os-ddns-go}"
 COMMENT="${COMMENT:-DDNS-Go dynamic DNS integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -145,7 +145,12 @@ prepare_ddnsgo_binary() {
 echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.py" "$STAGEDIR/usr/local/opnsense/scripts/ddnsgo/config_backup.py"
+install -m 0644 "$SCRIPT_DIR/../common/process_control.py" "$STAGEDIR/usr/local/opnsense/scripts/ddnsgo/process_control.py"
+install -m 0644 "$SCRIPT_DIR/../common/process_identity.py" "$STAGEDIR/usr/local/opnsense/scripts/ddnsgo/process_identity.py"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.php" "$STAGEDIR/usr/local/opnsense/scripts/ddnsgo/config_backup.php"
+PRODUCT_VERSION="$(sed -n 's/.*"product_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+	"$STAGEDIR/usr/local/opnsense/version/ddns-go")"
+[ "$PRODUCT_VERSION" = "$VERSION" ] || die "VERSION does not match the committed DDNS-Go product metadata"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-ddns-go-backup"
 prepare_ddnsgo_binary
 mkdir -p "$STAGEDIR/usr/local/bin"

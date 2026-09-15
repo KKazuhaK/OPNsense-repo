@@ -51,7 +51,7 @@ namespace {
         api_check(Backend::$calls === [], 'A read-only request reached configd.');
     }
     $controller->readOnly = false;
-    foreach (['busy', 'backup_failed', 'template_failed', 'stage_failed', 'validation_failed', 'restart_failed', 'success'] as $code) {
+    foreach (['busy', 'backup_failed', 'template_failed', 'stage_failed', 'validation_failed', 'restart_failed', 'recovery_failed', 'apply_failed', 'state_failed', 'success'] as $code) {
         Backend::$response = json_encode(['status' => $code === 'success' ? 'ok' : 'failed',
                                           'code' => $code, 'detail' => 'isolated detail'], JSON_THROW_ON_ERROR);
         $answer = $controller->applyAction();

@@ -315,6 +315,7 @@ require __DIR__ . '/settings.php';
         candidate = control.script.read_text().replace(str(control.configuration), str(self.configuration))
         candidate = candidate.replace(str(control.root / 'settings.lock'), str(self.root / 'settings.lock'))
         control.script.write_text(candidate)
+        control.driver.write_text(control.driver.read_text().replace(str(control.configuration), str(self.configuration)))
         result = control.run_action('apply')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('needs recovery', result.stderr)
@@ -372,6 +373,7 @@ require __DIR__ . '/settings.php';
         candidate = control.script.read_text().replace(str(control.configuration), str(self.configuration))
         candidate = candidate.replace(str(control.root / 'settings.lock'), str(self.root / 'settings.lock'))
         control.script.write_text(candidate)
+        control.driver.write_text(control.driver.read_text().replace(str(control.configuration), str(self.configuration)))
         result = control.run_action('apply')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('needs recovery', result.stderr)
@@ -414,6 +416,7 @@ require __DIR__ . '/settings.php';
         candidate = control.script.read_text().replace(str(control.configuration), str(self.configuration))
         candidate = candidate.replace(str(control.root / 'settings.lock'), str(self.root / 'settings.lock'))
         control.script.write_text(candidate)
+        control.driver.write_text(control.driver.read_text().replace(str(control.configuration), str(self.configuration)))
         pause, release = self.root / 'paused', self.root / 'release'
         payload = self.root / 'payload.json'
         payload.write_text(json.dumps({'enabled': True, 'entries': '192.0.2.7 aa:bb:cc:dd:ee:07',
@@ -427,7 +430,7 @@ require __DIR__ . '/settings.php';
             time.sleep(0.02)
         self.assertTrue(pause.exists(), 'The real first replacement was never reached.')
         reader = subprocess.Popen(['sh', str(control.script), 'apply'],
-                                  env={**os.environ, 'STATICARP_TEST_EVENTS': str(control.events)},
+                                  env=control.environment,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: reader.kill() if reader.poll() is None else None)
         repository = PACKAGE.parents[1]
@@ -465,8 +468,8 @@ require __DIR__ . '/settings.php';
         backup.join(timeout=10)
         self.assertFalse(backup.is_alive())
         self.assertEqual(results, [{'ok': True, 'changed': True, 'snapshot': True}])
-        load = next(event for event in control.calls() if event['command'] == 'arp' and event['args'][0] == '-f')
-        self.assertEqual(load['entries'], '192.0.2.7 aa:bb:cc:dd:ee:07\n')
+        load = next(event for event in control.calls() if event['command'] == 'arp' and event['args'][0] == '-i')
+        self.assertEqual(load['args'], ['-i', 'vtnet1', '-s', '192.0.2.7', 'aa:bb:cc:dd:ee:07'])
         self.assertIn(['vtnet1', 'staticarp'], [event['args'] for event in control.calls() if event['command'] == 'ifconfig'])
         _, entries, _ = engine._decode(exported)
         import base64
@@ -483,16 +486,56 @@ class StaticarpControlTests(unittest.TestCase):
         self.configuration = self.root / 'configuration'
         self.configuration.mkdir()
         self.events = self.root / 'events'
+        self.kernel = self.root / 'kernel.json'
+        self.kernel.write_text(json.dumps({'bindings': {'vtnet0|198.51.100.1':
+                              {'mac': 'aa:bb:cc:dd:ee:90', 'permanent': False, 'published': False}},
+                              'modes': {'vtnet0': {'noarp': False, 'staticarp': False},
+                                        'vtnet1': {'noarp': True, 'staticarp': False},
+                                        'vtnet2': {'noarp': False, 'staticarp': True},
+                                        'vtnet2.20': {'noarp': False, 'staticarp': False},
+                                        'vtnet3': {'noarp': False, 'staticarp': False}}}))
         command = self.root / 'command.py'
-        command.write_text('''import json,os,sys
+        command.write_text(r'''import json,os,sys
 from pathlib import Path
 args=sys.argv[1:]
 event={'command':args[0],'args':args[1:]}
-if args[:2]==['arp','-f']:event['entries']=Path(args[2]).read_text()
-with Path(os.environ['STATICARP_TEST_EVENTS']).open('a') as output:output.write(json.dumps(event)+'\\n')
-if args==['ifconfig']:print('vtnet1: flags\\n    inet 192.0.2.1 netmask 0xffffff00')
-if os.environ.get('STATICARP_TEST_MIRROR_FAIL') and args[0]=='mirror':sys.exit(1)
-if os.environ.get('STATICARP_TEST_COMMAND_FAIL') and args[0] in ['arp','ifconfig']:sys.exit(1)
+with Path(os.environ['STATICARP_TEST_EVENTS']).open('a') as output:output.write(json.dumps(event)+'\n')
+path=Path(os.environ['STATICARP_TEST_KERNEL'])
+state=json.loads(path.read_text())
+mutating=False
+if args==['ifconfig','-a']:
+    for device,mode in state['modes'].items():
+        flags=['UP','BROADCAST']+(['NOARP'] if mode['noarp'] else [])+(['STATICARP'] if mode['staticarp'] else [])
+        print(device+': flags=1<'+','.join(flags)+'>')
+        if device=='vtnet1':print('    inet 192.0.2.1 netmask 0xffffff00')
+elif args==['arp','-an']:
+    for key,value in state['bindings'].items():
+        device,ip=key.split('|')
+        print('? ('+ip+') at '+value['mac']+' on '+device+(' permanent' if value['permanent'] else ' expires in 90 seconds')+(' published' if value['published'] else '')+' [ethernet]')
+elif args[0]=='route':
+    print('    interface: '+('vtnet0' if args[-1].startswith('198.51.100.') else 'vtnet1'))
+    print('        flags: <UP,DONE>')
+elif args[:2]==['arp','-i']:
+    device,ip,mac=args[2],args[4],args[5]
+    state['bindings'][device+'|'+ip]={'mac':mac,'permanent':True,'published':'pub' in args}
+    mutating=True
+elif args[0]=='delete':
+    state['bindings'].pop(args[1],None)
+    mutating=True
+elif args[0]=='ifconfig':
+    for flag in args[2:]:
+        if flag in ('arp','-arp'):state['modes'][args[1]]['noarp']=flag=='-arp'
+        elif flag in ('staticarp','-staticarp'):state['modes'][args[1]]['staticarp']=flag=='staticarp'
+    mutating=True
+elif args[0]=='mirror':
+    if os.environ.get('STATICARP_TEST_MIRROR_FAIL'):sys.exit(1)
+else:raise SystemExit('Uncaptured fixture command: '+repr(args))
+if mutating:
+    fault=os.environ.get('STATICARP_TEST_COMMAND_FAIL')
+    if fault=='before' or (fault=='rollback' and args[0]=='delete'):sys.exit(1)
+    path.write_text(json.dumps(state))
+    if fault=='after' and args[0]!='delete':sys.exit(1)
+    if fault=='rollback' and args[0]!='delete':sys.exit(1)
 ''')
         source = CONTROL.read_text()
         source = source.replace('CONFIG_DIR="/usr/local/etc/staticarp"', 'CONFIG_DIR="' + str(self.configuration) + '"', 1)
@@ -508,20 +551,39 @@ with open(args[3],'a') as stream:
     raise SystemExit(subprocess.run(args[4:]).returncode)
 ''')
             source = source.replace('/usr/bin/lockf', '"' + sys.executable + '" "' + str(lock) + '"', 1)
-        # Replace every mutating absolute command, including discovery, before execution.
         invocation = '"' + sys.executable + '" "' + str(command) + '" '
-        source = source.replace('/sbin/ifconfig', invocation + 'ifconfig')
-        source = source.replace('if ifconfig |', 'if ' + invocation + 'ifconfig |')
-        source = source.replace('/usr/sbin/arp', invocation + 'arp')
+        runtime = PACKAGE / 'src/usr/local/opnsense/scripts/staticarp/runtime.py'
+        self.runtime_path = self.root / 'runtime.py'
+        self.runtime_path.write_text(runtime.read_text())
+        # Keep production discovery/parsing/mutations; redirect executables only.
+        driver = self.root / 'runtime-driver.py'
+        self.driver = driver
+        driver.write_text('import sys\nimport runtime\n'
+            + 'class FixtureSystem(runtime.System):\n'
+            + '    def boot_id(self): return __import__("os").environ.get("STATICARP_TEST_BOOT","100:0")\n'
+            + '    def interface_index(self,device): return int(__import__("os").environ.get("STATICARP_TEST_INDEX","10"))\n'
+            + '    def run(self,*args):\n'
+            + '        return super().run(sys.executable,' + repr(str(command)) + ',args[0].split("/")[-1],*args[1:])\n'
+            + '    def mutate_binding(self,key,target):\n'
+            + '        if target is None or not target["permanent"]: self.run("delete",key)\n'
+            + '        else: super().mutate_binding(key,target)\n'
+            + 'engine=runtime.Runtime(system=FixtureSystem(),config_dir=' + repr(str(self.configuration))
+            + ',state_file=' + repr(str(self.root / 'state/runtime.json')) + ')\n'
+            + 'if __import__("os").environ.get("STATICARP_TEST_JOURNAL_FAIL"):\n'
+            + '    original=engine.save\n'
+            + '    def fail_after_write():\n'
+            + '        if any("pending" not in row and row["after"] != row["before"] for kind in ("bindings","modes") for row in engine.state[kind].values()): raise OSError("simulated journal disk failure")\n'
+            + '        original()\n'
+            + '    engine.save=fail_after_write\n'
+            + 'engine.apply(reset=sys.argv[1]=="reset")\n')
+        source = source.replace('/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/runtime.py',
+                                '"' + sys.executable + '" "' + str(driver) + '"')
         source = source.replace('/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py mirror',
                                 invocation + 'mirror')
-        # Both Linux and FreeBSD accept the directory form; temporary ARP lists stay private.
-        source = source.replace('mktemp -t staticarp', 'mktemp "' + str(self.root / 'arp-list.XXXXXX') + '"')
-        self.assertNotIn('/sbin/ifconfig', source)
-        self.assertNotIn('/usr/sbin/arp', source)
-        self.assertNotIn('if ifconfig |', source)
         self.script = self.root / 'staticarpctl'
         self.script.write_text(source)
+        self.environment = {**os.environ, 'STATICARP_TEST_EVENTS': str(self.events),
+                            'STATICARP_TEST_KERNEL': str(self.kernel)}
 
     def seed(self, enabled='YES', entries='192.0.2.1 aa:bb:cc:dd:ee:01\n192.0.2.7 aa:bb:cc:dd:ee:07\n'):
         (self.configuration / 'settings.conf').write_text('enabled=' + enabled + '\n')
@@ -529,63 +591,203 @@ with open(args[3],'a') as stream:
         (self.configuration / 'interfaces.conf').write_text('# comment\nlan vtnet1 staticarp\nopt1 vtnet2 -arp\nopt2 vtnet3 normal\n')
 
     def run_action(self, action, failure=None):
-        return subprocess.run(['sh', str(self.script), action], env={**os.environ, 'STATICARP_TEST_EVENTS': str(self.events),
-                              **(failure or {})}, capture_output=True, text=True, timeout=10)
+        return subprocess.run(['sh', str(self.script), action], env={**self.environment, **(failure or {})},
+                              capture_output=True, text=True, timeout=10)
 
     def calls(self):
         return [json.loads(line) for line in self.events.read_text().splitlines()] if self.events.exists() else []
 
-    def test_enabled_apply_filters_router_ip_then_loads_arp_and_sets_each_interface_mode(self):
+    def kernel_state(self):
+        return json.loads(self.kernel.read_text())
+
+    def modify_kernel(self, callback):
+        state = self.kernel_state()
+        callback(state)
+        self.kernel.write_text(json.dumps(state))
+
+    def test_apply_journals_exact_changes_and_reset_restores_original_modes_without_foreign_loss(self):
         self.seed()
+        before = self.kernel_state()
         result = self.run_action('apply')
         self.assertEqual((result.returncode, result.stdout), (0, 'OK\n'), result.stderr)
-        calls = self.calls()
-        load = next(event for event in calls if event['command'] == 'arp' and event['args'][0] == '-f')
-        self.assertEqual(load['entries'], '192.0.2.7 aa:bb:cc:dd:ee:07\n')
-        mutations = [event['args'] for event in calls if event['command'] == 'ifconfig' and event['args']]
-        self.assertEqual(mutations, [['vtnet1', 'arp', '-staticarp'], ['vtnet1', 'staticarp'],
-                                     ['vtnet2', 'arp', '-staticarp'], ['vtnet2', '-arp'], ['vtnet3', 'arp', '-staticarp']])
-        self.assertEqual(calls[-1]['command'], 'mirror')
-        self.assertFalse(list(self.root.glob('arp-list.*')))
+        after = self.kernel_state()
+        self.assertEqual(after['bindings']['vtnet0|198.51.100.1'], before['bindings']['vtnet0|198.51.100.1'])
+        self.assertEqual(after['bindings']['vtnet1|192.0.2.7']['mac'], 'aa:bb:cc:dd:ee:07')
+        self.assertNotIn('vtnet1|192.0.2.1', after['bindings'])
+        journal = self.root / 'state/runtime.json'
+        self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(journal.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state(), before)
+        self.assertFalse(any(event['args'] == ['-d', '-a'] for event in self.calls()))
 
-    def test_disabled_apply_and_reset_only_clear_bindings_and_restore_normal_reply_modes(self):
-        for action in ['apply', 'reset']:
-            with self.subTest(action=action):
-                self.seed(enabled='NO')
-                self.events.unlink(missing_ok=True)
-                result = self.run_action(action)
-                self.assertEqual((result.returncode, result.stdout), (0, 'OK\n'))
-                calls = self.calls()
-                self.assertEqual([event['args'] for event in calls if event['command'] == 'arp'], [['-d', '-a']])
-                self.assertEqual([event['args'] for event in calls if event['command'] == 'ifconfig'],
-                                 [['vtnet1', 'arp', '-staticarp'], ['vtnet2', 'arp', '-staticarp'], ['vtnet3', 'arp', '-staticarp']])
-                self.assertEqual(calls[-1]['command'], 'mirror')
+    def test_new_disabled_apply_and_reset_do_not_mutate_any_neighbor_or_interface(self):
+        self.seed(enabled='NO')
+        before = self.kernel.read_bytes()
+        for action in ('apply', 'reset'):
+            result = self.run_action(action)
+            self.assertEqual((result.returncode, result.stdout), (0, 'OK\n'), result.stderr)
+            self.assertEqual(self.kernel.read_bytes(), before)
+            self.assertFalse((self.root / 'state/runtime.json').exists())
+        self.assertTrue(all(event['command'] == 'mirror' for event in self.calls()))
 
-    def test_empty_or_local_only_entries_never_flush_or_load_the_arp_table(self):
-        for entries in ['', '# comment\n', '192.0.2.1 aa:bb:cc:dd:ee:01\n']:
-            with self.subTest(entries=entries):
-                self.seed(entries=entries)
-                self.events.unlink(missing_ok=True)
-                self.assertEqual(self.run_action('apply').returncode, 0)
-                self.assertFalse(any(event['command'] == 'arp' for event in self.calls()))
-
-    def test_kernel_commands_are_best_effort_but_backup_failure_cannot_report_ok(self):
+    def test_interface_flag_failure_cannot_report_ok_and_single_flag_journal_restores_prior_mode(self):
         self.seed()
-        result = self.run_action('apply', {'STATICARP_TEST_COMMAND_FAIL': '1'})
-        self.assertEqual((result.returncode, result.stdout), (0, 'OK\n'))
-        self.events.unlink(missing_ok=True)
+        self.modify_kernel(lambda state: state['bindings'].update({'vtnet1|192.0.2.7':
+                           {'mac': 'aa:bb:cc:dd:ee:07', 'permanent': True, 'published': False}}))
+        before = self.kernel_state()
+        for point in ('before', 'after'):
+            with self.subTest(point=point):
+                result = self.run_action('apply', {'STATICARP_TEST_COMMAND_FAIL': point})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('OK', result.stdout)
+                self.assertEqual(self.run_action('reset').returncode, 0)
+                self.assertEqual(self.kernel_state(), before)
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        self.assertTrue(all(len(event['args']) == 2 for event in self.calls()
+                            if event['command'] == 'ifconfig' and event['args'] != ['-a']))
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state(), before)
+
+    def test_foreign_static_binding_is_restored_and_identical_foreign_binding_is_not_claimed(self):
+        self.seed()
+        original = {'mac': 'aa:bb:cc:dd:ee:99', 'permanent': True, 'published': False}
+        self.modify_kernel(lambda state: state['bindings'].update({'vtnet1|192.0.2.7': original}))
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state()['bindings']['vtnet1|192.0.2.7'], original)
+        self.seed(entries='192.0.2.7 aa:bb:cc:dd:ee:99\n')
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        journal = json.loads((self.root / 'state/runtime.json').read_text())
+        self.assertEqual(journal['bindings'], {})
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state()['bindings']['vtnet1|192.0.2.7'], original)
+
+    def test_later_admin_binding_and_mode_changes_survive_reset_and_conflicting_apply_fails(self):
+        self.seed()
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        edited = {'mac': 'aa:bb:cc:dd:ee:88', 'permanent': True, 'published': False}
+        self.modify_kernel(lambda state: (state['bindings'].update({'vtnet1|192.0.2.7': edited}),
+                                         state['modes'].update({'vtnet1': {'noarp': False, 'staticarp': False}})))
+        result = self.run_action('apply')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('OK', result.stdout)
+        self.assertEqual(self.kernel_state()['bindings']['vtnet1|192.0.2.7'], edited)
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state()['bindings']['vtnet1|192.0.2.7'], edited)
+        self.assertEqual(self.kernel_state()['modes']['vtnet1'], {'noarp': False, 'staticarp': False})
+
+    def test_failed_kernel_operation_reports_failure_and_retains_recoverable_state(self):
+        self.seed()
+        before = self.kernel_state()
+        for point in ('before', 'after'):
+            result = self.run_action('apply', {'STATICARP_TEST_COMMAND_FAIL': point})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn('OK', result.stdout)
+            self.assertEqual(self.kernel_state(), before)
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state(), before)
         result = self.run_action('apply', {'STATICARP_TEST_MIRROR_FAIL': '1'})
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('OK', result.stdout)
+        self.assertEqual(self.run_action('reset').returncode, 0)
 
-    def test_status_and_unknown_actions_do_not_mutate_configuration_or_call_commands(self):
+    def test_crash_after_write_ahead_and_rollback_failure_recover_without_foreign_loss(self):
+        self.seed()
+        before = self.kernel_state()
+        for failure in ({'STATICARP_TEST_COMMAND_FAIL': 'rollback'}, {'STATICARP_TEST_JOURNAL_FAIL': '1'}):
+            with self.subTest(failure=failure):
+                result = self.run_action('apply', failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('OK', result.stdout)
+                durable = json.loads((self.root / 'state/runtime.json').read_text())
+                self.assertIn('pending', durable['bindings']['vtnet1|192.0.2.7'])
+                self.assertEqual(self.kernel_state()['bindings']['vtnet0|198.51.100.1'], before['bindings']['vtnet0|198.51.100.1'])
+                self.assertEqual(self.run_action('reset').returncode, 0)
+                self.assertEqual(self.kernel_state(), before)
+
+    def test_failed_initial_write_does_not_claim_or_remove_an_unchanged_dynamic_neighbor(self):
+        self.seed()
+        dynamic = {'mac': 'aa:bb:cc:dd:ee:07', 'permanent': False, 'published': False}
+        self.modify_kernel(lambda state: state['bindings'].update({'vtnet1|192.0.2.7': dynamic}))
+        before = self.kernel_state()
+        self.assertNotEqual(self.run_action('apply', {'STATICARP_TEST_COMMAND_FAIL': 'before'}).returncode, 0)
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state(), before)
+
+    def test_corrupt_or_non_private_journal_refuses_all_kernel_mutations(self):
+        self.seed()
+        before = self.kernel.read_bytes()
+        directory = self.root / 'state'
+        directory.mkdir(mode=0o700)
+        journal = directory / 'runtime.json'
+        journal.write_text('{not valid JSON')
+        journal.chmod(0o600)
+        self.assertNotEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+        journal.write_text(json.dumps({'version': 1, 'bindings': {}, 'modes': {}, 'conflicts': []}))
+        journal.chmod(0o644)
+        self.assertNotEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+        journal.unlink()
+        journal.symlink_to(self.kernel)
+        self.assertNotEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+
+    def test_removed_entry_restores_only_owned_neighbor_and_changed_desired_mac_keeps_original_snapshot(self):
+        self.seed()
+        before = self.kernel_state()
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        self.seed(entries='192.0.2.7 aa:bb:cc:dd:ee:08\n')
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.kernel_state()['bindings']['vtnet1|192.0.2.7']['mac'], 'aa:bb:cc:dd:ee:08')
+        self.seed(entries='')
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.kernel_state()['bindings'], before['bindings'])
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel_state(), before)
+
+    def test_no_old_journal_does_not_infer_ownership_and_unavailable_or_wan_bindings_fail_before_mutation(self):
+        self.seed(enabled='NO')
+        before = self.kernel.read_bytes()
+        self.assertEqual(self.run_action('reset').returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+        self.seed(entries='198.51.100.10 aa:bb:cc:dd:ee:10\n')
+        self.assertNotEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+        self.seed()
+        (self.configuration / '.staticarp-recovery-old').write_text('not recovered')
+        self.assertNotEqual(self.run_action('apply').returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+
+    def test_new_kernel_boot_reapplies_explicit_settings_to_a_new_baseline_without_old_ownership(self):
+        self.seed()
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        self.modify_kernel(lambda state: (state['bindings'].pop('vtnet1|192.0.2.7'),
+                                         state['modes'].update({'vtnet1': {'noarp': False, 'staticarp': False}})))
+        result = self.run_action('apply', {'STATICARP_TEST_BOOT': '200:0'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        journal = json.loads((self.root / 'state/runtime.json').read_text())
+        self.assertEqual(journal['boot'], '200:0')
+        self.assertEqual(journal['modes']['vtnet1']['before'], {'noarp': False, 'staticarp': False})
+        self.assertEqual(self.run_action('reset', {'STATICARP_TEST_BOOT': '200:0'}).returncode, 0)
+        self.assertEqual(self.kernel_state()['modes']['vtnet1'], {'noarp': False, 'staticarp': False})
+
+    def test_interface_replaced_with_same_name_and_state_is_not_touched_by_old_ownership(self):
+        self.seed()
+        self.assertEqual(self.run_action('apply').returncode, 0)
+        before = self.kernel.read_bytes()
+        self.assertNotEqual(self.run_action('apply', {'STATICARP_TEST_INDEX': '11'}).returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+        self.assertEqual(self.run_action('reset', {'STATICARP_TEST_INDEX': '11'}).returncode, 0)
+        self.assertEqual(self.kernel.read_bytes(), before)
+
+    def test_status_and_unknown_actions_do_not_call_kernel_commands(self):
         self.seed(entries='# comment\n\n192.0.2.7 aa:bb:cc:dd:ee:07\n192.0.2.8 aa:bb:cc:dd:ee:08\n')
-        result = self.run_action('status')
-        self.assertEqual(result.stdout, 'enabled=YES\nentries=2\n')
+        self.assertEqual(self.run_action('status').stdout, 'enabled=YES\nentries=2\n')
         self.assertEqual(self.calls(), [])
-        result = self.run_action('unknown')
-        self.assertEqual(result.returncode, 64)
-        self.assertIn('usage:', result.stderr)
+        self.assertEqual(self.run_action('unknown').returncode, 64)
         self.assertEqual(self.calls(), [])
 
 

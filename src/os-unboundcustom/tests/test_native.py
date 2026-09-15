@@ -36,6 +36,7 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual(manifest['abi'], expected)
                 base = 'usr/local/opnsense/'
                 for name in ['scripts/OPNsense/Unboundcustom/apply.sh',
+                    'scripts/OPNsense/Unboundcustom/apply.py',
                     'service/conf/actions.d/actions_unboundcustom.conf',
                     'service/templates/OPNsense/Unboundcustom/custom-options.conf',
                     'mvc/app/models/OPNsense/Unboundcustom/General.xml']:
@@ -44,7 +45,7 @@ class NativeTests(unittest.TestCase):
                                      (PACKAGE / 'src/opnsense' / name).read_bytes())
                 self.assertTrue(members[base + 'scripts/OPNsense/Unboundcustom/apply.sh'].mode & 0o111)
                 for source in (PACKAGE / 'src/opnsense').rglob('*'):
-                    if not source.is_file() or any(part.startswith('._') or part == '.DS_Store'
+                    if not source.is_file() or any(part.startswith('._') or part in ('.DS_Store', '__pycache__')
                             for part in source.relative_to(PACKAGE / 'src/opnsense').parts):
                         continue
                     name = base + source.relative_to(PACKAGE / 'src/opnsense').as_posix()
@@ -57,6 +58,8 @@ class NativeTests(unittest.TestCase):
                 version = json.load(archive.extractfile(members[base + 'version/unboundcustom']))
                 self.assertEqual(version['product_version'], manifest['version'])
                 self.assertEqual(version['product_id'], manifest['name'])
+                self.assertEqual(archive.extractfile(members[base + 'scripts/OPNsense/Unboundcustom/process_identity.py']).read(),
+                                 (PACKAGE.parent / 'common/process_identity.py').read_bytes())
                 self.assertNotIn('conf/config.xml', members)
                 self.assertNotIn('usr/local/etc/unbound.opnsense.d/custom-options.conf', members)
                 self.assertFalse(any(name.startswith('original/') or '__pycache__' in name or name.endswith(('.pyc', '.pyo')) for name in members))

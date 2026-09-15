@@ -3,12 +3,22 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 
 REPOSITORY = Path(__file__).resolve().parents[3]
+
+
+def _native_opnsense_php_available():
+    """Run the native wiring test only where OPNsense PHP includes exist."""
+    if not sys.platform.startswith('freebsd') or shutil.which('php') is None:
+        return False
+    include_roots = [Path('/usr/local/etc/inc'), Path('/usr/local/opnsense/etc/inc')]
+    return any(all((root / name).is_file() for name in ('config.inc', 'interfaces.inc', 'util.inc'))
+               for root in include_roots)
 
 
 class RcBackupWiringTests(unittest.TestCase):
@@ -46,7 +56,7 @@ class RcBackupWiringTests(unittest.TestCase):
                 self.assertTrue(result.wasSuccessful(), str(result.errors + result.failures))
 
 
-@unittest.skipUnless(sys.platform.startswith('freebsd'), 'Requires the genuine native OPNsense PHP includes')
+@unittest.skipUnless(_native_opnsense_php_available(), 'Requires the genuine native OPNsense PHP includes')
 class NativeStaticarpWiringTests(unittest.TestCase):
     def test_native_settings_mirror_only_after_writes_and_report_backup_failure(self):
         with tempfile.TemporaryDirectory() as temporary:

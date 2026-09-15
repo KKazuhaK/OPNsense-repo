@@ -25,7 +25,13 @@ mihomo_stop()
 mihomo_restart() { /usr/local/bin/python3 "$control" restart; }
 mihomo_status()
 {
-    /usr/local/bin/python3 "$control" --json status
+    output="$(/usr/local/bin/python3 "$control" --json status)" || return $?
+    printf '%s\n' "$output"
+    # rc.subr expects a non-zero status when the service is not running. The
+    # manager answers both states with JSON and exit zero, so read the running
+    # flag instead of treating the JSON text as a protocol.
+    printf '%s' "$output" | /usr/local/bin/python3 -c \
+        'import json,sys; r=json.load(sys.stdin).get("result"); sys.exit(0 if isinstance(r,dict) and r.get("running") else 1)'
 }
 load_rc_config "$name"
 run_rc_command "$1"

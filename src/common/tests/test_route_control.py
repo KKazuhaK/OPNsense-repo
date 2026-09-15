@@ -254,6 +254,40 @@ class SharedPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(policy.RoutingError, 'No supported private'):
                 harness.allocate(record)
 
+    def test_reboot_reduced_fib_count_releases_stale_journal_without_netstat(self):
+        # net.fibs is not persistent. After a reboot the kernel can expose one
+        # table while the journal still names a higher one; withdrawal must
+        # neither query nor rewrite a table the kernel did not create.
+        class Harness(policy.TunPolicyRouting):
+            STATE = '/state'
+            TUN = 'tun_test'
+            ANCHOR = 'test'
+            LABEL = 'test-routing'
+            PF_PREFIX = 'test'
+            NATIVE_PYTHON = '/usr/local/bin/python3'
+            NATIVE_HELPER = '/helper.py'
+            ROUTING_LOCK = '/run/test.lock'
+
+            def command(self, args, **_options):
+                if args == ['/sbin/sysctl', '-n', 'net.fibs']:
+                    return subprocess.CompletedProcess(args, 0, b'1\n', b'')
+                if args[0] == '/usr/bin/netstat':
+                    raise AssertionError('A stale table must never be read: ' + repr(args))
+                return subprocess.CompletedProcess(args, 0, b'', b'')
+
+        with tempfile.TemporaryDirectory() as directory:
+            harness = Harness(Path(directory), lambda *_args, **_options: None,
+                              lambda _seconds: None)
+            stale = forwarding()
+            record = {'schema': 1, 'fib': 2023, 'active': False, 'pending': True,
+                      'routes': {route.route_key(stale): stale}, 'reserved': None}
+            result = harness.disable(record)
+            self.assertFalse(result['pending'])
+            self.assertIsNone(result['fib'])
+            self.assertEqual({}, record['routes'])
+            self.assertFalse(harness.load()['pending'])
+            self.assertIsNone(harness.load()['fib'])
+
     def test_reservation_is_journalled_before_inspection_and_reused(self):
         record = {'fib': None, 'routes': {}, 'active': False}
         count = [1]

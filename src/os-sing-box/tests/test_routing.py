@@ -83,6 +83,8 @@ class Kernel:
             self.tables[self.fibs - 1] = cloned
         elif args[0] == '/usr/bin/netstat':
             fib, family = int(args[args.index('-F') + 1]), 4 if args[-1] == 'inet' else 6
+            if fib not in self.tables:
+                return subprocess.CompletedProcess(args, 64, b'', b'netstat: %d: invalid fib\n' % fib)
             lines = ['Routing tables', 'Destination Gateway Flags Netif Expire']
             for value in self.tables[fib].values():
                 if value['family'] == family:
@@ -684,6 +686,29 @@ class RoutingTests(unittest.TestCase):
         self.kernel.alive = False
         self.assertFalse(self.routing.execute('refresh')['active'])
         self.assertEqual(self.kernel.anchor, '')
+
+    def test_reboot_reset_net_fibs_releases_stale_journal_table(self):
+        # net.fibs is not persistent, so a reboot can leave the journal naming
+        # a table the kernel no longer creates. The watcher's refresh must
+        # withdraw capture without querying or rewriting that table.
+        stale = route('10.99.0.0/24', '10.0.0.9', 'vtnet1')
+        self.routing.save({'schema': 1, 'fib': 2023, 'active': False, 'pending': True,
+                           'routes': {m.route_key(stale): stale}, 'reserved': None})
+        result = self.routing.execute('refresh')
+        self.assertFalse(result['active'])
+        self.assertFalse(result['pending'])
+        self.assertIsNone(result['fib'])
+        record = self.routing.load()
+        self.assertEqual(record['routes'], {})
+        self.assertFalse(any(args[0] == '/usr/bin/netstat' and '2023' in args
+                             for args in self.kernel.calls))
+        self.assertEqual(self.kernel.anchor, '')
+        # The next start reserves a table inside the current kernel range.
+        result = self.routing.execute('enable')
+        self.assertTrue(result['active'])
+        self.assertEqual(result['fib'], 1)
+        self.assertEqual(self.kernel.fibs, 2)
+        self.assertEqual(self.kernel.tables[1]['4:0.0.0.0/0%']['interface'], m.TUN)
 
     def test_paused_core_withdraws_capture_and_sigcont_waits_for_explicit_restart(self):
         native = copy.deepcopy(self.kernel.tables[0])

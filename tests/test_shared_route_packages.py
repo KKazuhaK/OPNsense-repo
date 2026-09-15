@@ -43,7 +43,7 @@ class SharedRoutePackageTests(unittest.TestCase):
             payloads[destination] = payload
         manifest = {
             'name': plugin,
-            'version': {'os-mihomo': '1.2.6', 'os-sing-box': '1.1.2',
+            'version': {'os-mihomo': '1.2.7', 'os-sing-box': '1.1.3',
                         'os-easytier': '1.1.2'}[plugin],
             'abi': 'FreeBSD:15:amd64',
             'files': {path: '1$' + hashlib.sha256(value).hexdigest()

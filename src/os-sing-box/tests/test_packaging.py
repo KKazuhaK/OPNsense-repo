@@ -117,6 +117,8 @@ class PackagingStateTests(unittest.TestCase):
         self.assertIn("('pre-install', '+PRE_INSTALL')", source)
         self.assertIn('packaging/freebsd/+PRE_INSTALL', source)
         self.assertIn('src/usr/local/opnsense/scripts/singbox/config_setup.php', source)
+        self.assertIn('python${TARGET_PYTHON:-3.13}', source)
+        self.assertNotIn('command -v python3', source)
         post = (PACKAGE / 'packaging/freebsd/+POST_INSTALL').read_text()
         self.assertIn('singbox/integration.py init', post)
         self.assertIn('singbox/config_setup.php retire-legacy', post)

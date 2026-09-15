@@ -14,6 +14,7 @@ OUTPUT_NAME="${OUTPUT_NAME:-${PKG_NAME}-${VERSION}.pkg}"
 SING_BOX_ASSET="${SING_BOX_ASSET:-bsd-box-reF1nd-freebsd-amd64.xz}"
 SING_BOX_DOWNLOAD_URL="${SING_BOX_DOWNLOAD_URL:-https://github.com/Vincent-Loeng/bsd-box/releases/latest/download/$SING_BOX_ASSET}"
 DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-300}"
+SING_BOX_PYTHON="${SING_BOX_PYTHON:-python${TARGET_PYTHON:-3.13}}"
 
 SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd)"
 WORKDIR="${WORKDIR:-"$SCRIPT_DIR/work/freebsd-pkg"}"
@@ -36,7 +37,7 @@ command -v pkg >/dev/null 2>&1 || die "pkg command not found. Run this script on
 command -v tar >/dev/null 2>&1 || die "tar command not found."
 command -v xz >/dev/null 2>&1 || die "xz command not found."
 command -v sha256 >/dev/null 2>&1 || die "sha256 command not found."
-command -v python3 >/dev/null 2>&1 || die "python3 command not found."
+command -v "$SING_BOX_PYTHON" >/dev/null 2>&1 || die "$SING_BOX_PYTHON command not found."
 if ! command -v fetch >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
     die "fetch or curl command not found."
 fi
@@ -193,7 +194,7 @@ done < "$PLIST"
 
 echo "==> Generating metadata"
 # Pkg URL-decodes manifest scripts, so escape percent signs before serialization.
-python3 - "$SCRIPT_DIR" "$STAGEDIR" "$METADIR" "$PLIST" "$PKG_NAME" "$ORIGIN" "$VERSION" "$COMMENT" "$MAINTAINER" "$WWW" "$PKG_ABI" "$PKG_ARCH" "$PREFIX" "$FLATSIZE" <<'PYTHON'
+"$SING_BOX_PYTHON" -B - "$SCRIPT_DIR" "$STAGEDIR" "$METADIR" "$PLIST" "$PKG_NAME" "$ORIGIN" "$VERSION" "$COMMENT" "$MAINTAINER" "$WWW" "$PKG_ABI" "$PKG_ARCH" "$PREFIX" "$FLATSIZE" <<'PYTHON'
 from pathlib import Path
 import hashlib
 import json

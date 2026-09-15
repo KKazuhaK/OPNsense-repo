@@ -55,6 +55,13 @@ def main(argv=None):
             args.append('-' + discard)
         return command(args)
 
+    # The kernel resolves every discard route through the loopback, which a
+    # fresh VNET jail leaves without an address. Attaching one also gives lo0
+    # its IPv6 identities, so borrow it before the baseline is taken and hand
+    # it back only once the table has been confirmed unchanged.
+    loopback = '4:127.0.0.1/32%' not in routes(0)
+    if loopback:
+        command(['/sbin/ifconfig', 'lo0', 'inet', '127.0.0.1/8', 'alias'])
     baseline = {family: routes(0, family) for family in (4, 6)}
     reserved = ['10.253.0.0/24', '10.255.255.254/32', '203.0.113.0/25', '203.0.113.128/25']
     if any(route['destination'] in reserved for route in baseline[4].values()):
@@ -72,8 +79,8 @@ def main(argv=None):
         count = int(command(['/sbin/sysctl', '-n', 'net.fibs']).stdout)
         if not 1 <= count <= 65531:
             raise RuntimeError('No fixture routing tables are available.')
-        command(['/sbin/sysctl', 'net.fibs=' + str(count + 3)])
-        cold, ambiguous, occupied = range(count, count + 3)
+        command(['/sbin/sysctl', 'net.fibs=' + str(count + 4)])
+        cold, ambiguous, occupied, pristine = range(count, count + 4)
 
         def remember(family, destination):
             wanted = next(route for route in routes(0, family).values() if route['destination'] == destination)
@@ -107,14 +114,29 @@ def main(argv=None):
         assert b'File exists' in rejected.stderr
         checks.append('exclusive add preserves existing destination without ECMP')
 
+        discarded = {}
         for destination, discard in [('203.0.113.0/25', 'blackhole'), ('203.0.113.128/25', 'reject')]:
             cli('add', 0, destination, '127.0.0.1', discard=discard)
-            wanted = remember(4, destination)
+            discarded[discard] = wanted = remember(4, destination)
             # FreeBSD normalizes these discard gateways to an interface route.
             # Exercise the real dispatcher instead of inventing a numeric path.
             routing.Routing().route_command('add', cold, wanted)
             assert routing.route_semantic(routes(cold)[routing.route_key(wanted)]) == routing.route_semantic(wanted)
-        checks.append('blackhole and reject route clones')
+        checks.append('blackhole and reject route clones through the route(8) path')
+
+        # Because of that normalization the dispatcher never hands the helper a
+        # discard route, so its discard branch only ever sees an identity some
+        # other caller invented. Drive it directly with numeric gateways the
+        # live table does not carry: it must refuse rather than fabricate them.
+        for wanted, reason in [(dict(discarded['blackhole'], gateway='10.253.0.1', interface=first),
+                                b'gateway or interface changed'),
+                               (dict(discarded['reject'], gateway='10.255.255.254', interface=first),
+                                b'gateway or interface changed'),
+                               (dict(selected, discard='blackhole'), b'changed before it could be copied')]:
+            refused = add(pristine, wanted, False)
+            assert refused.returncode and reason in refused.stderr, refused.stderr
+        assert not routes(pristine)
+        checks.append('synthesized numeric discard identities are refused by the helper')
 
         command(['/sbin/ifconfig', first, 'inet6', '2001:db8:3::10/64', '-ifdisabled'])
         command(['/sbin/ifconfig', second, 'inet6', '2001:db8:4::10/64', '-ifdisabled'])
@@ -142,7 +164,11 @@ def main(argv=None):
             routing.Routing().route_command('delete', 0, live)
         for name in reversed(interfaces):
             command(['/sbin/ifconfig', name, 'destroy'])
-        assert {family: routes(0, family) for family in (4, 6)} == baseline
+        try:
+            assert {family: routes(0, family) for family in (4, 6)} == baseline
+        finally:
+            if loopback:
+                command(['/sbin/ifconfig', 'lo0', 'inet', '127.0.0.1/8', '-alias'])
     print(json.dumps({'checks': checks, 'source_routes_and_interfaces_restored': True}))
     return 0
 

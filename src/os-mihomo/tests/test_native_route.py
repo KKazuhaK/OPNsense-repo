@@ -31,9 +31,9 @@ def acknowledgement(message, error=0):
     return reply(m.ERROR, sequence, struct.pack('=i', error) + message[:m.HEADER.size], pid)
 
 
-def source(wanted, index=4):
+def source(wanted, index=4, table=0):
     net, gw, index = m.validate(1, wanted, lambda _: index)
-    return m.payload(0, wanted, net, gw, index)
+    return m.payload(table, wanted, net, gw, index)
 
 
 class Socket:
@@ -64,6 +64,43 @@ class Socket:
         if not self.packets:
             raise socket.timeout('synthetic timeout')
         return self.packets.pop(0)
+
+
+class LostAcknowledgement(Socket):
+    """Deliver the add to the kernel, then never answer it."""
+    def __init__(self, wanted=None, present=None, fib=None):
+        super().__init__(wanted)
+        self.present, self.fib = present, fib
+
+    def send(self, message):
+        self.sent.append(message)
+        _, kind, _, sequence, pid = m.HEADER.unpack_from(message)
+        if kind == m.NEWROUTE:
+            return len(message)
+        if sequence == 1:
+            body = source(self.wanted)
+        elif self.fib is None:
+            return len(message)
+        else:
+            body = source(self.present or self.wanted, table=self.fib)
+        self.packets.append(reply(m.NEWROUTE, sequence, body, pid) + acknowledgement(message))
+        return len(message)
+
+
+class ExtraAttribute(Socket):
+    """Answer the source query with one more attribute than the plugin sends."""
+    def __init__(self, wanted, extra):
+        super().__init__(wanted)
+        self.extra = extra
+
+    def send(self, message):
+        self.sent.append(message)
+        _, kind, _, sequence, pid = m.HEADER.unpack_from(message)
+        if kind == m.GETROUTE:
+            self.packets.append(reply(m.NEWROUTE, sequence, source(self.wanted) + self.extra, pid) + acknowledgement(message))
+        else:
+            self.packets.append(acknowledgement(message, self.error))
+        return len(message)
 
 
 class NativeRouteTests(unittest.TestCase):
@@ -136,6 +173,38 @@ class NativeRouteTests(unittest.TestCase):
                 self.assertEqual(m.ROUTE.unpack_from(sock.sent[-1], m.HEADER.size)[7], kind)
                 attrs = m.attributes(sock.sent[-1][m.HEADER.size + m.ROUTE.size:])
                 self.assertTrue(m.U32.unpack(attrs[m.RTFLAGS])[0] & flag)
+
+    def test_lost_acknowledgement_adopts_the_route_the_kernel_installed(self):
+        wanted = route()
+        sock = LostAcknowledgement(wanted, fib=2023)
+        m.add(2023, wanted, lambda: (sock, 1234), lambda _: 4)
+        self.assertEqual(len(sock.sent), 3)
+        readback = sock.sent[2]
+        self.assertEqual(m.HEADER.unpack_from(readback)[1], m.GETROUTE)
+        attrs = m.attributes(readback[m.HEADER.size + m.ROUTE.size:])
+        self.assertEqual(attrs[m.TABLE], m.U32.pack(2023))
+        self.assertTrue(sock.closed)
+
+    def test_lost_acknowledgement_reports_failure_when_no_route_was_installed(self):
+        for present in (None, route(gateway='10.255.255.9')):
+            with self.subTest(present=present):
+                fib = None if present is None else 2023
+                sock = LostAcknowledgement(route(), present=present, fib=fib)
+                with self.assertRaises(OSError):
+                    m.add(2023, route(), lambda: (sock, 1234), lambda _: 4)
+                self.assertEqual(len(sock.sent), 3)
+                self.assertTrue(sock.closed)
+
+    def test_source_multipath_attribute_is_not_the_kernel_signal(self):
+        # FreeBSD 15.1 answers a unicast query with the selected path and, for
+        # a weighted or grouped nexthop, NL_RTA_WEIGHT. It never sends
+        # NL_RTA_MULTIPATH, so neither attribute may decide a copy here.
+        for kind in (13, 9):
+            with self.subTest(kind=kind):
+                wanted = route()
+                sock = ExtraAttribute(wanted, m.attribute(kind, m.U32.pack(0)))
+                m.add(3, wanted, lambda: (sock, 1234), lambda _: 4)
+                self.assertEqual(len(sock.sent), 2)
 
     def test_invalid_identity_never_opens_socket(self):
         def forbidden():

@@ -41,6 +41,7 @@ BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. Th
                             'Stop the service and use Repair saved backup to validate and import the edited backup.')
 UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
 UNBOUND_CONFIG_ROOT = '/var/unbound'
+UNBOUND_TEMPLATE_ROOT = '/usr/local/opnsense/service/templates/OPNsense/Unbound'
 FORWARDER = '127.0.0.1@1053'
 ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1
@@ -1132,39 +1133,88 @@ class System:
         except OSError:
             return False
 
+    def unbound_template_targets(self):
+        """Every file a reload of the Unbound templates is able to write.
+
+        Only two of them land in the chroot. The rest are written outside it and
+        reach the resolver when the restart copies them in, so the chroot on its
+        own cannot say whether the reload changed the policy Unbound is about to
+        serve -- an operator who replaces the DNS over TLS upstreams and saves
+        without applying changes dot.conf and nothing else. The engine keeps the
+        mapping in +TARGETS beside the templates; read it rather than repeating
+        a list here, because a firmware update extends it without asking us.
+        """
+        containers = sorted(Path(UNBOUND_TEMPLATE_ROOT).glob('*/+TARGETS'))
+        if not containers:
+            return None
+        targets = []
+        for container in containers:
+            for line in container.read_text().splitlines():
+                entry = line.strip()
+                if not entry or entry.startswith('#'):
+                    continue
+                target = entry.partition(':')[2].strip()
+                # A '[...]' placeholder expands once per model node, so the set
+                # of files behind such a mapping is not knowable from it alone.
+                if (not target or not Path(target).is_absolute()
+                        or any(char in target for char in '[]*?')):
+                    return None
+                targets.append(Path(target))
+        return targets
+
     def unbound_render_snapshot(self):
-        """Compare generated listeners and includes before avoiding a restart."""
+        """Compare everything a template reload can write before avoiding a restart."""
         root = Path(UNBOUND_CONFIG_ROOT)
         try:
             main = root / 'unbound.conf'
             if not main.is_file():
                 return None
-            files = sorted(root.rglob('*.conf'))
-            if len(files) > 4096:
+            targets = self.unbound_template_targets()
+            if targets is None:
                 return None
+            files = sorted(root.rglob('*.conf'))
+            if len(files) + len(targets) > 4096:
+                return None
+            # The chroot is walked by the path Unbound reads and every remaining
+            # target by the path the engine writes to, so the two never collide.
+            inside = {os.path.realpath(filename) for filename in files}
+            entries = [(filename.relative_to(root).as_posix(), filename, True) for filename in files]
+            entries += [(target.as_posix(), target, False) for target in targets
+                        if os.path.realpath(target) not in inside]
             digest = hashlib.sha256()
             total = 0
-            for filename in files:
-                with filename.open('rb') as handle:
-                    data = handle.read(MAX_CONFIG - total + 1)
-                total += len(data)
-                if total > MAX_CONFIG:
-                    return None
-                for line in data.decode('utf-8').splitlines():
-                    if re.match(r'^\s*include(?:-toplevel)?\s*:', line):
-                        parts = shlex.split(line, comments=True)
-                        if len(parts) != 2 or parts[0] not in ('include:', 'include-toplevel:'):
-                            return None
-                        include = Path(parts[1])
-                        if (not include.is_absolute() or include.suffix != '.conf'
-                                or not include.parent.resolve().is_relative_to(root.resolve())
-                                or (include.name != '*.conf' and not include.is_file())):
-                            return None
-                name = filename.relative_to(root).as_posix().encode()
+            for name, filename, chrooted in entries:
+                try:
+                    with filename.open('rb') as handle:
+                        data = handle.read(MAX_CONFIG - total + 1)
+                except FileNotFoundError:
+                    # A target the configuration does not need yet is simply
+                    # absent; its appearance is itself a change worth a restart.
+                    if chrooted:
+                        return None
+                    data = None
+                if data is not None:
+                    total += len(data)
+                    if total > MAX_CONFIG:
+                        return None
+                if chrooted:
+                    for line in data.decode('utf-8').splitlines():
+                        if re.match(r'^\s*include(?:-toplevel)?\s*:', line):
+                            parts = shlex.split(line, comments=True)
+                            if len(parts) != 2 or parts[0] not in ('include:', 'include-toplevel:'):
+                                return None
+                            include = Path(parts[1])
+                            if (not include.is_absolute() or include.suffix != '.conf'
+                                    or not include.parent.resolve().is_relative_to(root.resolve())
+                                    or (include.name != '*.conf' and not include.is_file())):
+                                return None
+                name = name.encode()
                 digest.update(len(name).to_bytes(4, 'big'))
                 digest.update(name)
-                digest.update(len(data).to_bytes(8, 'big'))
-                digest.update(data)
+                digest.update(b'\x00' if data is None else b'\x01')
+                if data is not None:
+                    digest.update(len(data).to_bytes(8, 'big'))
+                    digest.update(data)
             return digest.digest()
         except (OSError, ValueError, UnicodeError):
             return None
@@ -2050,7 +2100,7 @@ class Manager:
         atomic_write(path, content)
         return path
 
-    def stop(self, settings=None):
+    def stop(self, settings=None, reason=None):
         settings = settings or self.settings()
         # Restore direct DNS before stopping the listener, even for fail-closed policy.
         failed = None
@@ -2061,8 +2111,12 @@ class Manager:
         try:
             self.system.stop()
         finally:
+            # A cleanup that works leaves nothing behind to explain itself, so
+            # the caller's failure is what the status has to name: without it a
+            # start that could not arm reads as a service nobody ever asked for.
             self.publish_status(settings, dns_active=failed is not None,
-                error='DNS restoration failed; the core and TUN were stopped. Recovery will be retried.' if failed else '')
+                error='DNS restoration failed; the core and TUN were stopped. Recovery will be retried.' if failed
+                      else str(reason) if reason is not None else '')
         if failed:
             raise Error('DNS restoration failed; the core and TUN were stopped. Recovery will be retried.') from None
 
@@ -2105,9 +2159,15 @@ class Manager:
             if self.selections_file.exists():
                 atomic_write(self.replay_file, b'pending\n')
             self.proxy_tick()
+            # The watchdog starts only once arming has succeeded. Starting it
+            # earlier would have it retry a failed arm every few seconds, which
+            # is how one uptime consumed two thousand kernel routing tables, and
+            # its first tick republishes ground truth anyway -- erasing the
+            # reason Manager.stop just recorded. A failed arm stays failed and
+            # stays explained.
             self.system.watch()
-        except (Error, OSError):
-            self.stop(settings)
+        except (Error, OSError) as error:
+            self.stop(settings, reason=error)
             raise
         return self.publish_status(settings, dns_active)
 

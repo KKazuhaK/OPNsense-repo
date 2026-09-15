@@ -20,14 +20,25 @@ done
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 if [ "$restore_ready" = YES ]; then
     if [ -n "${PKG_UPGRADE+x}" ]; then
-        /usr/local/bin/python3 "$control" init upgrade
+        stage=upgrade
     else
-        /usr/local/bin/python3 "$control" init fresh
+        stage=fresh
     fi
-    cron_result="$(/usr/local/bin/php /usr/local/opnsense/scripts/mihomo/setup_unbound.php restore-cron)"
+    # Nothing below may abort the hook: configd, the firmware registration and
+    # the proxy itself still have to run even when a step here cannot finish.
+    store_ready=YES
+    if ! /usr/local/bin/python3 "$control" init "$stage"; then
+        store_ready=NO
+        echo 'Warning: the Mihomo settings store could not be prepared. Review the plugin settings in the web interface before starting the service.' >&2
+    fi
+    if ! cron_result="$(/usr/local/bin/php /usr/local/opnsense/scripts/mihomo/setup_unbound.php restore-cron)"; then
+        cron_result=
+        echo 'Warning: the Mihomo subscription schedule could not be restored. Save the subscription settings once to recreate it.' >&2
+    fi
     case "$cron_result" in *updated*) configctl cron restart ;; esac
     # Retire known workaround entry points only after successful migration.
-    if [ -f /var/db/os-mihomo/migrate/actions_mihomolocal.conf ]; then
+    # A store that was never prepared still needs the old ones to answer for it.
+    if [ "$store_ready" = YES ] && [ -f /var/db/os-mihomo/migrate/actions_mihomolocal.conf ]; then
         rm -f /usr/local/opnsense/service/conf/actions.d/actions_mihomolocal.conf
         rm -f /usr/local/etc/mihomo/update-sub.sh /usr/local/etc/mihomo/repair-after-upgrade.sh
     fi
@@ -41,6 +52,6 @@ if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
         echo 'Warning: the installed plugin recovery manifest could not be refreshed.' >&2
 fi
 # A fresh installation runs proxy ports only. Upgrade retains the explicit policy.
-if [ "$restore_ready" = YES ]; then
-    /usr/local/bin/python3 "$control" boot
+if [ "$restore_ready" = YES ] && ! /usr/local/bin/python3 "$control" boot; then
+    echo 'Warning: Mihomo could not be started. Start it from the web interface once its settings are reviewed.' >&2
 fi

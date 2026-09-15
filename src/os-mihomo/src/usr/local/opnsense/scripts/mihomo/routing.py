@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 import yaml
 
@@ -28,11 +29,23 @@ MAX_CONFIG = 16 * 1024 * 1024
 MAX_STATES = 64 * 1024 * 1024
 ROUTE_LIMIT = 8192
 DEVICE_LIMIT = 128
+RESERVE_ATTEMPTS = 3
+RESERVE_BACKOFF = 0.5
+DETAIL = 512
 IFNAME = re.compile(r'[A-Za-z0-9_.-]{1,15}\Z')
 
 
 class RoutingError(Exception):
     pass
+
+
+def failure(args, value):
+    """Quote the helper's own diagnosis; an arm failure is otherwise blind."""
+    name = Path(args[0]).name
+    if name.startswith('python') and len(args) > 1:
+        name = Path(args[1]).name
+    detail = ' '.join((value.stderr or b'').decode(errors='replace').split())[:DETAIL]
+    return 'The %s operation failed with status %d.%s' % (name, value.returncode, ' ' + detail if detail else '')
 
 
 def network(value, family=None):
@@ -254,11 +267,12 @@ def capture_states(text, fib):
 
 
 class Routing:
-    def __init__(self, root=Path('/'), run=None):
+    def __init__(self, root=Path('/'), run=None, delay=None):
         self.root = Path(root)
         self.state = self.path(STATE)
         self.marker = self.state / 'routing-state.json'
         self.runner = run or subprocess.run
+        self.delay = delay or time.sleep
 
     def path(self, value):
         return self.root / value.lstrip('/')
@@ -268,8 +282,10 @@ class Routing:
             value = self.runner(args, capture_output=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
             raise RoutingError('A routing operation failed or timed out.') from None
-        if len(value.stdout) + len(value.stderr) > limit or (check and value.returncode):
-            raise RoutingError('A routing operation failed.')
+        if len(value.stdout) + len(value.stderr) > limit:
+            raise RoutingError('A routing operation produced too much output.')
+        if check and value.returncode:
+            raise RoutingError(failure(args, value))
         return value
 
     def read(self, path, default=None, private=False, limit=LIMIT):
@@ -298,8 +314,13 @@ class Routing:
                 raise ValueError
             if not isinstance(record.get('resume', False), bool):
                 raise ValueError
-            if not isinstance(record['fib'], int) or not 1 <= record['fib'] <= 65534:
-                raise ValueError
+            # A record may hold a reserved table and no owned one yet: the
+            # sysctl bump is journalled before the table is examined. Only the
+            # reservation is optional; a record without the owned number at all
+            # would reach allocate and disable as a KeyError nothing catches.
+            for value in (record['fib'], record.get('reserved')):
+                if value is not None and (not isinstance(value, int) or not 1 <= value <= 65534):
+                    raise ValueError
             for key, route in record['routes'].items():
                 if key != route_key(route) or not IFNAME.fullmatch(route['interface']) or route['family'] not in (4, 6):
                     raise ValueError
@@ -371,22 +392,45 @@ class Routing:
             raise RoutingError('The routing anchor contains rules owned elsewhere.')
         return current
 
+    def occupied(self, fib):
+        """FreeBSD clones kernel interface routes into newly allocated FIBs.
+        Borrow identical nondefault system routes, but never claim ownership."""
+        native = self.routes(0)
+        for key, route in self.routes(fib).items():
+            if not ipaddress.ip_network(route['destination']).prefixlen or key not in native or route_identity(route) != route_identity(native[key]):
+                return True
+        return False
+
     def allocate(self, record):
         count = int(self.command(['/sbin/sysctl', '-n', 'net.fibs']).stdout.strip())
         if record['fib'] is not None and record['fib'] < count:
             return
-        if not 1 <= count < 65535:
-            raise RoutingError('No supported private routing table is available.')
-        self.command(['/sbin/sysctl', 'net.fibs=' + str(count + 1)])
-        if int(self.command(['/sbin/sysctl', '-n', 'net.fibs']).stdout.strip()) != count + 1:
-            raise RoutingError('The private routing table allocation could not be verified.')
-        # FreeBSD clones kernel interface routes into newly allocated FIBs.
-        # Borrow identical nondefault system routes, but never claim ownership.
-        native = self.routes(0)
-        for key, route in self.routes(count).items():
-            if not ipaddress.ip_network(route['destination']).prefixlen or key not in native or route_identity(route) != route_identity(native[key]):
-                raise RoutingError('The new routing table is already occupied.')
-        record.update(fib=count, routes={}, active=False)
+        reserved = record.get('reserved')
+        if not isinstance(reserved, int) or not 1 <= reserved < count:
+            if not 1 <= count < 65535:
+                raise RoutingError('No supported private routing table is available.')
+            self.command(['/sbin/sysctl', 'net.fibs=' + str(count + 1)])
+            if int(self.command(['/sbin/sysctl', '-n', 'net.fibs']).stdout.strip()) != count + 1:
+                raise RoutingError('The private routing table allocation could not be verified.')
+            # The kernel never lowers net.fibs again, so the number this bump
+            # paid for is written down before anything else can fail. A later
+            # attempt re-examines that table instead of buying another one.
+            reserved = count
+            record['reserved'] = reserved
+            self.save(record)
+        for attempt in range(RESERVE_ATTEMPTS):
+            if not self.occupied(reserved):
+                break
+            if attempt + 1 == RESERVE_ATTEMPTS:
+                # Name the table: the reservation is kept, so this is the
+                # one an operator has to go and look at, every time.
+                raise RoutingError('Private routing table ' + str(reserved)
+                                   + ' is occupied by routes this plugin does not own.')
+            # An interface that changes between the two snapshots reads like a
+            # foreign owner. Let a transient difference settle, but bound the
+            # wait: a status poll re-enters this path every few seconds.
+            self.delay(RESERVE_BACKOFF)
+        record.update(fib=reserved, routes={}, active=False, reserved=None)
         self.save(record)
 
     def route_command(self, action, fib, route):
@@ -430,7 +474,10 @@ class Routing:
                     raise RoutingError('A private routing destination was changed externally.')
                 continue
             if existing is not None and previous is None:
-                if wanted is not None and ipaddress.ip_network(wanted['destination']).prefixlen and route_identity(existing) == route_identity(wanted):
+                # A copy the kernel accepted carries flags of its own making,
+                # RTF_STATIC above all. Recognize our own unrecorded work by
+                # what the route does, never by how netstat prints it.
+                if wanted is not None and ipaddress.ip_network(wanted['destination']).prefixlen and route_semantic(existing) == route_semantic(wanted):
                     continue
                 if strict:
                     raise RoutingError('A private routing destination is owned elsewhere.')
@@ -632,6 +679,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (RoutingError, OSError, UnicodeError):
-        print('Mihomo routing could not be applied safely; owned recovery will be retried.', file=sys.stderr)
+    except (RoutingError, OSError, UnicodeError) as error:
+        print('Mihomo routing could not be applied safely; owned recovery will be retried. ' + str(error), file=sys.stderr)
         raise SystemExit(1)

@@ -97,6 +97,8 @@ class FrameworkApiTests(unittest.TestCase):
         self.assertIn('id="dns_override"', view)
         self.assertIn("'dns_override'", settings)
         self.assertIn("$('#dns_override,#router_dns').on('change', updateDnsControls);", view)
+        for field in ('dns_default', 'dns_nameserver', 'dns_proxy_nameserver'):
+            self.assertIn('id="effective_' + field + '"', view)
 
 
 class DeviceTabTests(unittest.TestCase):

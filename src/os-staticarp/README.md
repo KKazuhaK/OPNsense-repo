@@ -47,3 +47,11 @@ pkg add -f dist/os-staticarp.pkg
 The normal OPNsense configuration backup includes a compressed, checksummed snapshot of `/usr/local/etc/staticarp` and `/etc/rc.conf.d/staticarp` under `OPNsense/Staticarp/backup`. The existing files remain the runtime configuration source. Successful saves and apply/reset commands update the snapshot; a background watcher also captures external file and service-enable changes.
 
 Restore the normal OPNsense backup and reboot. An early configuration hook restores changed snapshots before service configuration is loaded. Unchanged snapshots do not replace newer runtime files. File contents, absence and permission modes are preserved. Installation imports a saved snapshot before creating defaults. Temporary files, logs, PID files and locks are excluded.
+
+## Runtime ownership
+
+Apply and Reset never flush the global ARP table. Only bindings on directly connected configured interfaces and interface modes changed by this plugin are recorded in a private, durable journal. Reset restores any preexisting static binding or ARP mode when the current state still matches the plugin's last change. Later administrator edits and replaced interfaces take precedence. A conflicting Apply reports failure; remove the conflicting plugin setting before applying it again. Kernel and journal failures retain recovery information and cannot report a successful Apply.
+
+The journal identifies the kernel boot and interface index. After a reboot, the explicit settings are applied against the new native baseline; stale runtime ownership is discarded. Existing installations without an ownership journal do not infer ownership of permanent neighbors or interface modes. Identical preexisting state is preserved. The outgoing removal hook of older releases predates these ownership protections; its historical upgrade behavior is not evidence of a fresh installation test.
+
+The ownership journal is runtime state and is deliberately excluded from configuration backups. New installations start disabled and do not change unrelated neighbors. Package action registration requires one configd restart, without restarting the WebGUI. Daily Apply and Reset restart neither service.

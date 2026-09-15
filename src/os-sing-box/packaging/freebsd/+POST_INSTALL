@@ -13,10 +13,11 @@ echo "===> Configuring os-sing-box"
 
 BACKUP_DIR="/var/db/os-sing-box-upgrade"
 NEW_SETTINGS=""
-INITIAL_INSTALL="no"
 WAS_RUNNING="no"
+IS_UPGRADE="no"
 RESTORED_SETTINGS="no"
 RESTORE_FAILED="no"
+[ -z "${PKG_UPGRADE+x}" ] || IS_UPGRADE="yes"
 umask 077
 if restore_result="$(/usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py import-config 2>/dev/null)"; then
     :
@@ -57,7 +58,6 @@ if [ "$RESTORED_SETTINGS" = "no" ]; then
     done
     if [ ! -f /etc/rc.conf.d/sing_box ]; then
         install -m 0644 /etc/rc.conf.d/sing_box.sample /etc/rc.conf.d/sing_box
-        INITIAL_INSTALL="yes"
     fi
 fi
 touch /var/log/sing-box.log /var/log/sing-box_sub.log 2>/dev/null || true
@@ -98,12 +98,37 @@ if [ "$RESTORE_FAILED" = "no" ] && [ -d "$BACKUP_DIR" ]; then
     rm -rf "$BACKUP_DIR"
 fi
 
-/usr/local/bin/php /usr/local/opnsense/scripts/singbox/config_setup.php >/dev/null 2>&1 \
-    || echo 'Warning: Sing-box interface configuration could not be synchronized.' >&2
+# First installation prepares an explicit proxy-only policy, without TUN rules.
+if [ "$RESTORE_FAILED" = "no" ] && [ -f /usr/local/etc/sing-box/config.json ]; then
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/integration.py init >/dev/null 2>&1 \
+        || echo 'Warning: Sing-box integration settings could not be initialized.' >&2
+fi
+
+# Version 1.1.1 had no ownership journal. Remove only its exact generated rule
+# and an exact, otherwise unreferenced interface assignment during the upgrade.
+if [ "$IS_UPGRADE" = "yes" ]; then
+    if LEGACY_RESULT="$(/usr/local/bin/php /usr/local/opnsense/scripts/singbox/config_setup.php retire-legacy 2>/dev/null)"; then
+        :
+    else
+        echo 'Exact legacy Sing-box TUN policy retirement failed.' >&2
+        exit 1
+    fi
+    case "$LEGACY_RESULT" in
+        changed) ;;
+        unchanged) ;;
+        *)
+            echo 'Exact legacy Sing-box TUN policy retirement returned an invalid result.' >&2
+            exit 1
+            ;;
+    esac
+fi
 
 echo "===> Reloading OPNsense services"
 service configd restart >/dev/null 2>&1 || true
-configctl filter reload >/dev/null 2>&1 || true
+if ! /usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/integration.py reload-filter >/dev/null 2>&1; then
+    echo 'A pending Sing-box firewall configuration reload could not be completed.' >&2
+    exit 1
+fi
 if [ "$RESTORE_FAILED" = "no" ]; then
     /usr/local/bin/python3 /usr/local/opnsense/scripts/singbox/config_mirror.py mirror >/dev/null 2>&1 \
         || echo 'Warning: Sing-box configuration backup could not be synchronized.' >&2
@@ -112,7 +137,5 @@ service sing-box-backup onerestart >/dev/null 2>&1 || true
 if [ "$RESTORE_FAILED" = "yes" ]; then
     :
 elif [ "$WAS_RUNNING" = "yes" ]; then
-    service sing-box restart >/dev/null 2>&1 || true
-elif [ "$INITIAL_INSTALL" = "yes" ]; then
-    service sing-box start >/dev/null 2>&1 || true
+    service sing-box onerestart >/dev/null 2>&1 || true
 fi

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import threading
 import time
 import tomllib
@@ -13,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 SOURCE = Path(os.environ.get('EASYTIER_SOURCE_ROOT', Path(__file__).resolve().parents[2])) / 'src/usr/local/opnsense/scripts/easytier/manage.py'
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'common'))
 spec = importlib.util.spec_from_file_location('easytier_mvc', SOURCE)
 manager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(manager)
@@ -27,6 +29,8 @@ class SettingsTest(unittest.TestCase):
         self.input = Path(self.directory.name) / 'easytier_mvc_input'
         self.input.touch(mode=0o600)
         self.addCleanup(patch.stopall)
+        patch.object(manager.network, 'routing_table', return_value={}).start()
+        patch.object(manager.network, 'load_record', return_value={}).start()
         patch.object(manager, 'CONFIG', self.config).start()
         patch.object(manager, 'LOG', self.log).start()
         patch.object(manager, 'SAVE_LOCK', Path(self.directory.name) / 'save.lock').start()

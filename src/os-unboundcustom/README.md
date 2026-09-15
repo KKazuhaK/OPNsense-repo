@@ -1,14 +1,38 @@
 # Unbound Custom Options for OPNsense
 
-An updated replacement for `os-unboundcustom-maxit`, tested with OPNsense 26.1.
+An updated replacement for `os-unboundcustom-maxit` targeting OPNsense 26.7.
 
 ## Safety behaviour
 
-The plugin saves settings, generates its dedicated include fragment, stages the
-runtime copy below `/var/unbound/etc`, validates the complete
-`/var/unbound/unbound.conf`, and only then restarts Unbound. On a validation or
-template or restart error it restores both copies of the previous fragment, so a bad edit
-does not interrupt the running resolver.
+The plugin renders its dedicated fragment and a complete include tree below the
+root-only `/var/db/os-unboundcustom` state directory, validates that candidate
+with `unbound-checkconf`, and only then durably publishes the live fragments.
+Candidate reads reject links, non-regular files, oversized files, and files
+that change while they are being copied. A disabled first installation does
+not restart DNS.
+Repeated applications keep the running resolver when the complete generated
+include closure still matches the receipt for that exact process. Changed
+listeners, other plugin includes, and unknown include forms require a restart.
+A resolver intentionally stopped by the administrator remains stopped.
+
+Validation and template failures restore the previous owned fragments. Restarts
+verify the original native Unbound executable, configuration argument, PID and
+kernel birth time, then stop it and directly launch the validated runtime
+configuration. The main configuration and other includes are not regenerated
+from pending OPNsense settings. Full restarts retain support for listener and
+remote-control changes that cannot take effect on reload. A concurrent Stop or
+replacement resolver is preserved. If startup fails, the plugin restores its
+fragments and directly starts the previous configuration; only its own launched
+process may be stopped for recovery. Recovery failures are reported explicitly.
+An existing corrupt or unsupported transaction receipt blocks apply and removal
+before changing files or DNS; it never falls back to legacy marker ownership.
+Removal preserves foreign same-named fragments and subsequent administrator
+edits. The private receipt is accepted only with its exact owner and mode;
+corrupt, linked, or permission-weakened state is never used as ownership
+authority. Upgrade removal hooks
+preserve the owned fragments; install/remove no longer restart the Web GUI.
+The outgoing hooks of a previously installed package still govern the first
+upgrade from that old version, including its historical DNS restart behaviour.
 
 Custom directives still require knowledge of `unbound.conf`. They are inserted
 verbatim and can override or conflict with settings managed by OPNsense.

@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-staticarp}"
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.1.2}"
 ORIGIN="${ORIGIN:-opnsense/os-staticarp}"
 COMMENT="${COMMENT:-Static ARP binding integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -42,6 +42,7 @@ need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp/Api/Ser
 need_file "src/usr/local/opnsense/mvc/app/views/OPNsense/Staticarp/index.volt"
 need_file "src/usr/local/opnsense/mvc/app/controllers/OPNsense/Staticarp/Api/SettingsController.php"
 need_file "src/usr/local/opnsense/scripts/staticarp/settings.php"
+need_file "src/usr/local/opnsense/scripts/staticarp/runtime.py"
 need_file "src/usr/local/etc/inc/plugins.inc.d/staticarp_backup.inc"
 need_file "src/usr/local/etc/rc.d/os-staticarp-backup"
 need_file "src/usr/local/opnsense/scripts/staticarp/config_mirror.py"
@@ -92,6 +93,9 @@ echo "==> Staging files"
 copy_tree "$SCRIPT_DIR/src" "$STAGEDIR"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.py" "$STAGEDIR/usr/local/opnsense/scripts/staticarp/config_backup.py"
 install -m 0644 "$SCRIPT_DIR/../common/config_backup.php" "$STAGEDIR/usr/local/opnsense/scripts/staticarp/config_backup.php"
+PRODUCT_VERSION="$(sed -n 's/.*"product_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+	"$STAGEDIR/usr/local/opnsense/version/staticarp")"
+[ "$PRODUCT_VERSION" = "$VERSION" ] || die "VERSION does not match the committed StaticARP product metadata"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/os-staticarp-backup"
 
 chmod 0644 "$STAGEDIR/etc/rc.conf.d/staticarp.sample"

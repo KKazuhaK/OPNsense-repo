@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Prove the device policy steers a real connection, not just a rendered rule.
+"""Prove device policy does not alter a manually configured proxy connection.
 
-The unit tests check which rules are generated and `mihomo -t` checks the core
-accepts them. Neither says a listed device is actually treated differently, so
-this runs a core of its own and makes a connection through it.
+Device policy selects LAN traffic before it enters TUN. This runs a proxy-only
+core and makes a real explicit HTTP proxy connection for each saved mode, so a
+regression cannot silently inject old SRC-IP-CIDR/DIRECT rules into the Core.
 
 Hermetic: the core binds to loopback on unused ports, has no TUN and no DNS
-takeover, and dials an address reserved for documentation, so no network and no
-other Mihomo is involved. What is asserted is which rule the core reports
-matching -- the exit cannot tell the cases apart when the node selector sits on
-DIRECT, but the rule always can.
+takeover, and dials an address reserved for documentation, so no external
+network and no other Mihomo is involved. Every case must reach the provider's
+MATCH rule.
 
 Run on a host with the core installed:  python3 test-device-policy.py
 """
@@ -26,6 +25,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'src/usr/local/opnsense/scripts/mihomo'))
+sys.path.insert(0, str(ROOT.parent / 'common'))
 CORE = Path('/usr/local/bin/mihomo')
 SOURCE = '127.0.0.1'
 OTHER = '192.0.2.77'
@@ -117,22 +118,13 @@ class DevicePolicyTests(unittest.TestCase):
         """Whether the device policy decided this connection rather than the rules."""
         return rule.startswith(('SrcIPCIDR', 'NOT(', 'NOT/('))
 
-    def test_a_blacklisted_device_is_forced_direct(self):
-        rule = self.matched('blacklist', [SOURCE])
-        self.assertTrue(self.steered(rule), rule)
-
-    def test_a_device_missing_from_the_blacklist_follows_the_rules(self):
-        self.assertFalse(self.steered(self.matched('blacklist', [OTHER])))
-
-    def test_a_whitelisted_device_follows_the_rules(self):
-        self.assertFalse(self.steered(self.matched('whitelist', [SOURCE])))
-
-    def test_a_device_missing_from_the_whitelist_is_forced_direct(self):
-        # The inverted form is the one worth proving: a whitelist cannot be
-        # written as a match on the listed devices, because matching stops at
-        # the first rule that matches.
-        rule = self.matched('whitelist', [OTHER])
-        self.assertTrue(self.steered(rule), rule)
+    def test_all_saved_modes_leave_explicit_proxy_clients_on_provider_rules(self):
+        for mode, listed in (('off', []), ('blacklist', [SOURCE]),
+                             ('blacklist', [OTHER]), ('whitelist', [SOURCE]),
+                             ('whitelist', [OTHER])):
+            with self.subTest(mode=mode, listed=listed):
+                rule = self.matched(mode, listed)
+                self.assertFalse(self.steered(rule), rule)
 
 
 if __name__ == '__main__':

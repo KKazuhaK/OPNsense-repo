@@ -11,6 +11,11 @@ import sys
 
 PYTHON_PATH = re.compile(rb'/usr/local/bin/python3(?:\.[0-9]+)?\b')
 VERSION_PATH = '/usr/local/opnsense/version/mihomo'
+SHARED_FILES = {
+    'process_identity.py': '/usr/local/opnsense/scripts/mihomo/process_identity.py',
+    'route_control.py': '/usr/local/opnsense/scripts/mihomo/route_control.py',
+    'tun_policy_routing.py': '/usr/local/opnsense/scripts/mihomo/tun_policy_routing.py',
+}
 
 
 def target_values(abi, product_abi, python, native_freebsd=None, repository=None,
@@ -124,6 +129,19 @@ def transform_hook(project, phase, target):
     return transform_content((Path(project) / 'packaging/freebsd' / phase).read_bytes(), target).decode()
 
 
+def shared_source(project, name):
+    """Read a fixed sibling common file without following source-tree links."""
+    project = Path(project)
+    source_root = project.parent
+    common = source_root / 'common'
+    path = common / name
+    if (source_root.is_symlink() or project.is_symlink()
+            or common.is_symlink() or not common.is_dir() or path.is_symlink()
+            or not path.is_file() or not path.resolve().is_relative_to(common.resolve())):
+        raise ValueError('A required shared routing source is missing or unsafe: ' + name)
+    return path.read_bytes()
+
+
 def staged_files(project, target, version):
     project = Path(project)
     source = project / 'src'
@@ -133,6 +151,8 @@ def staged_files(project, target, version):
         if (path.is_file() and path.suffix not in {'.xz', '.pyc', '.pyo'} and
                 '__pycache__' not in parts and not any(p == '.DS_Store' or p.startswith('._') for p in parts)):
             result['/' + str(path.relative_to(source))] = transform_content(path.read_bytes(), target)
+    for name, destination in SHARED_FILES.items():
+        result[destination] = transform_content(shared_source(project, name), target)
     result['/usr/local/bin/mihomo'] = lzma.decompress(
         (source / 'usr/local/bin/clash-meta-freebsd-amd64.xz').read_bytes())
     result[VERSION_PATH] = (json.dumps(product_metadata(project, target, version), sort_keys=True,

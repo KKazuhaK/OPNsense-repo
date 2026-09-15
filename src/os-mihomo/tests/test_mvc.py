@@ -91,6 +91,15 @@ class FrameworkApiTests(unittest.TestCase):
         settings = [p for p in CONTROLLERS if p.name == 'SettingsController.php'][0].read_text()
         self.assertIn("$settings['dashboard_any']", settings)
 
+    def test_manual_dns_has_an_explicit_runtime_override_switch(self):
+        view = VIEW.read_text()
+        settings = [p for p in CONTROLLERS if p.name == 'SettingsController.php'][0].read_text()
+        self.assertIn('id="dns_override"', view)
+        self.assertIn("'dns_override'", settings)
+        self.assertIn("$('#dns_override,#router_dns').on('change', updateDnsControls);", view)
+        for field in ('dns_default', 'dns_nameserver', 'dns_proxy_nameserver'):
+            self.assertIn('id="effective_' + field + '"', view)
+
 
 class DeviceTabTests(unittest.TestCase):
     """The device policy is its own tab, and it has to survive a long list."""

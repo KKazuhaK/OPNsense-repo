@@ -16,6 +16,7 @@ BINARIES = PACKAGE / 'src/usr/local/sbin'
 CORE = BINARIES / 'easytier-core'
 CLI = BINARIES / 'easytier-cli'
 SCRIPT = PACKAGE / 'src/usr/local/opnsense/scripts/easytier/manage.py'
+sys.path.insert(0, str(PACKAGE.parent / 'common'))
 
 
 class PortalTests(unittest.TestCase):
@@ -50,6 +51,9 @@ class PortalTests(unittest.TestCase):
             runner = Path(directory) / 'manage.py'
             runner.write_text(SCRIPT.read_text().replace(
                 "CONFIG = Path('/usr/local/etc/easytier/config.toml')", f'CONFIG = Path({str(config)!r})'))
+            runner.with_name('network.py').write_text((SCRIPT.with_name('network.py')).read_text())
+            runner.with_name('process_identity.py').write_text(
+                (PACKAGE.parent / 'common/process_identity.py').read_text())
             config.write_text('rpc_portal = "0.0.0.0:30125"\n')
             result = subprocess.run([sys.executable, str(runner), 'rpc-portal'], capture_output=True, text=True)
             self.assertEqual(0, result.returncode, result.stderr)
@@ -60,46 +64,45 @@ class PortalTests(unittest.TestCase):
             self.assertEqual('', result.stdout)
             self.assertNotIn('SENTINEL', result.stderr)
 
-    def test_rc_prestart_passes_portal_to_daemon_and_rejects_invalid_config_before_writes(self):
+    def test_rc_start_validates_before_launch_and_never_reloads_global_pf(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-
             def remap(source):
                 return re.sub(r'(?<![A-Za-z0-9_./-])/(usr/local|var)(?=/)',
                               lambda match: str(root / match[1]), source)
-
-            for subdirectory in ['usr/local/bin', 'usr/local/opnsense/scripts/easytier',
-                                 'usr/local/etc/easytier', 'var/run', 'var/log']:
-                (root / subdirectory).mkdir(parents=True, exist_ok=True)
-            python = root / 'usr/local/bin/python3'
-            python.symlink_to(sys.executable)
-            helper = root / 'usr/local/opnsense/scripts/easytier/manage.py'
-            helper.write_text(remap(SCRIPT.read_text()))
+            for directory in ('usr/local/bin', 'usr/local/opnsense/scripts/easytier', 'var/run', 'var/log'):
+                (root / directory).mkdir(parents=True, exist_ok=True)
+            (root / 'usr/local/bin/python3').symlink_to(sys.executable)
+            helper = root / 'usr/local/opnsense/scripts/easytier/network.py'
+            marker, arguments, reject = root / 'running', root / 'arguments', root / 'reject'
+            helper.write_text(f"import pathlib,sys\n"
+                              f"reject=pathlib.Path({str(reject)!r})\n"
+                              f"running=pathlib.Path({str(marker)!r})\n"
+                              "action=sys.argv[1]\n"
+                              "if action == 'check' and reject.exists(): raise SystemExit(1)\n"
+                              "if action == 'status': raise SystemExit(0 if running.exists() else 1)\n")
             helper.with_name('config_mirror.py').write_text('raise SystemExit(0)\n')
-            arguments = root / 'arguments'
+            daemon = root / 'daemon'
+            daemon.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{arguments}"\ntouch "{marker}"\n')
+            daemon.chmod(0o700)
             library = root / 'rc.subr'
-            library.write_text('load_rc_config() { :; }\n'
-                               'run_rc_command() { easytier_prestart || return; '
-                               f'printf "%s" "$command_args" > "{arguments}"; }}\n')
+            library.write_text('load_rc_config() { :; }\nrun_rc_command() { easytier_start; }\n')
             rc = root / 'rc'
             source = (PACKAGE / 'src/usr/local/etc/rc.d/easytier').read_text()
             rc.write_text(remap(source.replace('. /etc/rc.subr', 'PRIVATE_RC_LIBRARY'))
-                          .replace('PRIVATE_RC_LIBRARY', f'. "{library}"'))
-            config = root / 'usr/local/etc/easytier/config.toml'
-            config.write_text('rpc_portal = "127.0.0.1:30127"\n')
+                          .replace('PRIVATE_RC_LIBRARY', f'. "{library}"').replace('/usr/sbin/daemon', str(daemon)))
             result = subprocess.run(['sh', str(rc), 'onestart'], capture_output=True, text=True)
-            self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn('--rpc-portal 127.0.0.1:30127', arguments.read_text())
-            self.assertEqual(0o600, config.stat().st_mode & 0o777)
-            self.assertEqual(0o600, (root / 'var/log/easytier.log').stat().st_mode & 0o777)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(str(helper) + '\nrun\n', arguments.read_text())
+            self.assertEqual((root / 'var/log/easytier.log').stat().st_mode & 0o777, 0o600)
             arguments.unlink()
-            config.write_text('rpc_portal = "SENTINEL_BAD_PORTAL"\n')
-            config.chmod(0o640)
+            marker.unlink()
+            reject.touch()
             result = subprocess.run(['sh', str(rc), 'onestart'], capture_output=True, text=True)
-            self.assertNotEqual(0, result.returncode)
+            self.assertNotEqual(result.returncode, 0)
             self.assertFalse(arguments.exists())
-            self.assertNotIn('SENTINEL', result.stderr)
-            self.assertEqual(0o640, config.stat().st_mode & 0o777)
+            self.assertNotIn('configctl filter', source)
+            self.assertNotIn('pfctl', source)
 
 
 @unittest.skipUnless(sys.platform.startswith('freebsd') and CORE.is_file() and CLI.is_file(),

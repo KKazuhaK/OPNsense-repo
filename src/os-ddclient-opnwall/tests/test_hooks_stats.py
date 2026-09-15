@@ -24,11 +24,17 @@ from pathlib import Path
 command=Path(sys.argv[0]).name
 with Path(os.environ['HOOK_EVENTS']).open('a') as output: output.write(json.dumps([command,*sys.argv[1:]])+'\\n')
 if command=='pkg': sys.exit(0 if os.environ.get('OFFICIAL_INSTALLED')=='1' else 1)
+if os.environ.get('HOOK_STOP_FAIL')==command: sys.exit(7)
 sys.exit(1 if os.environ.get('HOOK_COMMAND_FAIL')=='1' else 0)
 '''.replace('PYTHON', sys.executable)
         for name in ['pkg', 'configctl', 'service', 'register']:
             (self.bin / name).write_text(program)
             (self.bin / name).chmod(0o755)
+        rc = self.root / 'usr/local/etc/rc.d'
+        rc.mkdir(parents=True)
+        for name in ['ddclient_opnwall_perl', 'ddclient_opn']:
+            (rc / name).write_text(program)
+            (rc / name).chmod(0o755)
         self.config = self.put('/conf/config.xml', b'SENTINEL_NATIVE_CONFIG_AND_CREDENTIALS')
         self.document = self.put('/usr/local/etc/ddclient.json', b'SENTINEL_GENERATED_CREDENTIALS', 0o644)
 
@@ -74,10 +80,27 @@ sys.exit(1 if os.environ.get('HOOK_COMMAND_FAIL')=='1' else 0)
     def test_remove_stops_daemon_but_keeps_native_settings_and_generated_credentials(self):
         self.assertEqual(self.run_hook('+PRE_DEINSTALL').returncode, 0)
         self.assertEqual(self.run_hook('+POST_DEINSTALL').returncode, 0)
-        self.assertEqual(self.calls()[0], ['configctl', 'ddclient', 'stop'])
+        self.assertEqual(self.calls()[:2], [['ddclient_opnwall_perl', 'onestop'],
+                                           ['ddclient_opn', 'onestop']])
         self.assertIn(['register', 'remove', 'os-ddclient-opnwall'], self.calls())
         self.assertEqual(self.document.read_bytes(), b'SENTINEL_GENERATED_CREDENTIALS')
         self.assertEqual(self.config.read_bytes(), b'SENTINEL_NATIVE_CONFIG_AND_CREDENTIALS')
+
+    def test_remove_and_upgrade_abort_when_either_exact_backend_cannot_stop(self):
+        for upgrade in (False, True):
+            for backend, expected in (
+                    ('ddclient_opnwall_perl', [['ddclient_opnwall_perl', 'onestop']]),
+                    ('ddclient_opn', [['ddclient_opnwall_perl', 'onestop'],
+                                      ['ddclient_opn', 'onestop']])):
+                with self.subTest(upgrade=upgrade, backend=backend):
+                    self.events.unlink(missing_ok=True)
+                    environment = {'HOOK_STOP_FAIL': backend}
+                    if upgrade:
+                        environment['PKG_UPGRADE'] = '1'
+                    result = self.run_hook('+PRE_DEINSTALL', **environment)
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn('refusing unsafe removal', result.stderr)
+                    self.assertEqual(expected, self.calls())
 
     def test_install_service_failure_still_registers_package_and_returns_success(self):
         self.assertEqual(self.run_hook('+POST_INSTALL', HOOK_COMMAND_FAIL='1').returncode, 0)

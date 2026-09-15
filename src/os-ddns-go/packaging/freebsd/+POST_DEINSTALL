@@ -12,6 +12,5 @@ rm -f \
 rm -rf /usr/local/etc/ddns-go
 
 service configd restart >/dev/null 2>&1 || true
-configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 
 exit 0

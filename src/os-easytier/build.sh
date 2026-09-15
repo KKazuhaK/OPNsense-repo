@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-easytier}"
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.1.2}"
 ORIGIN="${ORIGIN:-opnsense/os-easytier}"
 COMMENT="${COMMENT:-EasyTier mesh VPN integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -34,9 +34,12 @@ PKG_ARCH="freebsd:${ABI_MAJOR}:x86:64"
 rm -rf "$WORKDIR"
 mkdir -p "$STAGEDIR" "$METADIR" "$DISTDIR"
 (cd "$SCRIPT_DIR/src" && tar --exclude '.DS_Store' --exclude '._*' --exclude '__pycache__' --no-xattrs -cf - .) | (cd "$STAGEDIR" && tar -xf -)
-for shared in config_backup.py config_backup.php; do
+for shared in config_backup.py config_backup.php process_identity.py route_control.py; do
     install -m 0644 "$SCRIPT_DIR/../common/$shared" "$STAGEDIR/usr/local/opnsense/scripts/easytier/$shared"
 done
+PRODUCT_VERSION="$(sed -n 's/.*"product_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$STAGEDIR/usr/local/opnsense/version/easytier")"
+[ "$PRODUCT_VERSION" = "$VERSION" ] || die "VERSION does not match the committed EasyTier product metadata"
 chmod 0755 "$STAGEDIR/usr/local/etc/rc.d/easytier" "$STAGEDIR/usr/local/etc/rc.d/os-easytier-backup" "$STAGEDIR/usr/local/sbin/easytier-core" "$STAGEDIR/usr/local/sbin/easytier-cli"
 find "$STAGEDIR" -type f | sed "s#^$STAGEDIR##" | sort > "$PLIST"
 FLATSIZE=0

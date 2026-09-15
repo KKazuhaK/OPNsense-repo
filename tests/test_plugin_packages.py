@@ -41,19 +41,25 @@ UNBOUND_VERSION = ('{\n    "product_abi": "26.7",\n    "product_arch": "amd64",\
 
 # What each build.sh actually stages, read off the shell and written out again here.
 BUILDS = {
-    'os-staticarp': {'abi': NATIVE, 'copy': [('src', '/')],
+    'os-staticarp': {'deps': {'python313': {'origin': 'lang/python313', 'version': '>=0'}}, 'abi': NATIVE, 'copy': [('src', '/')],
                     'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/staticarp/config_backup.py'),
                                     ('src/common/config_backup.php', '/usr/local/opnsense/scripts/staticarp/config_backup.php')]},
     'os-pftop': {'abi': WILDCARD, 'copy': [('src/usr', '/usr')]},
     'os-lang': {'abi': WILDCARD, 'copy': [('src', '/')]},
-    'os-easytier': {'abi': NATIVE, 'copy': [('src', '/')],
+    'os-easytier': {'deps': {'python313': {'origin': 'lang/python313', 'version': '>=0'}}, 'abi': NATIVE, 'copy': [('src', '/')],
                    'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/easytier/config_backup.py'),
-                                   ('src/common/config_backup.php', '/usr/local/opnsense/scripts/easytier/config_backup.php')]},
-    'os-ddns-go': {'abi': NATIVE, 'copy': [('src', '/')],
+                                   ('src/common/config_backup.php', '/usr/local/opnsense/scripts/easytier/config_backup.php'),
+                                   ('src/common/process_identity.py', '/usr/local/opnsense/scripts/easytier/process_identity.py'),
+                                   ('src/common/route_control.py', '/usr/local/opnsense/scripts/easytier/route_control.py')]},
+    'os-ddns-go': {'deps': {'python313': {'origin': 'lang/python313', 'version': '>=0'}}, 'abi': NATIVE, 'copy': [('src', '/')],
                   'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/ddnsgo/config_backup.py'),
+                                  ('src/common/process_control.py', '/usr/local/opnsense/scripts/ddnsgo/process_control.py'),
+                                  ('src/common/process_identity.py', '/usr/local/opnsense/scripts/ddnsgo/process_identity.py'),
                                   ('src/common/config_backup.php', '/usr/local/opnsense/scripts/ddnsgo/config_backup.php')]},
-    'os-lucky': {'abi': NATIVE, 'copy': [('src', '/')],
+    'os-lucky': {'deps': {'python313': {'origin': 'lang/python313', 'version': '>=0'}}, 'abi': NATIVE, 'copy': [('src', '/')],
                  'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/lucky/config_backup.py'),
+                                  ('src/common/process_control.py', '/usr/local/opnsense/scripts/lucky/process_control.py'),
+                                  ('src/common/process_identity.py', '/usr/local/opnsense/scripts/lucky/process_identity.py'),
                                  ('src/common/config_backup.php', '/usr/local/opnsense/scripts/lucky/config_backup.php')],
                  'unpack': [('src/usr/local/bin/lucky_2.27.2_freebsd_x86_64.tar.gz', 'tar.gz',
                              {'lucky': '/usr/local/bin/lucky'})]},
@@ -62,8 +68,12 @@ BUILDS = {
                                  {'speedtest-go': '/usr/local/bin/opnsense-speedtest'})]},
     'os-sing-box': {'abi': NATIVE, 'copy': [('src', '/')],
                     'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/singbox/config_backup.py'),
-                                    ('src/common/config_backup.php', '/usr/local/opnsense/scripts/singbox/config_backup.php')],
-                    'deps': {'jq': {'origin': 'textproc/jq', 'version': '>=0'},
+                                    ('src/common/config_backup.php', '/usr/local/opnsense/scripts/singbox/config_backup.php'),
+                                    ('src/common/process_identity.py', '/usr/local/opnsense/scripts/singbox/process_identity.py'),
+                                    ('src/common/route_control.py', '/usr/local/opnsense/scripts/singbox/route_control.py'),
+                                    ('src/common/tun_policy_routing.py', '/usr/local/opnsense/scripts/singbox/tun_policy_routing.py')],
+                    'deps': {'python313': {'origin': 'lang/python313', 'version': '>=0'},
+                             'jq': {'origin': 'textproc/jq', 'version': '>=0'},
                              'curl': {'origin': 'ftp/curl', 'version': '>=0'}},
                     'unpack': [('src/usr/local/bin/bsd-box-reF1nd-freebsd-amd64.xz', 'xz',
                                 {None: '/usr/local/bin/sing-box'})]},
@@ -72,6 +82,8 @@ BUILDS = {
                            {'frp_0.71.0_freebsd_amd64/frps': '/usr/local/sbin/frps',
                             'frp_0.71.0_freebsd_amd64/frpc': '/usr/local/sbin/frpc'})]},
     'os-unboundcustom': {'abi': WILDCARD, 'copy': [('src/opnsense', '/usr/local/opnsense')],
+                         'shared_copy': [('src/common/process_identity.py', '/usr/local/opnsense/scripts/OPNsense/Unboundcustom/process_identity.py')],
+                         'deps': {'python313': {'origin': 'lang/python313', 'version': '>=3.13'}},
                          'generate': {'/usr/local/opnsense/version/unboundcustom': UNBOUND_VERSION},
                          'annotations': 'version-file'},
     'os-ddclient-opnwall': {'abi': WILDCARD, 'copy': [('src/etc', '/usr/local/etc'), ('src/usr', '/usr')],
@@ -514,6 +526,14 @@ class StagingRecordTests(SourceTree):
                                   makefile.read_text(), re.MULTILINE)
                 self.assertIsNotNone(match)
                 self.assertEqual(build_version(project.name), match.group(1))
+        for name in ('os-ddns-go', 'os-easytier', 'os-lucky', 'os-sing-box', 'os-staticarp'):
+            with self.subTest(plugin=name, override='VERSION'):
+                recipe = (REPO / 'src' / name / 'Makefile').read_text()
+                self.assertIn('VERSION="$(VERSION)"', recipe)
+                self.assertNotRegex(recipe, r'\bVERSION=[0-9]+(?:\.[0-9]+)+\b')
+                build = (REPO / 'src' / name / 'build.sh').read_text()
+                self.assertIn('PRODUCT_VERSION="$(sed ', build)
+                self.assertIn('[ "$PRODUCT_VERSION" = "$VERSION" ] || die', build)
 
     def test_install_hooks_register_only_their_own_plugin(self):
         for project in sorted((REPO / 'src').glob('os-*')):
@@ -692,7 +712,7 @@ class PublishedSiteTests(SourceTree):
         # failure of this test rather than of the thing it checks.
         root = self.drifted_source('os-unboundcustom', '1.0.2')
         package = SITE / 'repo/FreeBSD:15:amd64/All/os-unboundcustom-1.0.2.pkg'
-        with self.assertRaisesRegex(ValueError, 'Package content differs from source'):
+        with self.assertRaisesRegex(ValueError, 'Package content differs from source|file inventory does not match|Package dependencies differ'):
             verify.verify_source_package(package, root, plugin='os-unboundcustom')
         # Keep the real reference package while making unrelated release
         # availability explicit instead of depending on the current signed site.
@@ -711,7 +731,7 @@ class PublishedSiteTests(SourceTree):
         root = Path(tempfile.mkdtemp(dir=self.temp.name))
         (root / 'src').mkdir()
         for entry in (REPO / 'src').iterdir():
-            if entry.name == plugin:
+            if entry.name in (plugin, 'common'):
                 shutil.copytree(entry, root / 'src' / entry.name, symlinks=True)
             else:
                 (root / 'src' / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())

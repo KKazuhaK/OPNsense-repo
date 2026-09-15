@@ -22,3 +22,18 @@ if [ -f "$live" ]; then
     mv -f "$temporary" "$backup"
     trap - EXIT HUP INT TERM
 fi
+
+# Capture a currently supervised instance before future upgrades remove it.
+# Historical package hooks can stop Core before this hook is reached; in that
+# case do not guess that enabled means running, and require an explicit Start.
+resume="$state/runtime.resume.upgrade"
+if [ -f /usr/local/opnsense/scripts/easytier/network.py ] \
+    && /usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/network.py enabled >/dev/null 2>&1; then
+    if /usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/network.py status >/dev/null 2>&1; then
+        install -d -m 0700 "$state"
+        (umask 077; printf '%s\n' supervised-running > "$resume")
+    fi
+else
+    # An explicit disable or removal cancels any retry left by a failed upgrade.
+    rm -f "$resume"
+fi

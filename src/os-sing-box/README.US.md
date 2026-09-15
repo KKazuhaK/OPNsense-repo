@@ -51,62 +51,54 @@ The build script prefers the local `bin/bsd-box-reF1nd-freebsd-amd64.xz` file. I
 https://github.com/Vincent-Loeng/bsd-box/releases/latest/download/bsd-box-reF1nd-freebsd-amd64.xz
 ```
 
-## Notes
+## Routing, device policy and basic services
 
-1. Only x86_64 / amd64 is currently supported.
-2. After installation, no interface or firewall rule needs to be added manually. Edit the node information and use it directly.
-3. After debugging is complete, set the log level to `error` to avoid excessive long-term logs.
-4. Configuration formats may differ between versions. The default configuration in each release is only guaranteed to match the bundled package version.
-5. The default configuration enables the Clash API. You can open the dashboard at `http://LAN_IP:9091/ui`.
-6. Do not change the TUN interface name `tun_singbox` in `config.json`, otherwise the installer-generated firewall rules may stop matching.
-7. If LAN clients use OPNsense as their DNS resolver, Unbound will process queries locally before they reach sing-box. To have sing-box handle DNS rules, you can redirect LAN DNS traffic via NAT/rdr, configure Unbound to forward queries, or assign an external DNS server to clients via DHCP. You only need to use one of these methods.
+A first installation leaves the service stopped and defaults to explicit SOCKS
+proxy use. Configure valid nodes and click Start. The service renders a private
+runtime copy; the complete saved JSON, subscription URL, credentials and future
+fields remain unchanged. A legacy JSON `auto_route: true` does not provide
+transparent consent: enable and confirm LAN capture separately after upgrading.
 
-To redirect DNS queries, navigate to Firewall > NAT > Port Forward and add the following rule:
+Select Transparent LAN capture, confirm the intended capture, save and restart.
+The saved JSON must contain one gVisor TUN with a private prefix that does not
+overlap existing routes and real-address DNS. The runtime disables automatic
+routing and removes modern and legacy explicit TUN route ranges. A private FIB
+and non-quick PF match rules select new LAN TCP/UDP flows before TUN. Router
+traffic, WAN returns and the main FIB keep their native paths; administrator
+blocks, explicit gateways and specific VPN/static routes retain priority.
 
-```text
-- Interface: LAN
-- Version: IPv4
-- Protocol: TCP/UDP
-- Destination Address: This Firewall
-- Destination Port: 53
-- Redirect Target: 1.1.1.1 or other public DNS
-- Redirect Target Port: DOMAIN (53)
-```
-To add Unbound query forwarding, you need to add an inbound configuration to `config.json`:
-```text
-    {
-      "type": "direct",
-      "tag": "dns-in",
-      "listen": "127.0.0.1",
-      "listen_port": 5353,
-      "override_address": "8.8.8.8",
-      "override_port": 53
-    },
-```
-Then, under Services > Unbound DNS > Query Forwarding, add a forwarding record pointing to port 5353 and apply the changes:
+Device IP/CIDR policy selects only whitelist entries or bypasses blacklist
+entries before TUN. An empty list selects all LAN devices. Core DIRECT outbound
+rules do not implement this bypass. Applying policy by restarting clears only
+owned captured states. ICMP, DHCP, multicast and neighbor discovery remain
+native. IPv6 capture is separately enabled and requires a TUN IPv6 address;
+otherwise IPv6 remains native, with DHCP/RA settings unchanged.
 
-```text
-- Enable: Checked
-- Domain: Leave blank
-- Server IP: 127.0.0.1
-- Server Port: 5353
-```
+The plugin never rewrites `/etc/resolv.conf`, changes Unbound forwarding or
+restarts DNS services. LAN queries to OPNsense remain with Unbound. Transparent
+capture requires real addresses, without fake IP. Do not bind the system DNS
+root forwarder to a port available only while this proxy runs. Multi-WAN DNAT
+should retain an associated filter rule with correct `reply-to`; the plugin
+preserves administrator NAT and foreign connection states.
 
-You can also install the community plugin `os-unboundcustom` to add a custom option to Unbound, then enter the following content into the custom option box and enable it:
-```text
-server:
-    do-not-query-localhost: no
-forward-zone:
-    name: "."
-    forward-addr: 127.0.0.1@5353
-```
+An independent watcher removes owned capture after a Core failure or suspension, restores
+native routes in the private FIB and removes only states belonging to its FIB/TUN.
+Pending recovery is retried. A suspended Core retains signal ownership and can
+be stopped safely. Continuing the Core leaves native routing in place until an
+explicit Restart restores capture. The service page reports suspension, pending
+recovery and the need to restart capture. A closed TUN is removed only when its
+kernel interface index, driver and random ownership description still match;
+open or changed interfaces are preserved. Stop and startup failures perform the same scoped
+cleanup without global process-name killing. Uninstall retains private settings
+and recovery records. Only unchanged journal-owned interfaces/rules without
+other policy references may be removed.
 
 ## Install
 
 Upload the package to OPNsense and run:
 
 ```sh
-pkg add -f os-sing-box-1.1.1.pkg
+pkg add -f os-sing-box-1.1.2.pkg
 ```
 
 Refresh the OPNsense WebGUI and go to:
@@ -162,13 +154,13 @@ make package ABI=native
 Output file:
 
 ```text
-dist/os-sing-box-1.1.1.pkg
+dist/os-sing-box-1.1.2.pkg
 ```
 
 Inspect package metadata:
 
 ```sh
-pkg info -F dist/os-sing-box-1.1.1.pkg
+pkg info -F dist/os-sing-box-1.1.2.pkg
 ```
 
 ## Common Commands

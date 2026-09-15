@@ -1,6 +1,7 @@
 """Exercise merge policy, transport pins, and real System error boundaries."""
 import copy
 import json
+import os
 import shutil
 from pathlib import Path
 import subprocess
@@ -188,22 +189,27 @@ class RuntimeBoundaryTests(unittest.TestCase):
         config = self.manager.state / 'ready.yaml'
         config.write_text("tun: {enable: true, auto-route: false}\ndns: {enable: true, listen: '127.0.0.1:1053'}\n")
         system = m.System()
+        owner = unittest.mock.Mock()
+        owner.record_started.return_value = {'owned': True}
         def run(args, **kwargs):
             rc = 1 if args[0] in {'/usr/sbin/service', '/usr/bin/pgrep', '/sbin/ifconfig'} else 0
             return subprocess.CompletedProcess(args, rc, b'interface: lo1', b'')
-        with patch.object(system, 'run', side_effect=run), patch.object(system, 'running', side_effect=[False] + [True] * 30), patch.object(system, 'destroy_tun'), patch.object(system, 'stop') as stop, patch.object(m.time, 'sleep'), patch.object(m.socket, 'create_connection') as dns:
+        with patch.object(system, 'run', side_effect=run), patch.object(system, 'running', side_effect=[False] + [True] * 30), patch.object(system, '_core_group', return_value=owner), patch.object(system, 'destroy_tun'), patch.object(system, 'stop') as stop, patch.object(m.time, 'sleep'), patch.object(m.socket, 'create_connection') as dns:
             with self.assertRaises(m.Error): system.start(config, True)
             stop.assert_called_once()
             dns.assert_not_called()
 
-    def test_pid_reuse_with_path_in_another_program_is_not_killed(self):
+    def test_worker_check_requires_exact_executable_and_nul_argv(self):
         pid = self.manager.state / 'pid'
         pid.write_text('12345')
-        system = m.System()
-        with patch.object(system, 'run', return_value=subprocess.CompletedProcess([], 0, b'/usr/bin/vim /usr/local/bin/mihomo\n', b'')):
-            self.assertIsNone(system.valid_pid(str(pid), '/usr/local/bin/mihomo'))
-        with patch.object(system, 'run', return_value=subprocess.CompletedProcess([], 0, b'/usr/local/bin/mihomo -f config.yaml\n', b'')):
-            self.assertEqual(12345, system.valid_pid(str(pid), '/usr/local/bin/mihomo'))
+        expected = ['/usr/local/bin/python3', m.SCRIPT, 'sub-update']
+        base = {'pid': 12345, 'ppid': 1, 'uid': os.geteuid(), 'birth': '1:1',
+                'executable': expected[0], 'argv': expected, 'stopped': False}
+        system = m.System(process_reader=lambda unused: dict(
+            base, executable='/usr/bin/vim', argv=['/usr/bin/vim', expected[0]]))
+        self.assertFalse(system.process_running(str(pid), expected[0], expected))
+        system = m.System(process_reader=lambda unused: base)
+        self.assertTrue(system.process_running(str(pid), expected[0], expected))
 
 
 class SwitchTests(unittest.TestCase):
@@ -571,12 +577,45 @@ class DnsServerFieldTests(unittest.TestCase):
         self.assertEqual(['9.9.9.9'], dns['default-nameserver'])
 
     def test_a_stated_field_replaces_them(self):
-        dns = self.generated(dns_nameserver=['tls://223.5.5.5', 'https://doh.pub/dns-query'],
+        dns = self.generated(dns_override=True,
+                             dns_nameserver=['tls://223.5.5.5', 'https://doh.pub/dns-query'],
                              dns_default=['223.6.6.6'])['dns']
         self.assertEqual(['tls://223.5.5.5', 'https://doh.pub/dns-query'], dns['nameserver'])
         self.assertEqual(['223.6.6.6'], dns['default-nameserver'])
         # Untouched fields still come from the subscription.
         self.assertEqual(['https://provider.invalid/dns-query'], dns['proxy-server-nameserver'])
+
+    def test_manual_fields_only_replace_subscription_dns_when_enabled(self):
+        manual = ['tls://dot.example.net']
+        inherited = self.generated(dns_override=False, dns_nameserver=manual)['dns']
+        overridden = self.generated(dns_override=True, dns_nameserver=manual)['dns']
+        self.assertEqual(['https://provider.invalid/dns-query'], inherited['nameserver'])
+        self.assertEqual(manual, overridden['nameserver'])
+
+    def test_unbound_style_dot_tls_name_is_normalized_without_claiming_an_interface(self):
+        settings = m.routing_settings({**self.settings, 'dns_override': True,
+            'dns_nameserver': ['tls://162.159.36.5#v5brh3pn84.cloudflare-gateway.com'],
+            'dns_proxy_nameserver': [
+                'tls://[2606:4700:4700::1111]:8853#resolver.example.net&disable-ipv6=true',
+                'tls://192.0.2.53#vtnet1', 'tls://192.0.2.54#RULES']})
+        self.assertEqual(['tls://v5brh3pn84.cloudflare-gateway.com'],
+                         settings['dns_nameserver'])
+        self.assertEqual([
+            'tls://resolver.example.net:8853#disable-ipv6=true',
+            'tls://192.0.2.53#vtnet1', 'tls://192.0.2.54#RULES'],
+            settings['dns_proxy_nameserver'])
+        dns = self.generated(**settings)['dns']
+        self.assertEqual(settings['dns_nameserver'], dns['nameserver'])
+        self.assertEqual(settings['dns_proxy_nameserver'], dns['proxy-server-nameserver'])
+
+    def test_bootstrap_repairs_unbound_style_tls_name_without_a_dependency_loop(self):
+        manager = m.Manager.__new__(m.Manager)
+        base = dict(self.settings, dns_fallback=True, service_enabled=True,
+                    device='router', subscription_url='')
+        stated = 'tls://162.159.36.5#v5brh3pn84.cloudflare-gateway.com'
+        manager.check_settings(dict(base, dns_default=[stated]))
+        self.assertEqual(['162.159.36.5'],
+                         m.routing_settings(dict(base, dns_default=[stated]))['dns_default'])
 
     def test_router_dns_keeps_every_upstream_even_when_fields_are_stated(self):
         dns = self.generated(router_dns=True, dns_nameserver=['tls://223.5.5.5'],
@@ -603,6 +642,7 @@ class DnsServerFieldTests(unittest.TestCase):
         overlay = {'dns': {'nameserver': ['tls://223.5.5.5'], 'enhanced-mode': 'fake-ip'}}
         lifted = m.absorb_switches(overlay, self.settings)
         self.assertEqual(['tls://223.5.5.5'], lifted['dns_nameserver'])
+        self.assertTrue(lifted['dns_override'])
         self.assertNotIn('dns', overlay)
         self.assertEqual([], m.switch_overrides({'dns': {}}))
         self.assertEqual(['dns_nameserver'],
@@ -681,7 +721,7 @@ class OrphanPolicyTests(unittest.TestCase):
 
 
 class DevicePolicyTests(unittest.TestCase):
-    """Which sources the proxy may carry, expressed so matching order works."""
+    """Device selection never changes rules seen by explicit proxy clients."""
 
     def setUp(self):
         self.settings = {'transparent': False, 'secret': 'state-secret', **m.SWITCH_DEFAULTS}
@@ -694,43 +734,23 @@ class DevicePolicyTests(unittest.TestCase):
         return m.parse_yaml(m.render(self.data, {**self.settings, **settings},
             overlay=copy.deepcopy(self.preset)))
 
-    def test_off_leaves_the_provider_rules_alone(self):
+    def test_every_device_mode_leaves_the_provider_rules_alone(self):
         base = self.rendered()['rules']
-        self.assertEqual(base, self.rendered(device_mode='off',
-                                             device_list=['192.168.10.50'])['rules'])
-        # An empty list is the same as off, whatever the mode says.
-        self.assertEqual(base, self.rendered(device_mode='whitelist', device_list=[])['rules'])
+        for mode, entries in (('off', ['192.168.10.50']),
+                              ('blacklist', ['192.168.10.50', '192.168.10.0/24']),
+                              ('whitelist', ['192.168.10.50', '10.0.0.0/8']),
+                              ('whitelist', [])):
+            with self.subTest(mode=mode, entries=entries):
+                self.assertEqual(base, self.rendered(device_mode=mode,
+                                                     device_list=entries)['rules'])
 
-    def test_a_blacklist_sends_only_the_listed_sources_direct(self):
-        rules = self.rendered(device_mode='blacklist',
-                              device_list=['192.168.10.50', '192.168.10.0/24'])['rules']
-        self.assertEqual(['SRC-IP-CIDR,192.168.10.50/32,DIRECT',
-                          'SRC-IP-CIDR,192.168.10.0/24,DIRECT'], rules[:2])
-
-    def test_a_whitelist_matches_everything_it_does_not_list(self):
-        # Matching ends at the first hit, so the listed sources cannot be the
-        # ones matched: they are what is left over once everything else is out.
-        rules = self.rendered(device_mode='whitelist', device_list=['192.168.10.50'])['rules']
-        self.assertEqual('NOT,((SRC-IP-CIDR,192.168.10.50/32)),DIRECT', rules[0])
-        several = self.rendered(device_mode='whitelist',
-                                device_list=['192.168.10.50', '10.0.0.0/8'])['rules']
-        self.assertEqual('NOT,((OR,((SRC-IP-CIDR,192.168.10.50/32),'
-                         '(SRC-IP-CIDR,10.0.0.0/8)))),DIRECT', several[0])
-
-    def test_the_device_rules_sit_ahead_of_the_provider_rules(self):
-        rules = self.rendered(device_mode='blacklist', device_list=['192.168.10.50'])['rules']
-        self.assertEqual('SRC-IP-CIDR,192.168.10.50/32,DIRECT', rules[0])
-        self.assertIn('MATCH', rules[-1])
-
-    def test_the_router_dns_pins_stay_ahead_of_the_device_rules(self):
-        # Those pins keep the router's own encrypted DNS out of the tunnel; a
-        # device rule in front of them would decide that traffic instead.
+    def test_router_dns_pins_do_not_reintroduce_device_rules(self):
         settings = dict(self.settings, router_dns=True, device_mode='blacklist',
                         device_list=['192.168.10.50'])
         rules = m.parse_yaml(m.render(self.data, settings, overlay=copy.deepcopy(self.preset),
             upstreams='forward-addr: 192.0.2.53@853'))['rules']
         self.assertTrue(rules[0].startswith('IP-CIDR,192.0.2.53/32,DIRECT'), rules[0])
-        self.assertIn('SRC-IP-CIDR,192.168.10.50/32,DIRECT', rules[:6])
+        self.assertFalse(any(rule.startswith(('SRC-IP-CIDR,', 'NOT,(')) for rule in rules[:6]))
 
     def test_entries_that_are_not_addresses_are_refused(self):
         manager = m.Manager.__new__(m.Manager)
@@ -780,7 +800,11 @@ class StaleForwarderTests(unittest.TestCase):
 
         def record(args, **kwargs):
             self.ran.append(args)
-            stdout = b'Mihomo integration unchanged.' if args[0].endswith('php') else b''
+            effective = args[2] == 'enable' if args[0].endswith('php') else False
+            stdout = (b'Mihomo integration unchanged.\nMihomo integration state: '
+                      + json.dumps({'effective_forwarding': effective, 'dns_changed': False,
+                                    'integration_changed': False, 'filter_changed': False,
+                                    'cron_changed': False}).encode() + b'\n') if args[0].endswith('php') else b''
             return subprocess.CompletedProcess(args, 0, stdout, b'')
 
         self.record = record
@@ -822,9 +846,10 @@ class StaleForwarderTests(unittest.TestCase):
         def record(args, **kwargs):
             result = self.record(args, **kwargs)
             if args[0].endswith('php'):
-                result.stdout += b'\nMihomo integration state: ' + json.dumps(
+                result.stdout = b'Mihomo integration unchanged.\nMihomo integration state: ' + json.dumps(
                     {'effective_forwarding': effective, 'dns_changed': False,
-                     'integration_changed': False}).encode() + b'\n'
+                     'integration_changed': False, 'filter_changed': False,
+                     'cron_changed': False}).encode() + b'\n'
             return result
         return record
 
@@ -853,20 +878,25 @@ class StaleForwarderTests(unittest.TestCase):
             self.system.dns(True, {'dns_fallback': True})
         self.assertTrue(self.reloaded())
 
-    def test_invalid_effective_forwarding_metadata_keeps_the_legacy_guard(self):
+    def test_invalid_effective_forwarding_metadata_fails_closed_and_keeps_receipt(self):
         for invalid in ('false', 0, None):
             self.ran.clear()
-            with patch.object(self.system, 'run', side_effect=self.effective_record(invalid)):
+            with patch.object(self.system, 'run', side_effect=self.effective_record(invalid)), \
+                    self.assertRaises(m.Error):
                 self.system.dns(True, {'dns_fallback': True})
-            self.assertTrue(self.reloaded(), invalid)
+            self.assertFalse(self.reloaded(), invalid)
+            self.assertTrue((Path(m.STATE) / 'dns-reload-pending').exists())
+            (Path(m.STATE) / 'dns-reload-pending').unlink()
 
-    def integration_record(self, change_render=None):
+    def integration_record(self, change_render=None, filter_changed=True,
+                           dns_changed=False):
         def record(args, **kwargs):
             result = self.record(args, **kwargs)
             if args[0].endswith('php'):
                 result.stdout = b'Mihomo integration updated.\nMihomo integration state: ' + json.dumps(
-                    {'effective_forwarding': False, 'dns_changed': False,
-                     'integration_changed': True}).encode() + b'\n'
+                    {'effective_forwarding': False, 'dns_changed': dns_changed,
+                     'integration_changed': True, 'filter_changed': filter_changed,
+                     'cron_changed': False}).encode() + b'\n'
             elif 'template' in args and change_render is not None:
                 change_render()
             return result
@@ -880,6 +910,13 @@ class StaleForwarderTests(unittest.TestCase):
         self.assertTrue(any(args[1:3] == ['filter', 'reload'] for args in self.ran))
         self.assertFalse(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
         self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
+
+    def test_dns_only_change_restarts_resolver_without_global_filter_reload(self):
+        with patch.object(self.system, 'run', side_effect=self.integration_record(
+                filter_changed=False, dns_changed=True)):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+        self.assertFalse(any(args[1:3] == ['filter', 'reload'] for args in self.ran))
 
     def test_a_reload_that_only_rewrites_a_source_file_still_restarts_resolver(self):
         # DNS over TLS upstreams replaced and saved without Apply: the reload
@@ -992,6 +1029,129 @@ class DnsJournalOwnershipTests(unittest.TestCase):
                     m.Manager._journal('dns_state', json.dumps(saved))
 
 
+class IntegrationReloadTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state = Path(self.temp.name)
+        self.patch = patch.object(m, 'STATE', str(self.state))
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.system = m.System()
+        self.calls = []
+
+    @staticmethod
+    def output(**changes):
+        value = {'effective_forwarding': False, 'dns_changed': False,
+                 'integration_changed': False, 'filter_changed': False,
+                 'cron_changed': False}
+        value.update(changes)
+        return (b'Mihomo integration unchanged.\nMihomo integration state: '
+                + json.dumps(value).encode() + b'\n')
+
+    def runner(self, helper=None, fail_filter=False):
+        helper = self.output() if helper is None else helper
+
+        def run(args, **kwargs):
+            self.calls.append(args)
+            if args[0].endswith('php'):
+                return subprocess.CompletedProcess(args, 0, helper, b'')
+            if args[0].endswith('configctl') and args[1:3] == ['filter', 'reload'] and fail_filter:
+                raise m.Error('injected filter failure')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+        return run
+
+    def filter_reloads(self):
+        return [args for args in self.calls if args[0].endswith('configctl')
+                and args[1:3] == ['filter', 'reload']]
+
+    def cron_restarts(self):
+        return [args for args in self.calls if args[0].endswith('configctl')
+                and args[1:3] == ['cron', 'restart']]
+
+    def test_unchanged_tun_with_context_avoids_global_filter_reload(self):
+        (self.state / 'routing-context.json').write_text('{}')
+        with patch.object(self.system, 'run', side_effect=self.runner()):
+            self.system.tun()
+        self.assertEqual([], self.filter_reloads())
+        self.assertFalse((self.state / 'filter-reload-pending.json').exists())
+
+    def test_missing_context_or_filter_change_forces_exactly_one_reload(self):
+        for name, output, context in (
+                ('missing-context', self.output(), False),
+                ('filter-change', self.output(integration_changed=True, filter_changed=True), True)):
+            with self.subTest(name=name):
+                self.calls.clear()
+                (self.state / 'routing-context.json').unlink(missing_ok=True)
+                if context:
+                    (self.state / 'routing-context.json').write_text('{}')
+                with patch.object(self.system, 'run', side_effect=self.runner(output)):
+                    self.system.tun()
+                self.assertEqual(1, len(self.filter_reloads()))
+
+    def test_failed_filter_reload_keeps_receipt_and_retry_cannot_skip_it(self):
+        (self.state / 'routing-context.json').write_text('{}')
+        changed = self.output(integration_changed=True, filter_changed=True)
+        with patch.object(self.system, 'run', side_effect=self.runner(changed, fail_filter=True)), \
+                self.assertRaises(m.Error):
+            self.system.tun()
+        receipt = self.state / 'filter-reload-pending.json'
+        self.assertEqual({'action': 'enable-tun', 'version': 1}, json.loads(receipt.read_text()))
+        self.calls.clear()
+        with patch.object(self.system, 'run', side_effect=self.runner()):
+            self.system.tun()
+        self.assertEqual(1, len(self.filter_reloads()))
+        self.assertFalse(receipt.exists())
+
+    def test_invalid_or_duplicate_helper_decision_fails_closed_with_receipt(self):
+        invalid = [b'Mihomo integration unchanged.\n',
+                   b'Mihomo integration state: {"effective_forwarding":false}\n',
+                   (b'Mihomo integration state: {"effective_forwarding":false,'
+                    b'"effective_forwarding":true,"dns_changed":false,'
+                    b'"integration_changed":false,"filter_changed":false,'
+                    b'"cron_changed":false}\n')]
+        for output in invalid:
+            with self.subTest(output=output):
+                (self.state / 'filter-reload-pending.json').unlink(missing_ok=True)
+                with patch.object(self.system, 'run', side_effect=self.runner(output)), \
+                        self.assertRaises(m.Error):
+                    self.system.tun()
+                self.assertTrue((self.state / 'filter-reload-pending.json').exists())
+
+    def test_remove_reloads_only_changed_subsystems(self):
+        cases = [('none', self.output(), 0, 0),
+                 ('filter', self.output(integration_changed=True, filter_changed=True), 1, 0),
+                 ('cron', self.output(integration_changed=True, cron_changed=True), 0, 1)]
+        for name, output, filters, crons in cases:
+            with self.subTest(name=name):
+                self.calls.clear()
+                with patch.object(self.system, 'run', side_effect=self.runner(output)):
+                    self.system.remove()
+                self.assertEqual(filters, len(self.filter_reloads()))
+                self.assertEqual(crons, len(self.cron_restarts()))
+                self.assertFalse((self.state / 'filter-reload-pending.json').exists())
+                self.assertFalse((self.state / 'cron-reload-pending.json').exists())
+
+    def test_restore_cron_receipt_forces_retry_after_a_reload_failure(self):
+        changed = self.output(integration_changed=True, cron_changed=True)
+
+        def fail(args, **kwargs):
+            self.calls.append(args)
+            if args[0].endswith('php'):
+                return subprocess.CompletedProcess(args, 0, changed, b'')
+            raise m.Error('injected cron failure')
+
+        with patch.object(self.system, 'run', side_effect=fail), self.assertRaises(m.Error):
+            self.system.restore_cron()
+        receipt = self.state / 'cron-reload-pending.json'
+        self.assertTrue(receipt.exists())
+        self.calls.clear()
+        with patch.object(self.system, 'run', side_effect=self.runner()):
+            self.system.restore_cron()
+        self.assertEqual(1, len(self.cron_restarts()))
+        self.assertFalse(receipt.exists())
+
+
 class ConfigctlContractTests(unittest.TestCase):
     """configctl answers in a vocabulary the caller has to read correctly."""
 
@@ -1029,7 +1189,11 @@ class ConfigctlContractTests(unittest.TestCase):
 
         def record(args, **kwargs):
             calls.append(args)
-            return subprocess.CompletedProcess(args, 0, b'', b'')
+            stdout = (b'Mihomo integration unchanged.\nMihomo integration state: '
+                      b'{"effective_forwarding":false,"dns_changed":false,'
+                      b'"integration_changed":false,"filter_changed":false,'
+                      b'"cron_changed":false}\n') if args[0].endswith('php') else b''
+            return subprocess.CompletedProcess(args, 0, stdout, b'')
 
         state = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(state), True)
@@ -1084,7 +1248,11 @@ class AnchorOrderingTests(unittest.TestCase):
                 # The resolver comes up only with an anchor it can read.
                 return subprocess.CompletedProcess(
                     args, 0 if self.anchor.read_bytes().startswith(b'; autotrust') else 1, b'', b'')
-            return subprocess.CompletedProcess(args, 0, b'', b'')
+            stdout = (b'Mihomo integration updated.\nMihomo integration state: '
+                      b'{"effective_forwarding":true,"dns_changed":true,'
+                      b'"integration_changed":true,"filter_changed":false,'
+                      b'"cron_changed":false}\n') if args[0].endswith('php') else b''
+            return subprocess.CompletedProcess(args, 0, stdout, b'')
 
         real = m.System.anchor_snapshot
 

@@ -78,10 +78,12 @@ class TemplateTests(unittest.TestCase):
             with self.subTest(backend=backend):
                 general['backend'] = backend
                 self.assertIn('ddclient_opn_enable="' + native + '"', self.render('ddclient_opn.rc.conf.d'))
-                self.assertIn('ddclient_enable="' + legacy + '"', self.render('rc.conf.d'))
+                self.assertIn('ddclient_opnwall_perl_enable="' + legacy + '"', self.render('ddclient_opnwall_perl.rc.conf.d'))
+                self.assertIn('ddclient_enable="NO"', self.render('rc.conf.d'))
         general['enabled'] = '0'
         self.assertIn('ddclient_opn_enable="NO"', self.render('ddclient_opn.rc.conf.d'))
         self.assertIn('ddclient_enable="NO"', self.render('rc.conf.d'))
+        self.assertIn('ddclient_opnwall_perl_enable="NO"', self.render('ddclient_opnwall_perl.rc.conf.d'))
 
     def test_legacy_backend_ipv6_interface_and_disabled_account_selection(self):
         self.data['OPNsense']['DynDNS']['general']['backend'] = 'ddclient'

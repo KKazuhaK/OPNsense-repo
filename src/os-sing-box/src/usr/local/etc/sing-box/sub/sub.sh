@@ -28,12 +28,14 @@ staged="$(mktemp "${config}.XXXXXX")"
 cp "$private_dir/sub.json" "$staged"
 chmod 0600 "$staged"
 [ ! -f "$config" ] || cp "$config" "$private_dir/previous.json"
+was_running="no"
+if service sing-box onestatus >/dev/null 2>&1; then was_running="yes"; fi
 mv "$staged" "$config"
-if ! service sing-box restart >/dev/null 2>&1; then
+if [ "$was_running" = "yes" ] && ! service sing-box onerestart >/dev/null 2>&1; then
     if [ -f "$private_dir/previous.json" ]; then
         cp "$private_dir/previous.json" "$config"
         chmod 0600 "$config"
-        service sing-box restart >/dev/null 2>&1 || true
+        service sing-box onerestart >/dev/null 2>&1 || true
     fi
     echo 'Service restart failed; the previous configuration was restored.' >&2
     exit 1

@@ -1,3 +1,4 @@
 #!/bin/sh
-
+[ -n "${PKG_UPGRADE+x}" ] && exit 0
+/usr/local/bin/python3 /usr/local/opnsense/scripts/OPNsense/Unboundcustom/apply.py remove || exit 1
 exit 0

@@ -105,7 +105,7 @@ $(function () {
             $('#subscription_url').attr('placeholder', data.has_url
                 ? '{{ lang._('Leave empty to keep the stored URL') }}'
                 : '{{ lang._('No subscription URL is stored yet') }}');
-            ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any',
+            ['dns_fallback', 'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dashboard_any',
              'allow_lan'].forEach(function (flag) {
                 $('#' + flag).prop('checked', !!s[flag]);
             });
@@ -122,7 +122,10 @@ $(function () {
                 const inherited = (data.effective_dns || {})[$('#' + field).data('key')] || [];
                 $('#' + field).attr('placeholder', inherited.length ? inherited.join(', ')
                     : '{{ lang._('from the subscription') }}');
+                $('#effective_' + field).text(inherited.length ? inherited.join(', ')
+                    : '{{ lang._('not present') }}');
             });
+            updateDnsControls();
             $('#device_list').val((s.device_list || []).join('\n'));
             $('#merge_content').val(data.merge || '');
             $('#config_content').val(data.subscription || '');
@@ -160,6 +163,13 @@ $(function () {
     }
 
     let lastDevices = {devices: [], rules: []};
+
+    function updateDnsControls() {
+        const editable = $('#dns_override').is(':checked') && !$('#router_dns').is(':checked');
+        $('#dns_default,#dns_nameserver,#dns_proxy_nameserver').prop('disabled', !editable);
+    }
+
+    $('#dns_override,#router_dns').on('change', updateDnsControls);
 
     /* One entry can cover a whole segment, and a segment keeps covering it as
        devices come and go, which an address picked from a lease cannot. With
@@ -361,7 +371,7 @@ $(function () {
             // Preserve an existing disabled stack choice while TUN is off.
             payload.settings[field] = $('#' + field).prop('value');
         });
-        ['dns_fallback', 'router_dns', 'ipv6', 'dns_hijack', 'dashboard_any',
+        ['dns_fallback', 'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dashboard_any',
          'allow_lan'].forEach(function (flag) {
             payload.settings[flag] = $('#' + flag).is(':checked') ? 1 : 0;
         });
@@ -743,11 +753,20 @@ $(function () {
                     </td>
                 </tr>
                 <tr>
+                    <td><a id="help_for_dns_override" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Override subscription DNS') }}</td>
+                    <td><input type="checkbox" id="dns_override">
+                        <div class="hidden" data-for="help_for_dns_override">
+                            {{ lang._('Default off. When enabled, each nonempty manual field below replaces its counterpart in the generated runtime configuration. The stored subscription YAML is never rewritten. Router DNS takes priority while its switch is enabled.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
                     <td><a id="help_for_dns_default" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Bootstrap servers') }}</td>
                     <td><input type="text" class="form-control" id="dns_default" data-key="default-nameserver" autocomplete="off" spellcheck="false">
                         <span class="label label-warning mihomo-override" id="override_dns_default" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="text-muted"><small>{{ lang._('Effective in the saved runtime configuration:') }} <code id="effective_dns_default"></code></small></div>
                         <div class="hidden" data-for="help_for_dns_default">
-                            {{ lang._('Resolves the other servers below, so every entry must be a literal IP address: a name here has nothing left to resolve it. Leave empty to use what the subscription provides.') }}
+                            {{ lang._('Resolves the other servers below, so every entry must be a literal IP address: a name here has nothing left to resolve it. A copied tls://IP#TLS-hostname value is stored here as its literal IP; use tls://hostname below for encrypted queries. Leave empty to use what the subscription provides.') }}
                         </div>
                     </td>
                 </tr>
@@ -755,8 +774,9 @@ $(function () {
                     <td><a id="help_for_dns_nameserver" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Nameservers') }}</td>
                     <td><input type="text" class="form-control" id="dns_nameserver" data-key="nameserver" autocomplete="off" spellcheck="false">
                         <span class="label label-warning mihomo-override" id="override_dns_nameserver" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="text-muted"><small>{{ lang._('Effective in the saved runtime configuration:') }} <code id="effective_dns_nameserver"></code></small></div>
                         <div class="hidden" data-for="help_for_dns_nameserver">
-                            {{ lang._('The upstreams used for names no per-domain policy matches. Accepts a plain address, https:// for DoH, tls:// for DoT, quic://, or system to hand the query to the router resolver. Leave empty to use what the subscription provides.') }}
+                            {{ lang._('The upstreams used for names no per-domain policy matches. Accepts a plain address, https:// for DoH, tls:// for DoT, quic://, or system to hand the query to the router resolver. A pasted tls://IP#TLS-hostname endpoint is normalized to tls://TLS-hostname because Mihomo otherwise treats # as a proxy or interface. Leave empty to use what the subscription provides.') }}
                         </div>
                     </td>
                 </tr>
@@ -764,8 +784,9 @@ $(function () {
                     <td><a id="help_for_dns_proxy" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Proxy node servers') }}</td>
                     <td><input type="text" class="form-control" id="dns_proxy_nameserver" data-key="proxy-server-nameserver" autocomplete="off" spellcheck="false">
                         <span class="label label-warning mihomo-override" id="override_dns_proxy_nameserver" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
+                        <div class="text-muted"><small>{{ lang._('Effective in the saved runtime configuration:') }} <code id="effective_dns_proxy_nameserver"></code></small></div>
                         <div class="hidden" data-for="help_for_dns_proxy">
-                            {{ lang._('Resolves the proxy nodes themselves. This lookup has to succeed over the direct path before any proxy can be reached, so keep it on an upstream that works without the tunnel. Leave empty to use what the subscription provides.') }}
+                            {{ lang._('Resolves the proxy nodes themselves. This lookup has to succeed over the direct path before any proxy can be reached, so keep it on an upstream that works without the tunnel. A pasted tls://IP#TLS-hostname endpoint is normalized to Mihomo hostname form. Leave empty to use what the subscription provides.') }}
                         </div>
                     </td>
                 </tr>

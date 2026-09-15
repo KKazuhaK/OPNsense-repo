@@ -86,7 +86,7 @@ namespace {
         'config' => '{"password":"SENTINEL_PASSWORD"}', 'revision' => str_repeat('a', 64)];
     $service = new ServiceController();
     $service->request = new TestRequest();
-    foreach ([[$settings, ['setAction', 'saveConfigAction']], [$service,
+    foreach ([[$settings, ['setAction', 'setIntegrationAction', 'saveConfigAction']], [$service,
         ['startAction', 'stopAction', 'restartAction', 'subUpdateAction', 'clearLogAction', 'clearSubLogAction']]] as [$controller, $actions]) {
         $controller->readOnly = true;
         foreach ($actions as $action) {

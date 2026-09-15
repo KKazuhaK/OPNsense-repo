@@ -21,59 +21,6 @@ get_setting() {
 	printf '%s\n' "$default"
 }
 
-reset_interface_modes() {
-	[ -r "$INTERFACES_FILE" ] || return 0
-	while IFS= read -r line; do
-		case "$line" in
-			''|\#*) continue ;;
-		esac
-		device="$(printf '%s\n' "$line" | awk '{print $2}')"
-		[ -n "$device" ] || continue
-		/sbin/ifconfig "$device" arp -staticarp >/dev/null 2>&1 || true
-	done < "$INTERFACES_FILE"
-}
-
-apply_interface_modes() {
-	[ -r "$INTERFACES_FILE" ] || return 0
-	while IFS= read -r line; do
-		case "$line" in
-			''|\#*) continue ;;
-		esac
-		device="$(printf '%s\n' "$line" | awk '{print $2}')"
-		mode="$(printf '%s\n' "$line" | awk '{print $3}')"
-		[ -n "$device" ] || continue
-		/sbin/ifconfig "$device" arp -staticarp >/dev/null 2>&1 || true
-		case "$mode" in
-			staticarp|-arp)
-				/sbin/ifconfig "$device" "$mode" >/dev/null 2>&1 || true
-				;;
-		esac
-	done < "$INTERFACES_FILE"
-}
-
-load_entries() {
-	[ -s "$ENTRIES_FILE" ] || return 0
-	tmpfile="$(mktemp -t staticarp)"
-	: > "$tmpfile"
-	while IFS= read -r line; do
-		case "$line" in
-			''|\#*) continue ;;
-		esac
-		ip="$(printf '%s\n' "$line" | awk '{print $1}')"
-		mac="$(printf '%s\n' "$line" | awk '{print $2}')"
-		[ -n "$ip" ] && [ -n "$mac" ] || continue
-		if ifconfig | grep -Eq "^[[:space:]]*inet[[:space:]]+${ip}[[:space:]]"; then
-			continue
-		fi
-		printf '%s %s\n' "$ip" "$mac" >> "$tmpfile"
-	done < "$ENTRIES_FILE"
-	if [ -s "$tmpfile" ]; then
-		/usr/sbin/arp -d -a >/dev/null 2>&1 || true
-		/usr/sbin/arp -f "$tmpfile" || true
-	fi
-	rm -f "$tmpfile"
-}
-
 case "${1:-apply}" in
 	apply|reset)
 		# Keep settings, bindings and interface modes from the same completed save.
@@ -85,24 +32,8 @@ case "${1:-apply}" in
 		/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/config_mirror.py mirror >/dev/null
 		printf 'OK\n'
 		;;
-	_apply)
-		for recovery in "$CONFIG_DIR"/.staticarp-recovery-*; do
-			if [ -e "$recovery" ] || [ -L "$recovery" ]; then
-				echo "A previous settings save needs recovery before bindings can be applied." >&2
-				exit 1
-			fi
-		done
-		if [ "$(get_setting enabled NO)" = "YES" ]; then
-			load_entries
-			apply_interface_modes
-		else
-			reset_interface_modes
-			/usr/sbin/arp -d -a >/dev/null 2>&1 || true
-		fi
-		;;
-	_reset)
-		reset_interface_modes
-		/usr/sbin/arp -d -a >/dev/null 2>&1 || true
+	_apply|_reset)
+		/usr/local/bin/python3 /usr/local/opnsense/scripts/staticarp/runtime.py "${1#_}"
 		;;
 	status)
 		printf 'enabled=%s\n' "$(get_setting enabled NO)"

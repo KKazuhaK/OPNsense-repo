@@ -10,6 +10,7 @@ prefix: "@PREFIX@"
 flatsize: @FLATSIZE@
 licenselogic: single
 licenses: ["Apache-2.0"]
+deps: { python313: { origin: "lang/python313", version: ">=0" } }
 desc: <<EOD
 @DESC@
 EOD

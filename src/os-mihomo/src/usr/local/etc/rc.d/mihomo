@@ -26,8 +26,6 @@ mihomo_restart() { /usr/local/bin/python3 "$control" restart; }
 mihomo_status()
 {
     /usr/local/bin/python3 "$control" --json status
-    /bin/ps -p "$(cat /var/run/mihomo-child.pid 2>/dev/null)" -o command= 2>/dev/null |
-        /usr/bin/grep -q '/usr/local/bin/mihomo'
 }
 load_rc_config "$name"
 run_rc_command "$1"

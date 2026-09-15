@@ -10,8 +10,5 @@ rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cac
 rm -f /usr/local/opnsense/service/conf/actions.d/actions_sing-box.conf
 service configd restart >/dev/null 2>&1 || true
 
-echo "===> Scheduling sing-box residual directory cleanup"
-(
-    sleep 3
-    rm -rf /usr/local/etc/sing-box
-) >/dev/null 2>&1 &
+# Keep private settings and recovery journals for a later reinstall or review.
+# No delayed recursive removal may race another installation.

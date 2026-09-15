@@ -29,7 +29,10 @@ class ServiceController extends ApiControllerBase
             'stage_failed' => gettext('Could not stage the generated configuration fragment:'),
             'validation_failed' => gettext('Unbound configuration validation failed:'),
             'restart_failed' => gettext('The configuration is valid, but Unbound could not be restarted:'),
-            'success' => gettext('Custom options were validated and Unbound was restarted successfully.'),
+            'success' => gettext('Custom options were validated and applied successfully.'),
+            'recovery_failed' => gettext('The previous DNS configuration could not be fully recovered:'),
+            'apply_failed' => gettext('Could not apply custom options:'),
+            'state_failed' => gettext('Could not access the configuration transaction state:'),
         ];
         $code = $decoded['code'] ?? '';
         $message = $messages[$code] ?? gettext('Unknown apply result.');

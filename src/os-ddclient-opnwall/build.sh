@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ddclient-opnwall}"
-VERSION="${VERSION:-1.0.3}"
+VERSION="${VERSION:-1.0.4}"
 ORIGIN="${ORIGIN:-opnwall/os-ddclient-opnwall}"
 COMMENT="${COMMENT:-Extended Dynamic DNS client for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"
@@ -20,6 +20,8 @@ PLIST="$WORKDIR/pkg-plist"
 DISTDIR="${DISTDIR:-"$SCRIPT_DIR/dist"}"
 
 die() { echo "error: $*" >&2; exit 1; }
+[ -f "$SCRIPT_DIR/src/usr/local/opnsense/scripts/ddclient/perl_backend.py" ] || die "missing Perl backend supervisor"
+[ -f "$SCRIPT_DIR/src/usr/local/opnsense/scripts/ddclient/process_owner.py" ] || die "missing Python backend process ownership helper"
 command -v pkg >/dev/null 2>&1 || die "pkg command not found; run on FreeBSD/OPNsense"
 
 case "$TARGET_ABI" in

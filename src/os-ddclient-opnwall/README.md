@@ -46,3 +46,15 @@ pkg install os-ddclient
 ```
 
 卸载软件包不会删除 OPNsense 中已有的动态 DNS 配置。
+
+## Python backend process ownership
+
+The Python backend waits for its actual PID file after daemonization and records the exact executable, NUL-delimited arguments and microsecond kernel birth identity. Stop verifies the saved process and PID file before each signal, including any forced stop. Other Python backends, unrelated children and processes containing the script name as an argument are preserved. A missing legacy identity can be adopted only when the live interpreter, exact script path and configured PID-file argument match. Invalid, replaced or mismatched PID files fail without a signal. This uses conservative checks around signals; it does not claim an atomic kernel guarantee against all process-exit races.
+
+## Perl backend process ownership
+
+The selected Perl backend runs under the plugin's `ddclient_opnwall_perl` supervisor. The standard package's service remains disabled; its executable and dependencies are unchanged. The supervisor launches that executable in foreground mode and records its exact launch plus kernel birth, executable and UID before declaring it ready. DDClient may rewrite its process title while sleeping or updating without losing this launch ownership. Stop targets only that child and its verified Python supervisor. A missing supervisor PID file still permits cleanup of a child with a valid ownership record.
+
+Start, Stop and Restart preserve the saved backend selection and global disablement. Restart stops both managed backends before starting the selected one; any ownership or stop failure prevents another backend from starting. Force uses a separate foreground one-shot for a selected Perl backend and never adds that short process to the daemon's stop targets. There are no `pkill -F` actions or global process-name scans.
+
+A running legacy Perl backend without launch ownership cannot be identified from its rewritten basename-only title. Migration reports an error and preserves its existing process, parameters and PID file. Stop that legacy instance explicitly before enabling the new supervisor. No unrelated or guessed process is killed to complete migration.

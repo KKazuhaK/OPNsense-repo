@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[2] / 'src/usr/local/opnsense/scripts/easytier/manage.py'
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'common'))
 spec = importlib.util.spec_from_file_location('easytier_runtime', SOURCE)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
@@ -28,6 +29,8 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.addCleanup(patch.stopall)
+        patch.object(m.network, 'routing_table', return_value={}).start()
+        patch.object(m.network, 'load_record', return_value={}).start()
         for name, path in {'CONFIG': 'config.toml', 'LOG': 'log', 'SAVE_LOCK': 'save.lock',
                            'OPERATION_LOCK': 'operation.lock', 'PID': 'pid', 'SYSTEM_CONFIG': 'system.xml',
                            'REQUEST_ROOT': '.'}.items():
@@ -108,13 +111,41 @@ options={headers={name="second"}}
         for action, enabled in (('start', 'YES'), ('stop', 'NO'), ('restart', None)):
             with self.subTest(action=action):
                 self.run.reset_mock()
+                self.run.return_value = SimpleNamespace(returncode=0, stdout='YES')
                 self.assertEqual(self.cli(action)['status'], 'ok')
                 calls = [call.args[0] for call in self.run.call_args_list]
-                expected = [] if enabled is None else [['/usr/sbin/sysrc', '-f', '/etc/rc.conf.d/easytier',
+                expected = [['/usr/sbin/sysrc', '-n', '-f', '/etc/rc.conf.d/easytier', 'easytier_enable'], [m.RC, 'onestatus']] if enabled is None else [['/usr/sbin/sysrc', '-f', '/etc/rc.conf.d/easytier',
                                                        'easytier_enable=' + enabled]]
                 self.assertEqual(calls, expected + [[m.RC, 'one' + action]])
                 with m.OPERATION_LOCK.open('a') as handle:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_stopped_or_disabled_restart_never_forces_service_start(self):
+        for enabled, alive in (('NO', True), ('YES', False)):
+            self.run.reset_mock()
+            self.run.side_effect = lambda args, timeout=30: SimpleNamespace(returncode=0 if args[0].endswith('sysrc') or alive else 1, stdout=enabled)
+            result = self.cli('restart')
+            self.assertEqual(result['status'], 'failed')
+            self.assertFalse(any(call.args[0][-1] == 'onerestart' for call in self.run.call_args_list))
+        self.mirror.assert_not_called()
+
+    def test_unsafe_explicit_routes_return_actionable_error_and_preserve_file(self):
+        for routes in ('["64.0.0.0/2"]', '["0.0.0.0/0"]'):
+            result = self.cli('save', str(self.request('routes=' + routes + '\nhostname="new"\n')))
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('Public and default VPN routes', result['error'])
+            self.assertEqual(self.config.read_text(), self.original)
+        self.mirror.assert_not_called()
+
+    def test_native_prefix_conflicting_save_preserves_credentials_and_configuration(self):
+        native = {'10.0.0.1/32': {'destination': '10.0.0.1/32', 'gateway': '10.255.255.1', 'interface': 'wg0', 'flags': 'UGHS'}}
+        with patch.object(m.network, 'routing_table', return_value=native):
+            result = self.cli('save', str(self.request('routes=["10.0.0.0/24"]\n')))
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('explicit VPN route overlaps', result['error'])
+        self.assertEqual(self.config.read_text(), self.original)
+        self.assertNotIn('SENTINEL_', str(result))
+        self.mirror.assert_not_called()
 
     def test_enable_failure_does_not_start_service_or_mirror(self):
         self.run.return_value = SimpleNamespace(returncode=1, stdout='SENTINEL_PRIVATE_DIAGNOSTIC')

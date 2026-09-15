@@ -43,6 +43,18 @@ function mihomoChild(DOMDocument $doc, DOMElement $parent, string $name, string 
     return $node;
 }
 
+function mihomoCanonical(?DOMNode $node): ?string
+{
+    if ($node === null) {
+        return null;
+    }
+    $value = $node->C14N();
+    if (!is_string($value)) {
+        throw new RuntimeException('Unable to compare integration configuration.');
+    }
+    return $value;
+}
+
 function mihomoLockCurrent(OPNsense\Core\Config $config): void
 {
     $config->lock();
@@ -392,10 +404,16 @@ try {
         }
     }
     $before = $doc->saveXML();
+    if (!is_string($before)) {
+        throw new RuntimeException('Unable to compare integration configuration.');
+    }
     $zoneChanged = false;
     $effectiveForwarding = false;
     $xpath = new DOMXPath($doc);
-    $unboundBefore = $xpath->query('/opnsense/OPNsense/unboundplus')->item(0)?->C14N();
+    $unboundBefore = mihomoCanonical($xpath->query('/opnsense/OPNsense/unboundplus')->item(0));
+    $interfacesBefore = mihomoCanonical($xpath->query('/opnsense/interfaces')->item(0));
+    $filterBefore = mihomoCanonical($xpath->query('/opnsense/filter')->item(0));
+    $cronBefore = mihomoCanonical($xpath->query('/opnsense/cron')->item(0));
     $restore = null;
     if ($mode === 'restore-backup') {
         $raw = stream_get_contents(STDIN, 1048577);
@@ -562,7 +580,12 @@ try {
         }
         mihomoChild($doc, $section, 'checksum', $restore['repair_checksum']);
     }
-    if ($before !== $doc->saveXML()) {
+    $after = $doc->saveXML();
+    if (!is_string($after)) {
+        throw new RuntimeException('Unable to compare integration configuration.');
+    }
+    $configChanged = $before !== $after;
+    if ($configChanged) {
         if ($native !== null) {
             $native->save(make_config_revision_entry('Update Mihomo transparent integration'));
         } else {
@@ -580,16 +603,24 @@ try {
         @unlink($stateDir . '/migrate/cron.json');
         @unlink($stateDir . '/migrate/config.xml');
     }
-    $integrationChanged = $before !== $doc->saveXML() || $zoneChanged || $earlyZoneChange;
-    $unboundAfter = $xpath->query('/opnsense/OPNsense/unboundplus')->item(0)?->C14N();
-    $dnsChanged = is_string($unboundBefore) && is_string($unboundAfter)
-        ? $unboundBefore !== $unboundAfter || $zoneChanged || $earlyZoneChange : null;
+    $unboundAfter = mihomoCanonical($xpath->query('/opnsense/OPNsense/unboundplus')->item(0));
+    $interfacesAfter = mihomoCanonical($xpath->query('/opnsense/interfaces')->item(0));
+    $filterAfter = mihomoCanonical($xpath->query('/opnsense/filter')->item(0));
+    $cronAfter = mihomoCanonical($xpath->query('/opnsense/cron')->item(0));
+    $dnsChanged = $unboundBefore !== $unboundAfter || $zoneChanged || $earlyZoneChange;
+    /* Interface assignment and the associated pass rule are both materialized
+       by a filter reload, so publish one exact decision for the caller. */
+    $filterChanged = $interfacesBefore !== $interfacesAfter || $filterBefore !== $filterAfter;
+    $cronChanged = $cronBefore !== $cronAfter;
+    $integrationChanged = $configChanged || $zoneChanged || $earlyZoneChange;
     echo $integrationChanged
         ? "Mihomo integration updated.\n" : "Mihomo integration unchanged.\n";
     echo 'Mihomo integration state: ' . json_encode([
         'effective_forwarding' => $effectiveForwarding,
         'dns_changed' => $dnsChanged,
-        'integration_changed' => $integrationChanged
+        'integration_changed' => $integrationChanged,
+        'filter_changed' => $filterChanged,
+        'cron_changed' => $cronChanged
     ]) . "\n";
 } catch (Throwable $error) {
     fwrite(STDERR, "Mihomo integration failed. Existing DNS state is retained for recovery.\n");

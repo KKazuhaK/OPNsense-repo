@@ -9,9 +9,12 @@
 name="ddnsgo"
 rcvar="ddnsgo_enable"
 
+pidfile="/var/run/${name}.pid"
+
 # Reconcile restored XML before reading service enable and configuration paths.
 case "${1:-}" in
     start|onestart|faststart|forcestart)
+        /usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/process_control.py idle "$pidfile" "${name}:daemon" /usr/local/bin/ddns-go || exit 1
         /usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py reconcile >/dev/null || exit 1
         ;;
 esac
@@ -29,7 +32,6 @@ load_rc_config "$name"
 : "${ddnsgo_interval:=300}"
 : "${ddnsgo_extra_args:=}"
 
-pidfile="/var/run/${name}.pid"
 logfile="/var/log/${name}.log"
 command="/usr/sbin/daemon"
 ddnsgo_bin="/usr/local/bin/ddns-go"
@@ -47,42 +49,32 @@ ddnsgo_prestart()
 		return 1
 	fi
 
+	# Refuse foreign PIDs before modifying service files.
+	ddnsgo_control status >/dev/null 2>&1 && return 1
+	ddnsgo_control stop || return $?
 	mkdir -p "$(dirname "$ddnsgo_config")"
 	touch "$logfile"
 	chmod 0600 "$logfile"
-	rm -f "$pidfile"
 }
 
 ddnsgo_start()
 {
 	# shellcheck disable=SC2086
-	$command -P "$pidfile" -r -f -o "$logfile" -t "${name}:daemon" \
+	$command -P "$pidfile" -f -o "$logfile" -t "${name}:daemon" \
 		"$ddnsgo_bin" -c "$ddnsgo_config" -l "$ddnsgo_listen" -f "$ddnsgo_interval" $ddnsgo_extra_args || return $?
+	ddnsgo_control record || { ddnsgo_control stop; return 1; }
 	/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py mirror >/dev/null
+}
+
+ddnsgo_control()
+{
+	# shellcheck disable=SC2086
+	/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/process_control.py "$1" "$pidfile" "${name}:daemon" "$ddnsgo_bin" -c "$ddnsgo_config" -l "$ddnsgo_listen" -f "$ddnsgo_interval" $ddnsgo_extra_args
 }
 
 ddnsgo_stop()
 {
-	if [ -f "$pidfile" ]; then
-		daemon_pid="$(cat "$pidfile" 2>/dev/null)"
-		if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
-			children="$(pgrep -P "$daemon_pid" 2>/dev/null || true)"
-			kill -TERM "$daemon_pid" 2>/dev/null || true
-			for child in $children; do
-				kill -TERM "$child" 2>/dev/null || true
-				remaining=50
-				while kill -0 "$child" 2>/dev/null && [ "$remaining" -gt 0 ]; do
-					sleep 0.1
-					remaining=$((remaining - 1))
-				done
-				# Do not import or mirror while a writer can still flush old settings.
-				if kill -0 "$child" 2>/dev/null; then
-					return 1
-				fi
-			done
-		fi
-		rm -f "$pidfile"
-	fi
+	ddnsgo_control stop || return $?
 	if [ "${1:-}" != "skip-backup" ]; then
 		/usr/local/bin/python3 /usr/local/opnsense/scripts/ddnsgo/config_mirror.py mirror >/dev/null
 	fi
@@ -110,11 +102,10 @@ ddnsgo_restart()
 
 ddnsgo_status()
 {
-	if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-		echo "${name} is running as pid $(cat "$pidfile")."
+	if ddnsgo_control status; then
+		echo "${name} is running."
 		return 0
 	fi
-
 	echo "${name} is not running."
 	return 1
 }

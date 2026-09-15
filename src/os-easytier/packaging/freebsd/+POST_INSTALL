@@ -38,8 +38,21 @@ chmod 0600 /var/log/easytier.log
 service os-easytier-backup onestart >/dev/null 2>&1 || echo 'Warning: EasyTier configuration backup watcher could not be started.' >&2
 
 service configd restart >/dev/null 2>&1 || true
-configctl filter reload >/dev/null 2>&1 || true
+# Retire only a verified legacy rule without reloading native PF.
+/usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/retire_legacy.py
 # OPNsense caches the merged sidebar model for up to one hour.  Invalidate it
 # so the newly installed VPN menu entry is visible on the next page request.
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
+
+# Restore only recorded running intent, never merely an enabled rc variable.
+resume=/var/db/os-easytier/runtime.resume.upgrade
+if [ -f "$resume" ]; then
+    if /usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/network.py enabled >/dev/null 2>&1 \
+        && service easytier start \
+        && /usr/local/bin/python3 /usr/local/opnsense/scripts/easytier/network.py status >/dev/null 2>&1; then
+        rm -f "$resume"
+    else
+        echo 'Warning: The previously running EasyTier service could not be restored. Its retry marker was preserved; check the private log and retry the upgrade or start it explicitly.' >&2
+    fi
+fi
 echo "EasyTier installed. Open VPN > EasyTier to configure it."

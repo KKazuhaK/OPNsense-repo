@@ -6,14 +6,24 @@
 # deletes the package whether or not that hook succeeded, and a copy left
 # behind points the router's root zone at a port nothing is listening on any
 # more -- the whole network without DNS and no plugin left to undo it. Remove
-# it here as well, along with the copy inside the chroot, and let the resolver
-# pick up the change.
-rm -f \
+# it here as well, along with the copy inside the chroot. Restart the resolver
+# only when this fallback actually removed a remnant.
+unbound_changed=
+for path in \
     /usr/local/etc/unbound.opnsense.d/zz-mihomo.conf \
     /usr/local/etc/unbound.opnsense.d/00-mihomo.conf \
     /var/unbound/etc/zz-mihomo.conf \
     /var/unbound/etc/00-mihomo.conf
-configctl unbound restart >/dev/null 2>&1 || true
+do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        if rm -f "$path"; then
+            unbound_changed=1
+        fi
+    fi
+done
+if [ -n "$unbound_changed" ]; then
+    configctl unbound restart >/dev/null 2>&1 || true
+fi
 
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 service configd restart >/dev/null 2>&1 || true

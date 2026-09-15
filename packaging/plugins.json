@@ -13,13 +13,13 @@
     "os-staticarp": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "stage": {"src": "/"},
       "shared": {
         "src/common/config_backup.py": "/usr/local/opnsense/scripts/staticarp/config_backup.py",
         "src/common/config_backup.php": "/usr/local/opnsense/scripts/staticarp/config_backup.php"
       },
-      "deps": {},
+      "deps": {"python313": "lang/python313"},
       "version_file": {"path": "/usr/local/opnsense/version/staticarp", "format": "json"}
     },
     "os-pftop": {
@@ -42,39 +42,45 @@
     "os-easytier": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "stage": {"src": "/"},
       "shared": {
         "src/common/config_backup.py": "/usr/local/opnsense/scripts/easytier/config_backup.py",
-        "src/common/config_backup.php": "/usr/local/opnsense/scripts/easytier/config_backup.php"
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/easytier/config_backup.php",
+        "src/common/process_identity.py": "/usr/local/opnsense/scripts/easytier/process_identity.py",
+        "src/common/route_control.py": "/usr/local/opnsense/scripts/easytier/route_control.py"
       },
-      "deps": {},
+      "deps": {"python313": "lang/python313"},
       "version_file": {"path": "/usr/local/opnsense/version/easytier", "format": "json"},
       "notes": "Both executables are committed under src/, so their bytes are covered by the per-file digests."
     },
     "os-ddns-go": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "stage": {"src": "/"},
       "shared": {
+        "src/common/process_control.py": "/usr/local/opnsense/scripts/ddnsgo/process_control.py",
+        "src/common/process_identity.py": "/usr/local/opnsense/scripts/ddnsgo/process_identity.py",
         "src/common/config_backup.py": "/usr/local/opnsense/scripts/ddnsgo/config_backup.py",
         "src/common/config_backup.php": "/usr/local/opnsense/scripts/ddnsgo/config_backup.php"
       },
-      "deps": {},
+      "deps": {"python313": "lang/python313"},
       "version_file": {"path": "/usr/local/opnsense/version/ddns-go", "format": "json"},
       "notes": "The binary is committed under src/; the release download fallback in build.sh can never satisfy this record."
     },
     "os-lucky": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "stage": {"src": "/"},
       "shared": {
+        "src/common/process_control.py": "/usr/local/opnsense/scripts/lucky/process_control.py",
+        "src/common/process_identity.py": "/usr/local/opnsense/scripts/lucky/process_identity.py",
         "src/common/config_backup.py": "/usr/local/opnsense/scripts/lucky/config_backup.py",
         "src/common/config_backup.php": "/usr/local/opnsense/scripts/lucky/config_backup.php"
       },
-      "deps": {},
+      "deps": {"python313": "lang/python313"},
       "vendored": [
         {
           "artifact": "src/usr/local/bin/lucky_2.27.2_freebsd_x86_64.tar.gz",
@@ -104,13 +110,16 @@
     "os-sing-box": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "stage": {"src": "/"},
       "shared": {
         "src/common/config_backup.py": "/usr/local/opnsense/scripts/singbox/config_backup.py",
-        "src/common/config_backup.php": "/usr/local/opnsense/scripts/singbox/config_backup.php"
+        "src/common/config_backup.php": "/usr/local/opnsense/scripts/singbox/config_backup.php",
+        "src/common/process_identity.py": "/usr/local/opnsense/scripts/singbox/process_identity.py",
+        "src/common/route_control.py": "/usr/local/opnsense/scripts/singbox/route_control.py",
+        "src/common/tun_policy_routing.py": "/usr/local/opnsense/scripts/singbox/tun_policy_routing.py"
       },
-      "deps": {"jq": "textproc/jq", "curl": "ftp/curl"},
+      "deps": {"python313": "lang/python313", "jq": "textproc/jq", "curl": "ftp/curl"},
       "vendored": [
         {
           "artifact": "src/usr/local/bin/bsd-box-reF1nd-freebsd-amd64.xz",
@@ -145,9 +154,10 @@
     "os-unboundcustom": {
       "staging": "tree",
       "abi": "independent",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "stage": {"src/opnsense": "/usr/local/opnsense"},
-      "deps": {},
+      "shared": {"src/common/process_identity.py": "/usr/local/opnsense/scripts/OPNsense/Unboundcustom/process_identity.py"},
+      "deps": {"python313": "lang/python313"},
       "generated": {
         "/usr/local/opnsense/version/unboundcustom": {
           "literal": "{\n    \"product_abi\": \"26.7\",\n    \"product_arch\": \"amd64\",\n    \"product_email\": \"https://github.com/Opnwall/\",\n    \"product_id\": \"os-unboundcustom\",\n    \"product_name\": \"unboundcustom\",\n    \"product_tier\": \"4\",\n    \"product_version\": \"@VERSION@\",\n    \"product_website\": \"https://pfchina.org/\"\n}\n"
@@ -158,7 +168,7 @@
     "os-ddclient-opnwall": {
       "staging": "tree",
       "abi": "independent",
-      "version": "1.0.3",
+      "version": "1.0.4",
       "stage": {"src/etc": "/usr/local/etc", "src/usr": "/usr"},
       "deps": {"ddclient": "dns/ddclient", "py313-boto3": "devel/py-boto3@py313"},
       "generated": {

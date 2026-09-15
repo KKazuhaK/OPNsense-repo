@@ -1,0 +1,44 @@
+#!/bin/sh
+# PROVIDE: ddclient_opnwall_perl
+# REQUIRE: SERVERS
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+name=ddclient_opnwall_perl
+rcvar=ddclient_opnwall_perl_enable
+command=/usr/local/opnsense/scripts/ddclient/perl_backend.py
+command_interpreter=/usr/local/bin/python3
+pidfile=/var/run/ddclient.pid
+required_files=/usr/local/etc/ddclient.conf
+load_rc_config "$name"
+: "${ddclient_opnwall_perl_enable:=NO}"
+: "${ddclient_opnwall_perl_delay:=300}"
+command_args="-p $pidfile --delay $ddclient_opnwall_perl_delay"
+start_precmd=ddclient_opnwall_perl_guard
+start_postcmd=ddclient_opnwall_perl_record
+stop_cmd=ddclient_opnwall_perl_stop
+
+ddclient_opnwall_perl_guard()
+{
+    /usr/local/bin/python3 "$command" guard -p "$pidfile"
+}
+
+ddclient_opnwall_perl_record()
+{
+    /usr/local/bin/python3 /usr/local/opnsense/scripts/ddclient/process_owner.py \
+        record "$pidfile" "$command" "$command_interpreter" || {
+            /usr/local/bin/python3 "$command" stop -p "$pidfile" >/dev/null 2>&1 || true
+            return 1
+        }
+    /usr/local/bin/python3 "$command" ready -p "$pidfile" || {
+        /usr/local/bin/python3 "$command" stop -p "$pidfile" >/dev/null 2>&1 || true
+        return 1
+    }
+}
+
+ddclient_opnwall_perl_stop()
+{
+    /usr/local/bin/python3 "$command" stop -p "$pidfile"
+}
+
+run_rc_command "$1"

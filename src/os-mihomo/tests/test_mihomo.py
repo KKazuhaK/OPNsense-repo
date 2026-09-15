@@ -5,12 +5,15 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 import yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'src/usr/local/opnsense/scripts/mihomo/mihomo.py'
+sys.path.insert(0, str(SCRIPT.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'common'))
 spec = importlib.util.spec_from_file_location('mihomo', SCRIPT)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
@@ -195,6 +198,47 @@ class StateTests(unittest.TestCase):
                 self.assertFalse(generated['tun']['enable'])
                 self.assertTrue(self.system.alive)
 
+    def test_settings_action_persists_normalized_dot_without_rewriting_subscription(self):
+        self.manager.apply(SUBSCRIPTION)
+        source = self.manager.source_file.read_bytes()
+        payload = self.manager.state / 'request.json'
+        payload.write_text(json.dumps({
+            'dns_override': True,
+            'dns_default': ['tls://162.159.36.5#v5brh3pn84.cloudflare-gateway.com'],
+            'dns_nameserver': ['tls://162.159.36.5#v5brh3pn84.cloudflare-gateway.com'],
+            'dns_proxy_nameserver': ['tls://162.159.36.5#v5brh3pn84.cloudflare-gateway.com']}))
+        self.manager.dispatch('set-settings', str(payload))
+        expected = ['tls://v5brh3pn84.cloudflare-gateway.com']
+        settings = self.manager.settings()
+        self.assertTrue(settings['dns_override'])
+        self.assertEqual(['162.159.36.5'], settings['dns_default'])
+        self.assertEqual(expected, settings['dns_nameserver'])
+        self.assertEqual(expected, settings['dns_proxy_nameserver'])
+        generated = m.parse_yaml(self.manager.config_file.read_bytes())['dns']
+        self.assertEqual(expected, generated['nameserver'])
+        self.assertEqual(expected, generated['proxy-server-nameserver'])
+        self.assertEqual(source, self.manager.source_file.read_bytes())
+
+    def test_dns_override_can_be_disabled_without_erasing_manual_or_subscription_data(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data['dns']['nameserver'] = ['https://provider.invalid/dns-query']
+        subscription = yaml.safe_dump(data, sort_keys=False).encode()
+        self.manager.apply(subscription)
+        source = self.manager.source_file.read_bytes()
+        payload = self.manager.state / 'request.json'
+        manual = ['tls://dot.example.net']
+        payload.write_text(json.dumps({'dns_override': True, 'dns_nameserver': manual}))
+        self.manager.dispatch('set-settings', str(payload))
+        self.assertEqual(manual, m.parse_yaml(self.manager.config_file.read_bytes())['dns']['nameserver'])
+        payload.write_text(json.dumps({'dns_override': False}))
+        self.manager.dispatch('set-settings', str(payload))
+        settings = self.manager.settings()
+        self.assertFalse(settings['dns_override'])
+        self.assertEqual(manual, settings['dns_nameserver'])
+        self.assertEqual(['https://provider.invalid/dns-query'],
+                         m.parse_yaml(self.manager.config_file.read_bytes())['dns']['nameserver'])
+        self.assertEqual(source, self.manager.source_file.read_bytes())
+
     def test_settings_action_rejects_invalid_listener_and_tun_fields_without_changes(self):
         payload = self.manager.state / 'request.json'
         for invalid in ({'mixed_port': 53}, {'socks_port': 7890},
@@ -306,6 +350,23 @@ class RecoveryTests(unittest.TestCase):
 
 class UpgradeTests(unittest.TestCase):
     setUp = StateTests.setUp
+
+    def test_upgrade_keeps_pre_switch_manual_dns_enabled(self):
+        data = m.parse_yaml(SUBSCRIPTION)
+        data['dns']['nameserver'] = ['https://provider.invalid/dns-query']
+        subscription = yaml.safe_dump(data, sort_keys=False).encode()
+        manual = ['tls://dot.example.net']
+        settings = dict(self.manager.settings(), dns_override=True, dns_nameserver=manual)
+        self.manager.apply(subscription, settings)
+        legacy = self.manager.settings()
+        legacy.pop('dns_override')
+        legacy['switch_schema'] = m.SWITCH_SCHEMA - 1
+        self.manager.write_settings(legacy)
+        self.manager.initialize(upgrade=True)
+        migrated = self.manager.settings()
+        self.assertTrue(migrated['dns_override'])
+        self.assertEqual(manual, migrated['dns_nameserver'])
+        self.assertEqual(manual, m.parse_yaml(self.manager.config_file.read_bytes())['dns']['nameserver'])
 
     def test_explicit_consent_survives_upgrade_and_same_version_reinstall(self):
         self.manager.apply(SUBSCRIPTION)
@@ -557,7 +618,8 @@ class IntegrationHelperTests(unittest.TestCase):
         self.assertEqual(0, repeated.returncode)
         self.assertIn('unchanged', repeated.stdout)
         self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
-                          'integration_changed': False}, self.helper_state(repeated))
+                          'integration_changed': False, 'filter_changed': False,
+                          'cron_changed': False}, self.helper_state(repeated))
 
     def test_forwarding_metadata_follows_enable_and_disable(self):
         enabled = self.helper('enable')
@@ -580,7 +642,8 @@ class IntegrationHelperTests(unittest.TestCase):
         disabled = self.helper('disable')
         self.assertEqual(0, disabled.returncode)
         self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
-                          'integration_changed': True}, self.helper_state(disabled))
+                          'integration_changed': True, 'filter_changed': True,
+                          'cron_changed': False}, self.helper_state(disabled))
 
     def test_real_dns_modes_preserve_operator_private_address_and_journal(self):
         for mode in ('redir-host', 'normal'):
@@ -598,7 +661,8 @@ class IntegrationHelperTests(unittest.TestCase):
                 self.assertEqual(0, repeated.returncode)
                 self.assertEqual(saved, journal.read_bytes())
                 self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
-                                  'integration_changed': False}, self.helper_state(repeated))
+                                  'integration_changed': False, 'filter_changed': False,
+                                  'cron_changed': False}, self.helper_state(repeated))
                 disabled = self.helper('disable')
                 self.assertEqual(0, disabled.returncode)
                 self.assertFalse(self.helper_state(disabled)['dns_changed'])

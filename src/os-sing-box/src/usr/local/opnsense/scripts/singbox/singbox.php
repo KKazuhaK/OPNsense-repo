@@ -461,6 +461,39 @@ function singbox_update(bool $background, bool $wait = false): array
     }
 }
 
+function singbox_integration_settings(): array
+{
+    $defaults = ['schema' => 1, 'transparent' => false, 'transparent_consent' => false,
+        'device_mode' => 'off', 'device_list' => [], 'ipv6' => false];
+    $value = json_decode((string)@file_get_contents(singbox_path('/usr/local/etc/sing-box/integration.json')), true);
+    return is_array($value) ? array_intersect_key($value + $defaults, $defaults) : $defaults;
+}
+
+function singbox_save_integration(string $content): array
+{
+    $given = json_decode($content, true);
+    if (!is_array($given) || strlen($content) > 65536) {
+        throw new RuntimeException('Invalid integration settings.');
+    }
+    $process = proc_open(['/usr/local/bin/python3', singbox_path('/usr/local/opnsense/scripts/singbox/integration.py'), 'set-policy'],
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    if (!is_resource($process)) {
+        throw new RuntimeException('Unable to save the integration settings.');
+    }
+    fwrite($pipes[0], json_encode($given));
+    fclose($pipes[0]);
+    $output = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    stream_get_contents($pipes[2]);
+    fclose($pipes[2]);
+    $code = proc_close($process);
+    $answer = json_decode($output, true);
+    if ($code !== 0 || !is_array($answer) || empty($answer['ok'])) {
+        throw new RuntimeException('The integration settings were rejected. Check IP/CIDR entries and confirm LAN capture.');
+    }
+    return ['ok' => true];
+}
+
 function singbox_action(string $action, string $argument = ''): array
 {
     switch ($action) {
@@ -468,11 +501,21 @@ function singbox_action(string $action, string $argument = ''): array
             $handle = singbox_config_lock();
             try {
                 return ['ok' => true, 'config' => json_encode(singbox_redact(singbox_config()), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES),
-                    'revision' => singbox_revision(), 'has_url' => singbox_url() !== ''];
+                    'revision' => singbox_revision(), 'has_url' => singbox_url() !== '',
+                    'integration' => singbox_integration_settings()];
             } finally {
                 flock($handle, LOCK_UN);
                 fclose($handle);
             }
+        case 'set-integration':
+            $handle = singbox_config_lock();
+            try {
+                $result = singbox_save_integration(singbox_request($argument));
+            } finally {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+            }
+            return singbox_mirror_result($result);
         case 'set-settings':
             $handle = singbox_config_lock();
             try {
@@ -502,13 +545,27 @@ function singbox_action(string $action, string $argument = ''): array
             $output = [];
             $code = 1;
             exec('/usr/sbin/service sing-box status 2>&1', $output, $code);
-            return ['ok' => true, 'running' => $code === 0];
+            foreach (array_reverse($output) as $line) {
+                $state = json_decode($line, true);
+                if (!is_array($state) || empty($state['ok']) || !is_bool($state['running'] ?? null)) {
+                    continue;
+                }
+                $result = ['ok' => true, 'running' => $code === 0 && $state['running']];
+                foreach (['process_alive', 'healthy', 'paused', 'transparent', 'routing_active',
+                          'recovery_pending', 'routing_fallback', 'restart_required'] as $field) {
+                    $result[$field] = ($state[$field] ?? false) === true;
+                }
+                $result['routing_error'] = is_string($state['routing_error'] ?? null)
+                    ? singbox_scrub($state['routing_error']) : '';
+                return $result;
+            }
+            return ['ok' => false, 'error' => 'The service status could not be established.'];
         case 'start':
         case 'stop':
         case 'restart':
             $output = [];
             $code = 1;
-            exec('/usr/sbin/service sing-box ' . $action . ' 2>&1', $output, $code);
+            exec('/usr/sbin/service sing-box ' . 'one' . $action . ' 2>&1', $output, $code);
             return singbox_mirror_result(['ok' => $code === 0, 'error' => $code === 0 ? '' : 'Service operation failed. Check the service log.']);
         case 'log':
         case 'sub-log':

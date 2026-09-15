@@ -29,8 +29,8 @@
       "mtu": 1500,
       "type": "tun",
       "tag": "tun-in",
-      "auto_route": true,
-      "strict_route": true,
+      "auto_route": false,
+      "strict_route": false,
       "interface_name": "tun_singbox",
       "address": [
         "172.19.0.1/30"

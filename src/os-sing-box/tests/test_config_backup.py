@@ -50,6 +50,9 @@ class SingBoxBackupTests(unittest.TestCase):
             'certificate_providers': [{'type': 'acme', 'data_directory': '/mnt/acme'}],
         }
         self.put(driver.CONFIG, json.dumps(self.configuration).encode())
+        self.put(driver.STATE + '/integration.json', json.dumps({'schema': 1, 'transparent': True,
+            'transparent_consent': True, 'device_mode': 'blacklist', 'device_list': ['192.168.9.103/32'],
+            'future_policy': {'preserve': 'SENTINEL_FUTURE_FIELD'}}).encode())
         self.put(driver.STATE + '/sub/env', b"# Retain unrelated variables.\nexport SING_BOX_URL='https://example.invalid/SENTINEL_SUBSCRIPTION'\nexport EXTRA='value'\n")
         self.put(driver.STATE + '/sub/template.json', b'{"tls":{"certificate_path":"/mnt/certs/template.pem"}}\n')
         self.put(driver.RC, b'# Preserve disabled service and custom config.\nsing_box_enable="NO"\nconfig="/mnt/configuration/service.json"\n', 0o644)
@@ -105,6 +108,7 @@ class SingBoxBackupTests(unittest.TestCase):
     def test_roundtrip_preserves_credentials_rc_templates_references_and_modes(self):
         roots, entries, files = self.snapshot()
         wanted = self.live_state(files)
+        self.assertIn(driver.STATE + '/integration.json', files)
         self.assertIn('/mnt/configuration/service.json', files)
         self.assertIn('/mnt/certs/client.pem', files)
         self.assertIn('/mnt/certs/template.pem', files)

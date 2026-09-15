@@ -89,7 +89,6 @@ rm -f \
 
 echo "===> Reloading OPNsense menu, ACL and configd actions"
 service configd restart >/dev/null 2>&1 || true
-configctl webgui restart >/dev/null 2>&1 || service lighttpd onerestart >/dev/null 2>&1 || true
 
 echo "===> Starting DDNS-Go service"
 service os-ddns-go restart >/dev/null 2>&1 || true

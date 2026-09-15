@@ -5,14 +5,18 @@ checks over their source: the framework is what the native environment supplies,
 but the contracts below are ones a wrong call satisfies silently. Each of these
 has already been violated once.
 """
+import ast
 import re
 from pathlib import Path
 import unittest
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLERS = sorted((ROOT / 'src/usr/local/opnsense/mvc/app/controllers/OPNsense/Mihomo').rglob('*.php'))
 VIEW = ROOT / 'src/usr/local/opnsense/mvc/app/views/OPNsense/Mihomo/index.volt'
 ACTIONS = ROOT / 'src/usr/local/opnsense/service/conf/actions.d/actions_mihomo.conf'
+BACKUP_MODEL = ROOT / 'src/usr/local/opnsense/mvc/app/models/OPNsense/Mihomo/Backup.xml'
+MANAGER = ROOT / 'src/usr/local/opnsense/scripts/mihomo/mihomo.py'
 
 
 def configd_contract():
@@ -49,6 +53,17 @@ class ConfigdContractTests(unittest.TestCase):
 
 
 class FrameworkApiTests(unittest.TestCase):
+    def test_every_mirrored_setting_exists_in_the_native_backup_model(self):
+        tree = ast.parse(MANAGER.read_text())
+        assignment = next(node for node in tree.body
+                          if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'BACKUP_KEYS'
+                                  for target in node.targets))
+        mirrored = set(ast.literal_eval(assignment.value))
+        modeled = {node.tag for node in ElementTree.parse(BACKUP_MODEL).findall('./items/*')}
+        self.assertEqual(set(), mirrored - modeled,
+                         'config_mirror.php drops unmodeled fields but retains their checksum')
+
     def test_no_controller_calls_a_phalcon_request_method(self):
         # OPNsense has its own Request. Calling Phalcon's helpers raises at
         # runtime and surfaces as "Unexpected error, check log for details".

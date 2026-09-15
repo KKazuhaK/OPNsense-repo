@@ -53,12 +53,33 @@ configuration "$work/kazuha.pub" > "$work/repos/kazuha.conf"
 candidate_pkg() {
     pkg -4 -o "REPOS_DIR=$work/repos" -o "PKG_DBDIR=$work/db" -o "PKG_CACHEDIR=$work/cache" "$@"
 }
+catalog_version() {
+    package="$1"
+    catalog="$work/catalog"
+    candidate_pkg rquery -r kazuha '%n %v' "$package" > "$catalog"
+    selected=''
+    while IFS=' ' read -r catalog_name catalog_version extra; do
+        [ "$catalog_name" = "$package" ] || die "invalid signed catalog entry for $package"
+        [ -z "$extra" ] || die "invalid signed catalog entry for $package"
+        case "$catalog_version" in ''|*[!0-9A-Za-z._,+~-]*) die "invalid catalog version for $package" ;; esac
+        if [ -z "$selected" ]; then
+            selected="$catalog_version"
+        else
+            relation="$(pkg version -t "$catalog_version" "$selected")" || die "cannot compare catalog versions for $package"
+            case "$relation" in
+                '>') selected="$catalog_version" ;;
+                '<'|'=') ;;
+                *) die "cannot compare catalog versions for $package" ;;
+            esac
+        fi
+    done < "$catalog"
+    [ -n "$selected" ] || return 1
+    printf '%s\n' "$selected"
+}
 # Check the signed repository and download its plugin before changing router files.
 candidate_pkg update -f -r kazuha
-[ "$(candidate_pkg rquery -r kazuha '%n' os-kazuha-repo)" = os-kazuha-repo ] || die 'the repository plugin is unavailable for this series'
-version="$(candidate_pkg rquery -r kazuha '%v' os-kazuha-repo)"
-case "$version" in ''|*[!0-9A-Za-z._,+~-]*) die 'invalid repository plugin version' ;; esac
-candidate_pkg fetch -y -r kazuha os-kazuha-repo
+version="$(catalog_version os-kazuha-repo)" || die 'the repository plugin is unavailable for this series'
+candidate_pkg fetch -y -r kazuha "os-kazuha-repo-$version"
 
 for item in key config old_repo; do
     case "$item" in key) target="$keys/kazuha.pub" ;; config) target="$repos/kazuha.conf" ;; old_repo) target="$repos/opnwall.conf" ;; esac
@@ -103,11 +124,7 @@ if [ "$restore_plugins" = yes ]; then
         printf '%s\n' "$plugin" | LC_ALL=C grep -Eq '^os-[a-z0-9][a-z0-9-]*$' || die 'invalid plugin name in restore manifest'
         printf '%s\n' "$recorded" | LC_ALL=C grep -Eq '^[0-9][0-9A-Za-z._,+~-]*$' || die 'invalid plugin version in restore manifest'
         [ "$plugin" != os-kazuha-repo ] || continue
-        available="$(pkg -4 rquery -r kazuha '%n %v' "$plugin")"
-        available_name="${available%% *}"
-        available_version="${available#* }"
-        [ "$available_name" = "$plugin" ] || die "restored plugin is unavailable for $series: $plugin"
-        printf '%s\n' "$available_version" | LC_ALL=C grep -Eq '^[0-9][0-9A-Za-z._,+~-]*$' || die "invalid catalog version for $plugin"
+        available_version="$(catalog_version "$plugin")" || die "restored plugin is unavailable for $series: $plugin"
         printf '%s-%s\n' "$plugin" "$available_version" >> "$work/restore-packages"
     done < "$work/manifest"
     if [ -f "$work/restore-packages" ]; then

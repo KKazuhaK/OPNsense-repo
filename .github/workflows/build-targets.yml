@@ -59,6 +59,8 @@ jobs:
           prepare: |
             set -eu
             sh src/os-mihomo/packaging/prepare-builder.sh
+            # The OPNsense base package provides this compatibility link on routers.
+            test -x /usr/local/bin/python3 || ln -s "python${TARGET_PYTHON}" /usr/local/bin/python3
             test -f /usr/local/etc/php.ini || cp /usr/local/etc/php.ini-production /usr/local/etc/php.ini
             # Plain FreeBSD builders retain OPNsense extension configuration as samples.
             for sample in /usr/local/etc/php/*.ini.sample; do

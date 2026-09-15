@@ -58,4 +58,4 @@ EOF
 pkg -4 -R "$work/repos" update -f -r OPNsense
 pkg -4 -R "$work/repos" install -y -r OPNsense curl git "python3$python_minor" \
     "py3$python_minor-pyyaml" "php8$php_minor" "php8$php_minor-dom" \
-    "php8$php_minor-simplexml" unbound
+    "php8$php_minor-filter" "php8$php_minor-simplexml" unbound

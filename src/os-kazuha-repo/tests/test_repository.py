@@ -39,7 +39,8 @@ class RepositoryTests(unittest.TestCase):
         self.old_key.write_text('original key\n')
         self.env = dict(os.environ, PATH=str(self.bin) + ':' + os.environ['PATH'],
                         KAZUHA_REPO_ROOT=str(self.root), SERIES='26.7', KEY_SOURCE=str(KEY),
-                        TRACE=str(self.base / 'trace'), FAIL_PHASE='', CORRUPT_KEY='')
+                        TRACE=str(self.base / 'trace'), FAIL_PHASE='', CORRUPT_KEY='',
+                        CATALOG=json.dumps({'os-kazuha-repo': '1.0.0'}))
         for name, code in {
             'opnsense-version': 'import os; print(os.environ["SERIES"])',
             'sha256': 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[-1], "rb").read()).hexdigest())',
@@ -53,6 +54,13 @@ if os.environ["CORRUPT_KEY"]: output.write_text("wrong key")''',
             'pkg': '''import os,sys,json
 from pathlib import Path
 args=sys.argv[1:]
+if args[:2] == ["version", "-t"]:
+ order = ["1.0.0", "1.0.1", "1.0.9", "1.1.0", "1.1.1"]
+ left,right=args[2:]
+ left_key=order.index(left) if left in order else left
+ right_key=order.index(right) if right in order else right
+ print(">" if left_key > right_key else "<" if left_key < right_key else "=")
+ sys.exit(0)
 assert args[0] == "-4"
 with open(os.environ["TRACE"], "a") as trace: trace.write(json.dumps(args)+"\\n")
 candidate = any(x.startswith("REPOS_DIR=") for x in args)
@@ -66,8 +74,9 @@ if candidate:
 if os.environ["FAIL_PHASE"] == phase: sys.exit(1)
 if "rquery" in args:
  if "%n %v" in args:
-  version=json.loads(os.environ.get("CATALOG", "{}" )).get(args[-1])
-  if version: print(args[-1]+" "+version)
+  value=json.loads(os.environ.get("CATALOG", "{}" )).get(args[-1])
+  versions=value if isinstance(value, list) else [value] if value else []
+  for version in versions: print(args[-1]+" "+version)
  else: print("1.0.0" if "%v" in args else "os-kazuha-repo")''',
         }.items():
             path = self.bin / name
@@ -88,18 +97,28 @@ mirror) exit 0 ;;
 esac
 ''')
         (self.root / 'restore-manifest').write_text(content)
-        self.env['CATALOG'] = json.dumps(catalog)
+        self.env['CATALOG'] = json.dumps({'os-kazuha-repo': '1.0.0', **catalog})
 
     def test_bootstrap_restores_manifest_names_using_current_signed_catalog_versions(self):
         self.restore_manifest('os-kazuha-repo 1.0.0\nos-frp 1.0.0\nos-speedtest 1.1.0\n',
-                              {'os-frp': '1.0.1', 'os-speedtest': '1.1.1'})
+                              {'os-frp': ['1.0.1', '1.0.9', '1.1.0'], 'os-speedtest': '1.1.1'})
         result = self.run_script(BOOTSTRAP, '--restore-plugins')
         self.assertEqual(0, result.returncode, result.stderr)
         calls = [json.loads(line) for line in (self.base / 'trace').read_text().splitlines()]
-        restore = [call for call in calls if 'install' in call and 'os-frp-1.0.1' in call]
+        restore = [call for call in calls if 'install' in call and 'os-frp-1.1.0' in call]
         self.assertEqual(1, len(restore))
-        self.assertEqual(['os-frp-1.0.1', 'os-speedtest-1.1.1'], restore[0][-2:])
+        self.assertEqual(['os-frp-1.1.0', 'os-speedtest-1.1.1'], restore[0][-2:])
         self.assertTrue(all('-r' in call and 'kazuha' in call for call in restore))
+
+    def test_bootstrap_selects_latest_repository_plugin_from_historical_catalog(self):
+        self.env['CATALOG'] = json.dumps({'os-kazuha-repo': ['1.0.0', '1.0.1']})
+        result = self.run_script(BOOTSTRAP)
+        self.assertEqual(0, result.returncode, result.stderr)
+        calls = [json.loads(line) for line in (self.base / 'trace').read_text().splitlines()]
+        fetch = [call for call in calls if 'fetch' in call]
+        install = [call for call in calls if 'install' in call]
+        self.assertEqual('os-kazuha-repo-1.0.1', fetch[-1][-1])
+        self.assertEqual('os-kazuha-repo-1.0.1', install[-1][-1])
 
     def test_restore_preflights_all_plugins_before_installing_any_of_them(self):
         self.restore_manifest('os-frp 1.0.0\nos-missing 1.0.0\n', {'os-frp': '1.0.1'})

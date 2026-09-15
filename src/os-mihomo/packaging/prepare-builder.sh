@@ -57,5 +57,8 @@ EOF
 # Select the target firmware repository for every dependency and its transitive packages.
 pkg -4 -R "$work/repos" update -f -r OPNsense
 pkg -4 -R "$work/repos" install -y -r OPNsense curl git "python3$python_minor" \
-    "py3$python_minor-pyyaml" "php8$php_minor" "php8$php_minor-dom" \
+    "py3$python_minor-pyyaml" "py3$python_minor-requests" \
+    "py3$python_minor-dnspython" "py3$python_minor-ujson" \
+    "py3$python_minor-jinja2" "py3$python_minor-boto3" \
+    "php8$php_minor" "php8$php_minor-dom" \
     "php8$php_minor-filter" "php8$php_minor-gettext" "php8$php_minor-simplexml" unbound

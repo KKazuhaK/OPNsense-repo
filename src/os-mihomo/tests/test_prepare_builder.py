@@ -76,8 +76,8 @@ else:
         self.assertIn('install', calls[2])
         self.assertEqual(
             ['curl', 'git', 'python313', 'py313-pyyaml', 'php85', 'php85-dom',
-             'php85-simplexml', 'unbound'],
-            calls[2][-8:])
+             'php85-filter', 'php85-simplexml', 'unbound'],
+            calls[2][-9:])
         self.assertEqual('existing FreeBSD repository\n', self.system_repo.read_text())
         self.assertFalse(Path(calls[1][calls[1].index('-R') + 1]).exists())
 

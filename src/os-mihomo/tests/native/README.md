@@ -55,18 +55,50 @@ interface data to check LAN selection and router/WAN exclusions. Neither check
 exercises actual packet forwarding or the native Core configuration writer.
 
 Run the numeric gateway transport fixture only inside a disposable FreeBSD
-VNET jail containing the installed Python helpers:
+VNET jail containing the installed Python helpers. The jail needs its own
+network stack, a private `devfs`, and raw sockets for the netlink helper, and a
+read-only root keeps the host tree out of its reach:
 
 ```sh
-python3 -B test-native-route.py --run
+REPO=$(pwd)
+mkdir -p /var/tmp/mihomoroute
+mount -t nullfs -o ro / /var/tmp/mihomoroute
+mount -t tmpfs tmpfs /var/tmp/mihomoroute/tmp
+jail -c name=mihomoroute host.hostname=mihomoroute.local path=/var/tmp/mihomoroute \
+     vnet=new mount.devfs allow.raw_sockets=1 enforce_statfs=1 persist
+jexec mihomoroute sh -c "cd $REPO && python3 -B tests/run.py --package os-mihomo --python-only --kernel-route"
+jail -r mihomoroute
+umount /var/tmp/mihomoroute/dev /var/tmp/mihomoroute/tmp /var/tmp/mihomoroute
 ```
 
-It creates three private FIBs and two temporary loopback interfaces. It checks
-cold gateway cycles, an ambiguous gateway reachable through another interface,
-exclusive creation without appending an ECMP path, IPv6 scope, and reject and
-blackhole routes. It restores its FIB0 routes and interfaces; remove the
-disposable jail after the check to release the allocated private FIBs. It does
-not establish WireGuard peer connectivity or LAN packet forwarding.
+The read-only root shows the checkout at its own path inside the jail, so the
+selector runs the working tree while the fixture drives the installed helpers.
+The writable `/tmp` is for the ordinary mock suites the same run executes; the
+kernel fixture itself writes nothing.
+
+The `--kernel-route` selector is the only automated entry point that reaches
+this fixture; every other run of `tests/run.py` skips it, because it rewrites
+kernel routing state and must never touch a host that carries real traffic. The
+runner refuses the selector outside a jail. Running the file directly with
+`--run` and the `--helper` and `--routing` paths of an unpacked tree does the
+same work against sources that are not installed yet.
+
+It creates four private FIBs and two temporary loopback interfaces, and it
+borrows `127.0.0.1` on `lo0` when the jail has none, because the kernel
+resolves every discard route through the loopback and refuses one it cannot
+reach; that address is attached before the baseline is taken and handed back
+after the tables have been confirmed unchanged. Six groups drive `native_route.py` itself: a cold gateway cycle, an
+ambiguous gateway reachable through another interface, exclusive creation
+without appending an ECMP path, IPv6 scope, an IPv6 scoped gateway, and
+synthesized blackhole and reject identities carrying numeric gateways, which
+the helper must refuse because no such route exists in FIB0 to copy. The
+seventh group covers installed discard routes through `route(8)`, not through
+the helper: FreeBSD forces every blackhole and reject nexthop onto the
+loopback and strips its gateway, so the dispatcher never hands one to the
+netlink path. The fixture restores its FIB0 routes, its loopback address and
+its interfaces; remove the disposable jail after the check to release the
+allocated private FIBs. It does not establish WireGuard peer connectivity or
+LAN packet forwarding.
 
 Run the Core writer and concurrency fixture as root on the matching OPNsense
 target, using the installed helper when validating a package:

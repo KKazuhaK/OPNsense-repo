@@ -42,7 +42,7 @@ NATIVE_PYTHON = {
 }
 
 
-def suites(packages, python_only=False, native=False, device_policy=False, bandwidth=False):
+def suites(packages, python_only=False, native=False, device_policy=False, bandwidth=False, kernel_route=False):
     commands = []
     for package, directory in packages.items():
         files = sorted(directory.rglob('test_*.py'))
@@ -64,6 +64,9 @@ def suites(packages, python_only=False, native=False, device_policy=False, bandw
         if device_policy and package == 'os-mihomo':
             commands.append((package, [sys.executable, '-B',
                                       'src/os-mihomo/tests/native/test-device-policy.py', '-v']))
+        if kernel_route and package == 'os-mihomo':
+            commands.append((package, [sys.executable, '-B',
+                                      'src/os-mihomo/tests/native/test-native-route.py', '--run']))
         if bandwidth and package == 'os-speedtest':
             commands.append((package, [sys.executable, '-B',
                                       'src/os-speedtest/tests/native/test-live-speedtest.py', '-v']))
@@ -81,6 +84,8 @@ def main(argv=None):
     parser.add_argument('--native', action='store_true', help='Also run isolated genuine Core/FreeBSD contracts')
     parser.add_argument('--device-policy', action='store_true', help='Also exercise a private loopback Mihomo core')
     parser.add_argument('--bandwidth', action='store_true', help='Also run the real Internet bandwidth test on FreeBSD')
+    parser.add_argument('--kernel-route', action='store_true',
+                        help='Also clone real kernel routes inside a disposable VNET jail')
     parser.add_argument('--list', action='store_true', help='Print the complete plan without running tests')
     args = parser.parse_args(argv)
     packages = {path.name: path / 'tests' for path in sorted((ROOT / 'src').glob('os-*')) if path.is_dir()}
@@ -90,11 +95,13 @@ def main(argv=None):
         if unknown:
             parser.error('Unknown packages: ' + ', '.join(sorted(unknown)))
         packages = {name: directory for name, directory in packages.items() if name in args.package}
-    for requested, package in [(args.device_policy, 'os-mihomo'), (args.bandwidth, 'os-speedtest')]:
+    for requested, package in [(args.device_policy, 'os-mihomo'), (args.kernel_route, 'os-mihomo'),
+                               (args.bandwidth, 'os-speedtest')]:
         if requested and package not in packages:
             parser.error(f'The requested live test requires selecting {package}')
     try:
-        commands = suites(packages, args.python_only, args.native, args.device_policy, args.bandwidth)
+        commands = suites(packages, args.python_only, args.native, args.device_policy,
+                          args.bandwidth, args.kernel_route)
     except ValueError as error:
         parser.error(str(error))
     if not args.list:
@@ -107,6 +114,11 @@ def main(argv=None):
             parser.error('--device-policy requires an installed Mihomo core')
         if args.bandwidth and platform.system() != 'FreeBSD':
             parser.error('--bandwidth requires native FreeBSD')
+        # The fixture rewrites kernel routing state, so a host that owns real
+        # traffic must never be its target; only a throwaway VNET qualifies.
+        if args.kernel_route and (platform.system() != 'FreeBSD' or subprocess.run(
+                ['/sbin/sysctl', '-n', 'security.jail.jailed'], capture_output=True).stdout.strip() != b'1'):
+            parser.error('--kernel-route requires a disposable FreeBSD VNET jail, never a router')
     failures = []
     for package, command in commands:
         print(f'[{package}] ' + ' '.join(command), flush=True)

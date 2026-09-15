@@ -55,6 +55,11 @@ class Kernel:
         self.fail_kill = False
         self.populate_foreign = False
         self.empty_header_only = False
+        self.diagnosis = b''
+        self.delays = []
+
+    def delay(self, seconds):
+        self.delays.append(seconds)
 
     def run(self, args, **options):
         self.calls.append(list(args))
@@ -107,7 +112,11 @@ class Kernel:
             elif self.fail_add or key == self.fail_key or key in self.tables[fib]:
                 code = 1
             else:
-                self.tables[fib][key] = copy.deepcopy(value)
+                installed = copy.deepcopy(value)
+                # Both route(8) and the netlink helper ask for RTF_STATIC, so
+                # an installed copy prints 'S' even when its source does not.
+                installed['flags'] += '' if 'S' in installed['flags'] else 'S'
+                self.tables[fib][key] = installed
         elif args[0] == '/sbin/route':
             # Native modifiers must follow the command keyword.
             assert args[2] in ('add', 'delete') and args[3] == '-fib', args
@@ -125,7 +134,7 @@ class Kernel:
                 self.tables[fib][key] = value
         else:
             raise AssertionError('Unexpected command: ' + repr(args))
-        return subprocess.CompletedProcess(args, code, output, b'')
+        return subprocess.CompletedProcess(args, code, output, self.diagnosis if code else b'')
 
 
 class RoutingTests(unittest.TestCase):
@@ -134,7 +143,7 @@ class RoutingTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.kernel = Kernel()
-        self.routing = m.Routing(self.root, self.kernel.run)
+        self.routing = m.Routing(self.root, self.kernel.run, self.kernel.delay)
         self.routing.state.mkdir(parents=True)
         self.settings = {'service_enabled': True, 'transparent': True, 'transparent_consent': True,
                          'device_mode': 'off', 'device_list': []}
@@ -223,6 +232,46 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn(m.route_key(foreign), record['routes'])
         self.assertEqual(self.kernel.tables[record['fib']][m.route_key(foreign)], foreign)
         self.assertFalse(record['active'])
+
+    def test_repeated_allocation_failure_reuses_the_reserved_table(self):
+        self.kernel.populate_foreign = True
+        for attempt in range(3):
+            with self.subTest(attempt=attempt), self.assertRaises(m.RoutingError):
+                self.routing.execute('enable')
+            record = self.routing.load()
+            # One bump was paid for; every later attempt re-examines that table.
+            self.assertEqual(self.kernel.fibs, 2)
+            self.assertEqual(record['reserved'], 1)
+            self.assertIsNone(record['fib'])
+        self.assertEqual(self.kernel.delays, [m.RESERVE_BACKOFF] * 2 * 3)
+        del self.kernel.tables[1]['4:203.0.113.0/24%']
+        result = self.routing.execute('enable')
+        self.assertEqual((result['active'], result['fib'], self.kernel.fibs), (True, 1, 2))
+        self.assertIsNone(self.routing.load()['reserved'])
+
+    def test_route_failures_name_the_program_and_quote_its_diagnosis(self):
+        self.kernel.fail_key = '4:10.2.0.0/24%'
+        self.kernel.diagnosis = b'Native routing operation failed: [Errno 17] File exists\n'
+        with self.assertRaisesRegex(m.RoutingError, r'native_route\.py operation failed with status 1\. .*Errno 17'):
+            self.routing.execute('enable')
+        self.kernel.fail_key, self.kernel.diagnosis = None, b''
+        self.kernel.fail_add = True
+        with self.assertRaisesRegex(m.RoutingError, r'The route operation failed with status 1\.$'):
+            self.routing.execute('enable')
+
+    def test_unrecorded_copy_of_a_system_route_is_adopted_despite_kernel_flags(self):
+        value = route('10.5.0.0/24', '10.0.0.6', 'vtnet1', 'UG')
+        self.kernel.tables[0][m.route_key(value)] = value
+        key = m.route_key(value)
+        fib = self.routing.execute('enable')['fib']
+        self.assertEqual(self.kernel.tables[fib][key]['flags'], 'UGS')
+        record = self.routing.load()
+        # An add whose ownership write never landed leaves exactly this state.
+        del record['routes'][key]
+        self.routing.save(record)
+        self.assertTrue(self.routing.execute('enable')['active'])
+        self.assertEqual(self.kernel.tables[fib][key]['gateway'], '10.0.0.6')
+        self.assertEqual(self.kernel.tables[fib][key]['flags'], 'UGS')
 
     def test_empty_native_fib_without_columns_can_be_allocated(self):
         self.kernel.empty_header_only = True
@@ -435,6 +484,18 @@ class RoutingTests(unittest.TestCase):
         with self.assertRaises(m.RoutingError):
             self.routing.execute('status')
 
+    def test_a_record_without_the_owned_table_is_refused_but_a_reserved_one_loads(self):
+        # Every caller indexes record['fib']; an absent key has to be rejected
+        # here or it surfaces as a KeyError past the module's own handler.
+        self.routing.save({'schema': 1, 'active': False, 'pending': False, 'routes': {}})
+        for action in ('status', 'disable', 'enable'):
+            with self.subTest(action=action), self.assertRaises(m.RoutingError):
+                self.routing.execute(action)
+        self.routing.save({'schema': 1, 'fib': None, 'reserved': 1, 'active': False,
+                           'pending': False, 'routes': {}})
+        self.assertEqual(self.routing.load()['reserved'], 1)
+        self.assertIsNone(self.routing.load()['fib'])
+
 
 class ParsingTests(unittest.TestCase):
     def test_tun_counterparts_require_exact_tuple_origin_protocol_and_creator(self):
@@ -464,6 +525,15 @@ class ParsingTests(unittest.TestCase):
         for text in ('', 'unknown\n', 'Routing tables\nInternet6:\n', 'Routing tables\nforeign data\n'):
             with self.assertRaises(m.RoutingError):
                 m.parse_routes(text, 4)
+
+    def test_multipath_destination_is_refused_before_a_copy_is_requested(self):
+        # A unicast netlink reply names only the selected path, so the helper
+        # cannot recognize a multipath source. This is where that is caught.
+        text = ('Destination Gateway Flags Netif Expire\n'
+                '10.81.0.0/24 10.0.0.9 UGS vtnet0\n'
+                '10.81.0.0/24 10.0.0.10 UGS vtnet0\n')
+        with self.assertRaisesRegex(m.RoutingError, 'Multiple routes to one destination'):
+            m.parse_routes(text, 4)
 
     def test_netstat_short_networks_scopes_and_neighbor_entries(self):
         ipv4 = m.parse_routes('Destination Gateway Flags Netif Expire\n10.2 link#2 U vtnet1\n10.2.0.2 00:11:22:33:44:55 UHLW vtnet1 100\n', 4)

@@ -34,6 +34,10 @@ class RouteError(Exception):
     pass
 
 
+class RouteRejected(OSError):
+    """The kernel answered with an errno, so its verdict on the request is final."""
+
+
 def align(length):
     return (length + 3) & ~3
 
@@ -111,7 +115,7 @@ def scoped_address(address, scoped, ifindex):
     return raw
 
 
-def check_source(data, wanted, net, gw, ifindex):
+def check_source(data, wanted, net, gw, ifindex, fib=0):
     if len(data) < ROUTE.size:
         raise RouteError('The native source route is incomplete.')
     family, prefix, _, _, _, _, _, route_type, _ = ROUTE.unpack_from(data)
@@ -123,10 +127,10 @@ def check_source(data, wanted, net, gw, ifindex):
     if net.version == 6 and net.network_address.is_multicast and (destination[1] & 15) == 1:
         destination = scoped_address(net.network_address, wanted['scope'], ifindex)
     expected = {DST: destination, GATEWAY: gw.packed,
-                OIF: U32.pack(ifindex), TABLE: U32.pack(0)}
+                OIF: U32.pack(ifindex), TABLE: U32.pack(fib)}
     if family != (2 if net.version == 4 else 28) or prefix != net.prefixlen or route_type != expected_type:
         raise RouteError('The system route changed before it could be copied.')
-    if any(attrs.get(key) != value for key, value in expected.items()) or 9 in attrs:
+    if any(attrs.get(key) != value for key, value in expected.items()):
         raise RouteError('The system routing gateway or interface changed.')
     flags = attrs.get(RTFLAGS)
     if flags is None or len(flags) != U32.size or U32.unpack(flags)[0] & LLDATA:
@@ -201,13 +205,24 @@ def exchange(sock, pid, sequence, kind, flags, data, clock=time.monotonic):
                 if original != expected:
                     raise RouteError('The native routing acknowledgement identity is invalid.')
                 if error:
-                    raise OSError(abs(error), os.strerror(abs(error)))
+                    raise RouteRejected(abs(error), os.strerror(abs(error)))
                 acknowledged = True
             elif kind == GETROUTE and response_kind == NEWROUTE and response is None:
                 response = body
             else:
                 raise RouteError('The native routing reply type is invalid.')
     return response
+
+
+def installed(sock, pid, fib, wanted, net, gw, ifindex):
+    """Ask the kernel what the destination holds now. The question travels the
+    socket that carried the add, so the answer describes the settled table."""
+    try:
+        body = exchange(sock, pid, 3, GETROUTE, 0, payload(fib, wanted, net, gw, ifindex, get=True))
+        check_source(body, wanted, net, gw, ifindex, fib)
+    except (RouteError, OSError):
+        return False
+    return True
 
 
 def add(fib, wanted, connector=open_socket, index=socket.if_nametoindex):
@@ -218,7 +233,20 @@ def add(fib, wanted, connector=open_socket, index=socket.if_nametoindex):
         check_source(source, wanted, net, gw, ifindex)
         # EXCL prevents both replacing a concurrent owner's destination and
         # appending an ECMP path. Never use APPEND, REPLACE or RTF_PINNED.
-        exchange(sock, pid, 2, NEWROUTE, CREATE | EXCL, payload(fib, wanted, net, gw, ifindex))
+        # It promises nothing about the source: a unicast reply describes only
+        # the selected path, so routing.py refuses a table that answers one
+        # destination twice before any copy is asked for.
+        try:
+            exchange(sock, pid, 2, NEWROUTE, CREATE | EXCL, payload(fib, wanted, net, gw, ifindex))
+        except RouteRejected:
+            raise
+        except (RouteError, OSError):
+            # The request may already have reached the kernel, so this failure
+            # says nothing about the table. Adopt a route the kernel accepted
+            # rather than leave the journal denying it exists; anything else at
+            # that destination belongs to its own owner.
+            if not installed(sock, pid, fib, wanted, net, gw, ifindex):
+                raise
 
 
 def main(argv=None):

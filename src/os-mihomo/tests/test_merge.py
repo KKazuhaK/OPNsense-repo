@@ -752,12 +752,29 @@ class StaleForwarderTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.generated = Path(self.temp.name) / 'dot.conf'
+        # The geometry the router actually has: the template engine writes its
+        # targets outside the chroot and only a restart copies them in, so a
+        # fixture that lets the engine write into the chroot proves nothing.
         self.render_root = Path(self.temp.name) / 'unbound'
         (self.render_root / 'etc').mkdir(parents=True)
-        (self.render_root / 'unbound.conf').write_text(f'include: {self.render_root}/etc/*.conf\n')
-        self.render_include = self.render_root / 'etc/listeners.conf'
-        self.render_include.write_text('server:\n  interface: 127.0.0.1\n')
+        (self.render_root / 'unbound.conf').write_text(
+            f'include: {self.render_root}/advanced.conf\n'
+            f'include: {self.render_root}/etc/*.conf\n')
+        self.generated = self.render_root / 'etc/zz-mihomo.conf'
+        self.render_advanced = self.render_root / 'advanced.conf'
+        self.render_advanced.write_text('server:\n  cache-min-ttl: 0\n')
+        # The chroot copy the resolver reads, and the source the engine writes.
+        self.chroot_dot = self.render_root / 'etc/dot.conf'
+        self.chroot_dot.write_text('forward-zone:\n  name: "."\n  forward-addr: 192.0.2.53@853\n')
+        self.source_root = Path(self.temp.name) / 'unbound.opnsense.d'
+        self.source_root.mkdir()
+        self.source_dot = self.source_root / 'dot.conf'
+        self.source_dot.write_text(self.chroot_dot.read_text())
+        self.template_root = Path(self.temp.name) / 'templates'
+        (self.template_root / 'core').mkdir(parents=True)
+        self.targets = self.template_root / 'core/+TARGETS'
+        self.targets.write_text(f'dot.conf:{self.source_dot}\n'
+                                f'advanced.conf:{self.render_advanced}\n')
         self.system = m.System()
         self.ran = []
 
@@ -771,6 +788,7 @@ class StaleForwarderTests(unittest.TestCase):
         state.mkdir()
         self.patches = [patch.object(m, 'UNBOUND_GENERATED', str(self.generated)),
                         patch.object(m, 'UNBOUND_CONFIG_ROOT', str(self.render_root)),
+                        patch.object(m, 'UNBOUND_TEMPLATE_ROOT', str(self.template_root)),
                         patch.object(m, 'STATE', str(state))]
         for entry in self.patches:
             entry.start()
@@ -863,21 +881,52 @@ class StaleForwarderTests(unittest.TestCase):
         self.assertFalse(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
         self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
 
-    def test_tun_assignment_changing_generated_listeners_still_restarts_resolver(self):
+    def test_a_reload_that_only_rewrites_a_source_file_still_restarts_resolver(self):
+        # DNS over TLS upstreams replaced and saved without Apply: the reload
+        # rewrites dot.conf where the engine keeps it, the copy inside the
+        # chroot still names the dead servers, and only a restart copies it in.
         def changed():
-            self.render_include.write_text('server:\n  interface: 127.0.0.1\n  interface: 192.0.2.1\n')
+            self.source_dot.write_text('forward-zone:\n  name: "."\n  forward-addr: 192.0.2.99@853\n')
+        with patch.object(self.system, 'run', side_effect=self.integration_record(changed)):
+            self.system.dns(False, {'dns_fallback': True})
+        self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_a_source_file_the_reload_creates_from_nothing_also_restarts_resolver(self):
+        safesearch = self.source_root / 'safesearch.conf'
+        self.targets.write_text(self.targets.read_text() + f'safesearch.conf:{safesearch}\n')
+        def changed():
+            safesearch.write_text('server:\n  local-zone: "example.test" redirect\n')
         with patch.object(self.system, 'run', side_effect=self.integration_record(changed)):
             self.system.dns(False, {'dns_fallback': True})
         self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
 
     def test_top_level_generated_include_change_also_restarts_resolver(self):
-        advanced = self.render_root / 'advanced.conf'
-        advanced.write_text('server:\n  access-control: 192.0.2.0/24 allow\n')
         def changed():
-            advanced.write_text('server:\n  access-control: 192.0.2.0/24 refuse\n')
+            self.render_advanced.write_text('server:\n  cache-min-ttl: 300\n')
         with patch.object(self.system, 'run', side_effect=self.integration_record(changed)):
             self.system.dns(False, {'dns_fallback': True})
         self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
+
+    def test_the_targets_are_read_from_the_engine_map_and_never_guessed(self):
+        self.assertEqual([self.source_dot, self.render_advanced],
+                         self.system.unbound_template_targets())
+        # A mapping that expands per model node names no fixed set of files.
+        self.targets.write_text('zone.conf:/var/unbound/z-[OPNsense.unbound.x.%.id].conf\n')
+        self.assertIsNone(self.system.unbound_template_targets())
+
+    def test_an_unreadable_target_map_cannot_prove_a_restart_unnecessary(self):
+        # Gone and present-but-unreadable are the same answer: a map that cannot
+        # be parsed names no files, and a digest blind to what the reload writes
+        # must never be the reason the resolver is left serving the old policy.
+        # The read is deliberately exercised through dns(), because the helper
+        # raises and only its caller turns that into the conservative restart.
+        for break_map in (self.targets.unlink, self.targets.mkdir):
+            with self.subTest(break_map.__name__):
+                self.ran.clear()
+                break_map()
+                with patch.object(self.system, 'run', side_effect=self.integration_record()):
+                    self.system.dns(False, {'dns_fallback': True})
+                self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
 
     def test_unknown_external_include_cannot_prove_a_restart_unnecessary(self):
         external = Path(self.temp.name) / 'operator.conf'
@@ -1131,3 +1180,49 @@ class ResolverRepairTests(unittest.TestCase):
         with patch.object(self.system, 'run', side_effect=self.runner([False, True])):
             self.system.repair_resolver(None)
         self.assertIn(['/usr/local/sbin/configctl', 'unbound', 'restart'], self.calls)
+
+
+class FailedArmRecoveryTests(unittest.TestCase):
+    """A start that cannot arm routing fails loudly and stays failed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.system = fixtures.FakeSystem()
+        self.manager = m.Manager(Path(self.temp.name), self.system)
+        self.manager.initialize()
+        self.manager.dispatch('start')
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.watches = []
+        self.system.watch = lambda: self.watches.append('watch')
+
+    def refuse_to_arm(self):
+        raise m.Error('Transparent routing could not be armed.')
+
+    def status(self):
+        return json.loads(self.manager.status_file.read_bytes())
+
+    def test_an_arm_that_fails_leaves_no_watchdog_retrying_it(self):
+        # A watchdog started before arming would retry the failing arm every few
+        # seconds. That is how a single uptime consumed two thousand kernel
+        # routing tables, and the retry buys nothing anyway: the watchdog's first
+        # tick republishes ground truth and erases the reason recorded below. So
+        # the watchdog starts only after arming has succeeded.
+        self.system.tun = self.refuse_to_arm
+        with self.assertRaises(m.Error):
+            self.manager.start()
+        self.assertEqual([], self.watches)
+
+    def test_the_status_a_failed_arm_leaves_behind_names_the_reason(self):
+        self.system.tun = self.refuse_to_arm
+        with self.assertRaises(m.Error):
+            self.manager.start()
+        self.assertEqual('Transparent routing could not be armed.', self.status()['error'])
+        self.assertFalse(self.status()['running'])
+
+    def test_a_start_that_arms_publishes_a_clean_status_and_one_watchdog(self):
+        self.manager.start()
+        self.assertEqual('', self.status()['error'])
+        self.assertEqual(['watch'], self.watches)
+        self.assertIn('assign-tun', self.system.events)

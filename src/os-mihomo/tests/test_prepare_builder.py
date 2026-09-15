@@ -76,7 +76,7 @@ else:
         self.assertIn('install', calls[2])
         self.assertEqual(
             ['curl', 'git', 'python313', 'py313-pyyaml', 'py313-requests',
-             'py313-dnspython', 'py313-ujson', 'py313-jinja2', 'py313-boto3',
+             'py313-dnspython', 'py313-ujson', 'py313-Jinja2', 'py313-boto3',
              'php85', 'php85-dom', 'php85-filter', 'php85-gettext',
              'php85-simplexml', 'unbound'],
             calls[2][-15:])

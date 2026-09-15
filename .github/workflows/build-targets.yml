@@ -68,7 +68,7 @@ jobs:
               active="${sample%.sample}"
               if [ ! -f "$active" ]; then cp "$sample" "$active"; fi
             done
-            php -r 'if (!class_exists("DOMDocument") || !class_exists("DOMXPath") || !class_exists("SimpleXMLElement")) { fwrite(STDERR, "Required PHP XML extensions are unavailable.\n"); exit(1); }'
+            php -r 'if (!class_exists("DOMDocument") || !class_exists("DOMXPath") || !class_exists("SimpleXMLElement") || !function_exists("filter_var") || !function_exists("gettext")) { fwrite(STDERR, "Required PHP extensions are unavailable.\n"); exit(1); }'
           run: |
             set -eu
             sh src/os-mihomo/build.sh

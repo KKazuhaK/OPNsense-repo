@@ -54,8 +54,8 @@ class SharedRoutePackageTests(unittest.TestCase):
                      for path, value in payloads.items()}
         manifest = {
             'name': plugin,
-            'version': {'os-mihomo': '1.2.8', 'os-sing-box': '1.1.3',
-                        'os-easytier': '1.1.2'}[plugin],
+            'version': {'os-mihomo': '1.2.9', 'os-sing-box': '1.1.4',
+                        'os-easytier': '1.1.3'}[plugin],
             'abi': 'FreeBSD:15:amd64',
             'files': files,
         }

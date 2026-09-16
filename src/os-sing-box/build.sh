@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-sing-box}"
-VERSION="${VERSION:-1.1.3}"
+VERSION="${VERSION:-1.1.4}"
 ORIGIN="${ORIGIN:-opnsense/os-sing-box}"
 COMMENT="${COMMENT:-sing-box proxy integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"

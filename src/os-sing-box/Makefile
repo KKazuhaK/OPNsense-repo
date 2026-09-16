@@ -1,5 +1,5 @@
 PKG_NAME?=	os-sing-box
-VERSION?=	1.1.3
+VERSION?=	1.1.4
 ABI?=		native
 
 .PHONY: package install clean

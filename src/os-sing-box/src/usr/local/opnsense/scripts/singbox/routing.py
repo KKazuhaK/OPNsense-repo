@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 
-from process_identity import process
+from process_identity import birth_frame_shift, process, rebase_birth
 from tun_policy_routing import (
     DETAIL, DEVICE_LIMIT, IFNAME, LIMIT, MAX_CONFIG, MAX_STATES,
     RESERVE_ATTEMPTS, RESERVE_BACKOFF, ROUTE_LIMIT, RouteControlError,
@@ -32,6 +32,23 @@ def capture_states(text, fib):
     return shared_capture_states(text, fib, TUN)
 
 
+def rebase_record_births(record):
+    """Move recorded births into the live clock frame after a wall-clock step."""
+    token = record.get('boot') if isinstance(record, dict) else None
+    if not isinstance(token, str):
+        return
+    shift = birth_frame_shift(token)
+    if shift is None:
+        return
+    delta, current = shift
+    for identity in (record.get('core'),):
+        if isinstance(identity, dict) and isinstance(identity.get('birth'), str):
+            moved = rebase_birth(identity['birth'], delta)
+            if moved is not None:
+                identity['birth'] = moved
+    record['boot'] = current
+
+
 class Routing(TunPolicyRouting):
     STATE = STATE
     TUN = TUN
@@ -47,6 +64,7 @@ class Routing(TunPolicyRouting):
         try:
             record = json.loads(
                 self.read(self.state / 'service-state.json', b'{}', private=True))
+            rebase_record_births(record)
             child = record.get('core') or {}
             pid = child.get('pid', 0)
             expected = ['/usr/local/bin/sing-box', 'run', '-c',

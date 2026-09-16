@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import pwd
-from process_identity import process
+from process_identity import birth_frame_shift, boot_token, process, rebase_birth
 import re
 import secrets
 import shlex
@@ -365,7 +365,8 @@ def read_receipt(path, paths):
         if record['uid'] != os.geteuid() or record['mode'] != 0o600:
             raise ValueError('Unsafe receipt ownership or permissions')
         receipt = json.loads(content(record))
-        if not isinstance(receipt, dict) or set(receipt) != {'owned', 'closure', 'resolver'}:
+        keys = {'owned', 'closure', 'resolver'}
+        if not isinstance(receipt, dict) or set(receipt) not in (keys, keys | {'boot'}):
             raise ValueError('Unsupported receipt structure')
         owned = receipt['owned']
         if not isinstance(owned, dict) or set(owned) != {str(item) for item in paths}:
@@ -388,6 +389,17 @@ def read_receipt(path, paths):
                 type(owner['pid']) is not int or not 0 < owner['pid'] < 2147483648 or
                 not isinstance(owner['birth'], str) or not re.fullmatch(r'[1-9][0-9]*:[0-9]{1,6}', owner['birth'])):
             raise ValueError('Invalid resolver receipt')
+        if 'boot' in receipt and receipt['boot'] is not None and not isinstance(receipt['boot'], str):
+            raise ValueError('Invalid boot receipt')
+        if isinstance(receipt.get('boot'), str):
+            shift = birth_frame_shift(receipt['boot'])
+            if shift is not None:
+                delta, current = shift
+                moved = rebase_birth(owner['birth'], delta) if owner is not None else None
+                if owner is None or moved is not None:
+                    if owner is not None:
+                        owner['birth'] = moved
+                    receipt['boot'] = current
         return receipt
     except (OSError, RuntimeError, ValueError, TypeError, UnicodeError) as error:
         raise ApplyError('state_failed', 'The existing configuration receipt is invalid; files and DNS were preserved.') from error
@@ -509,7 +521,8 @@ def transaction(remove=False):
                 targets[str(path)] = None
         if before == targets:
             if receipt is not None:
-                payload = {**receipt, 'owned': {str(path): None for path in paths}}
+                payload = {**receipt, 'owned': {str(path): None for path in paths},
+                           'boot': boot_token()}
                 atomic(receipt_path, (json.dumps(payload, sort_keys=True) + '\n').encode())
             return {'status': 'ok', 'code': 'success', 'detail': '', 'restarted': False}
     else:
@@ -579,7 +592,8 @@ def transaction(remove=False):
         owned = ({str(path): None for path in paths} if remove else
                  {str(path): snapshot(path) for path in paths})
         payload = {'owned': owned, 'closure': closure() if restart or same_loaded_config else None,
-                   'resolver': resolver() if restart or same_loaded_config else None}
+                   'resolver': resolver() if restart or same_loaded_config else None,
+                   'boot': boot_token()}
         encoded = (json.dumps(payload, sort_keys=True) + '\n').encode()
         if len(encoded) > LIMIT:
             raise ApplyError('state_failed', 'The configuration receipt exceeds its bounded size.')

@@ -1,5 +1,6 @@
 """Run actual configd command bodies and test launch-owned mutable-title children."""
 import copy
+import errno
 import importlib.util
 import json
 import os
@@ -18,6 +19,7 @@ sys.path.insert(0, str(DIRECTORY))
 spec = importlib.util.spec_from_file_location('perl_backend', DIRECTORY / 'perl_backend.py')
 backend = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backend)
+import process_owner
 
 
 class Table:
@@ -117,6 +119,47 @@ class ChildOwnershipTests(unittest.TestCase):
         self.child.cleanup(timeout=.1)
         self.assertEqual(self.table.signals, [(12345, signal.SIGTERM)])
         self.assertFalse(self.child.journal.exists())
+
+    def test_child_journal_rebases_identity_and_launcher_after_a_clock_step(self):
+        with mock.patch.object(backend, 'boot_token', return_value='1000:0'):
+            self.gated_launch()
+        record = json.loads(self.child.journal.read_text())
+        self.assertEqual(record['boot'], '1000:0')
+        self.assertEqual(record['identity']['birth'], '1000:123456')
+        self.assertEqual(record['launcher']['birth'], '1000:123456')
+        # The kernel moves kern.boottime and the live birth by the same +300s.
+        self.table.identities[12345] = {**self.identity, 'birth': '1300:123456'}
+        with mock.patch.object(process_owner, 'boot_token', return_value='1300:0'):
+            loaded = self.child.load()
+            self.assertEqual(loaded['identity']['birth'], '1300:123456')
+            self.assertEqual(loaded['launcher']['birth'], '1300:123456')
+            self.child.cleanup(timeout=.1)
+        self.assertEqual(self.table.signals, [(12345, signal.SIGTERM)])
+        self.assertFalse(self.child.journal.exists())
+
+    def test_legacy_child_journal_without_boot_keeps_exact_comparisons(self):
+        with mock.patch.object(backend, 'boot_token', return_value='1000:0'):
+            self.gated_launch()
+        record = json.loads(self.child.journal.read_text())
+        record.pop('boot')
+        self.child.journal.write_text(json.dumps(record))
+        # A shifted boot reader must not move a legacy birth; exact text matches.
+        with mock.patch.object(process_owner, 'boot_token', return_value='1300:0'):
+            self.child.cleanup(timeout=.1)
+        self.assertEqual(self.table.signals, [(12345, signal.SIGTERM)])
+
+
+class ProcessTableTests(unittest.TestCase):
+    def test_replaced_executable_of_a_live_child_fails_closed_and_exit_stays_empty(self):
+        identity = {'pid': 12345, 'ppid': 100, 'uid': os.geteuid(), 'birth': '1000:123456'}
+        table = backend.ProcessTable()
+        with (mock.patch.object(process_owner, 'precise_metadata', return_value=identity),
+              mock.patch.object(process_owner, 'kernel_value', side_effect=OSError(errno.ENOENT, 'replaced'))):
+            with self.assertRaisesRegex(RuntimeError, 'live DDClient process 12345 is unavailable'):
+                table.read(12345)
+        with (mock.patch.object(process_owner, 'precise_metadata', side_effect=[identity, None]),
+              mock.patch.object(process_owner, 'kernel_value', side_effect=OSError(errno.ESRCH, 'exited'))):
+            self.assertIsNone(table.read(12345))
 
 
 class ConfigdActionTests(unittest.TestCase):

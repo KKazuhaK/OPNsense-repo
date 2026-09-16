@@ -33,7 +33,7 @@ class SharedRoutePackageTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def package(self, plugin, corrupt=None):
+    def package(self, plugin, corrupt=None, modern=False, bad_sum=None):
         mappings = checker.shared_destinations(REPO, verify)[plugin]
         payloads = {}
         for relative, destination in mappings.items():
@@ -41,13 +41,23 @@ class SharedRoutePackageTests(unittest.TestCase):
             if corrupt == relative:
                 payload += b'changed\n'
             payloads[destination] = payload
+        if modern:
+            files = {}
+            for path, value in payloads.items():
+                digest = '2$' + verify.zbase32(hashlib.blake2b(value).digest())
+                if bad_sum == path:
+                    digest = digest[:-1] + ('y' if digest[-1] != 'y' else 'z')
+                files[path] = {'sum': digest, 'uname': 'root', 'gname': 'wheel',
+                               'perm': '0755', 'mtime': 0}
+        else:
+            files = {path: '1$' + hashlib.sha256(value).hexdigest()
+                     for path, value in payloads.items()}
         manifest = {
             'name': plugin,
             'version': {'os-mihomo': '1.2.8', 'os-sing-box': '1.1.3',
                         'os-easytier': '1.1.2'}[plugin],
             'abi': 'FreeBSD:15:amd64',
-            'files': {path: '1$' + hashlib.sha256(value).hexdigest()
-                      for path, value in payloads.items()},
+            'files': files,
         }
         package = self.root / (plugin + '.pkg')
         encoded = json.dumps(manifest).encode()
@@ -65,6 +75,7 @@ class SharedRoutePackageTests(unittest.TestCase):
             manifest_of=verify.manifest_of,
             archive_members=verify.archive_members,
             source_path=verify.source_path,
+            file_checksum_matches=verify.file_checksum_matches,
             verify_source_package=lambda *_args, **_kwargs: None,
         )
 
@@ -112,6 +123,49 @@ class SharedRoutePackageTests(unittest.TestCase):
                 patch.object(checker, 'committed_source_bytes',
                              return_value=b'older committed bytes\n'), \
                 self.assertRaisesRegex(ValueError, 'differs from the source commit'):
+            checker.bind_packages(REPO, packages, COMMIT)
+
+    def test_zbase32_matches_libpkg_reference_vector(self):
+        content = (b'#!/bin/sh\n# Keep the historical CLI and cron entry point stable.\n'
+                   b'exec /usr/local/bin/python3.13 '
+                   b'/usr/local/opnsense/scripts/mihomo/mihomo.py sub-update "$@"\n')
+        self.assertEqual(
+            'a3dcfr6wkfa963qn8wwetde3feakuy1gwm1xfmkhsd6ju5igen11c5oy91txe5f9gyy88'
+            'mfcmrazsrwoh7psbs68mzk1gj5bmkphd7n',
+            verify.zbase32(hashlib.blake2b(content).digest()))
+
+    def test_file_checksum_matches_both_pkg_manifest_shapes(self):
+        content = b'payload\n'
+        modern = '2$' + verify.zbase32(hashlib.blake2b(content).digest())
+        self.assertTrue(verify.file_checksum_matches(
+            '1$' + hashlib.sha256(content).hexdigest(), content))
+        self.assertTrue(verify.file_checksum_matches(
+            {'sum': modern, 'uname': 'root', 'gname': 'wheel', 'perm': '0755', 'mtime': 0},
+            content))
+        self.assertFalse(verify.file_checksum_matches({'sum': modern[:-1] + ('y' if modern[-1] != 'y' else 'z')}, content))
+        self.assertFalse(verify.file_checksum_matches({'perm': '0755'}, content))
+        self.assertFalse(verify.file_checksum_matches(None, content))
+
+    def test_modern_manifest_shapes_bind_like_legacy_ones(self):
+        packages = [self.package(plugin, modern=True) for plugin in checker.REQUIRED]
+        with patch.object(checker, 'load_verifier',
+                          return_value=self.verifier_without_full_package_check()), \
+                patch.object(checker, 'committed_source_bytes',
+                             side_effect=self.committed_source):
+            report = checker.bind_packages(REPO, packages, COMMIT)
+        self.assertEqual(set(checker.REQUIRED), {item['name'] for item in report['packages']})
+
+    def test_modern_manifest_wrong_sum_is_rejected(self):
+        mappings = checker.shared_destinations(REPO, verify)['os-mihomo']
+        bad_install = mappings['src/common/route_control.py']
+        packages = [self.package(plugin, modern=True,
+                                 bad_sum=bad_install if plugin == 'os-mihomo' else None)
+                    for plugin in checker.REQUIRED]
+        with patch.object(checker, 'load_verifier',
+                          return_value=self.verifier_without_full_package_check()), \
+                patch.object(checker, 'committed_source_bytes',
+                             side_effect=self.committed_source), \
+                self.assertRaisesRegex(ValueError, 'manifest does not bind'):
             checker.bind_packages(REPO, packages, COMMIT)
 
     def test_native_workflow_builds_checks_and_archives_all_three_packages(self):

@@ -27,6 +27,61 @@ SOURCE_NOISE = {'.pyc', '.pyo'}
 # Manifest keys that make libpkg act beyond the files{} this verifier reconstructs:
 # a second (Lua) hook interpreter, filesystem objects, accounts and config handling.
 MANIFEST_SIDE_EFFECTS = ('lua_scripts', 'directories', 'dirs', 'config', 'users', 'groups')
+# libpkg records each manifest file sum as "<type>$<digest>": type 1 is SHA256 in
+# hex, and type 2 (the pkg 2.x default) is BLAKE2b in libpkg's z-base32 alphabet.
+# Both shapes ship from supported targets, so verification accepts either one.
+ZBASE32 = 'ybndrfg8ejkmcpqxot1uwisza345h769'
+
+
+def zbase32(data):
+    """Encode bytes exactly like libpkg's pkg_checksum_encode_base32()."""
+    output, remain = [], -1
+    for index, byte in enumerate(data):
+        step = index % 5
+        if step == 0:
+            value = byte
+            remain = byte >> 5
+        elif step == 1:
+            value = remain | byte << 3
+            output.append(ZBASE32[value & 0x1F])
+            output.append(ZBASE32[(value >> 5) & 0x1F])
+            remain = value >> 10
+            continue
+        elif step == 2:
+            value = remain | byte << 1
+            remain = value >> 5
+        elif step == 3:
+            value = remain | byte << 4
+            output.append(ZBASE32[value & 0x1F])
+            output.append(ZBASE32[(value >> 5) & 0x1F])
+            remain = (value >> 10) & 0x3
+            continue
+        else:
+            value = remain | byte << 2
+            output.append(ZBASE32[value & 0x1F])
+            output.append(ZBASE32[(value >> 5) & 0x1F])
+            remain = -1
+            continue
+        output.append(ZBASE32[value & 0x1F])
+    if remain >= 0:
+        output.append(ZBASE32[remain])
+    return ''.join(output)
+
+
+def file_checksum_matches(entry, content):
+    """Accept both manifest file shapes: 1$SHA256 hex and 2$BLAKE2b z-base32."""
+    if isinstance(entry, dict):
+        entry = entry.get('sum')
+    if not isinstance(entry, str):
+        return False
+    prefix, separator, digest = entry.partition('$')
+    if not separator:
+        return False
+    if prefix == '1':
+        return digest == hashlib.sha256(content).hexdigest()
+    if prefix == '2':
+        return digest == zbase32(hashlib.blake2b(content).digest())
+    return False
 
 
 def target_module(source):
@@ -711,7 +766,7 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
         # A reconstructed path is also a tar pattern below; keep it a plain path.
         install_path(path)
     for path, content in expected.items():
-        if actual[path] != '1$' + hashlib.sha256(content).hexdigest():
+        if not file_checksum_matches(actual[path], content):
             raise ValueError('Package content differs from source: ' + path)
         archived = subprocess.check_output(['tar', '-xOf', str(package), '-P', '--', archive_paths[path]])
         if archived != content:

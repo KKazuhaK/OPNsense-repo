@@ -98,6 +98,21 @@ jobs:
               git status --short
               exit 1
             }
+            python${TARGET_PYTHON} -B - <<'PY'
+            import importlib.util
+            import subprocess
+            from pathlib import Path
+            pkg = Path('src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.2.8.pkg')
+            actual = subprocess.check_output(['tar', '-xOf', str(pkg), '-P', '--', 'usr/bin/mihomo_sub'])
+            print('DEBUG_ACTUAL', repr(actual))
+            spec = importlib.util.spec_from_file_location('t', 'src/os-mihomo/packaging/target.py')
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            target = module.resolve_target(Path('src/os-mihomo'))
+            print('DEBUG_TARGET_PYTHON', target['python'])
+            staged = module.staged_files(Path('src/os-mihomo'), target, '1.2.8')
+            print('DEBUG_EXPECTED', repr(staged['/usr/bin/mihomo_sub']))
+            PY
             mkdir -p native-artifacts
             python${TARGET_PYTHON} -B tests/check-shared-route-packages.py \
               --source-commit "$(git rev-parse HEAD)" \

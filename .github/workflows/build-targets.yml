@@ -99,19 +99,29 @@ jobs:
               exit 1
             }
             python${TARGET_PYTHON} -B - <<'PY'
+            import hashlib
             import importlib.util
             import subprocess
             from pathlib import Path
-            pkg = Path('src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.2.8.pkg')
-            actual = subprocess.check_output(['tar', '-xOf', str(pkg), '-P', '--', 'usr/bin/mihomo_sub'])
-            print('DEBUG_ACTUAL', repr(actual))
-            spec = importlib.util.spec_from_file_location('t', 'src/os-mihomo/packaging/target.py')
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            target = module.resolve_target(Path('src/os-mihomo'))
+            root = Path('.').resolve()
+            spec = importlib.util.spec_from_file_location('v', root / 'verify-repo.py')
+            verifier = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(verifier)
+            module = verifier.target_module(root)
+            src = root / 'src/os-mihomo'
+            package = root / 'src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.2.8.pkg'
+            manifest = verifier.manifest_of(package)
+            python_package = next((name for name in manifest.get('deps', {}) if name.startswith('python3')), 'python313')
+            target = module.resolve_target(src, {'TARGET_ABI': manifest['abi'], 'TARGET_PRODUCT_ABI': manifest.get('annotations', {}).get('product_abi', ''), 'TARGET_PYTHON': '3.' + python_package[7:]})
+            expected = module.staged_files(src, target, manifest['version'])
+            archive = verifier.archive_members(package)
+            archived = subprocess.check_output(['tar', '-xOf', str(package), '-P', '--', archive['/usr/bin/mihomo_sub']])
             print('DEBUG_TARGET_PYTHON', target['python'])
-            staged = module.staged_files(Path('src/os-mihomo'), target, '1.2.8')
-            print('DEBUG_EXPECTED', repr(staged['/usr/bin/mihomo_sub']))
+            print('DEBUG_EXPECTED_SHA', hashlib.sha256(expected['/usr/bin/mihomo_sub']).hexdigest())
+            print('DEBUG_MANIFEST_SHA', manifest['files']['/usr/bin/mihomo_sub'])
+            print('DEBUG_ARCHIVE_SHA', hashlib.sha256(archived).hexdigest())
+            print('DEBUG_EXPECTED_REPR', repr(expected['/usr/bin/mihomo_sub']))
+            print('DEBUG_ARCHIVE_REPR', repr(archived))
             PY
             mkdir -p native-artifacts
             python${TARGET_PYTHON} -B tests/check-shared-route-packages.py \

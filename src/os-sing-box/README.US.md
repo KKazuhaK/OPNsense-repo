@@ -98,7 +98,7 @@ other policy references may be removed.
 Upload the package to OPNsense and run:
 
 ```sh
-pkg add -f os-sing-box-1.1.3.pkg
+pkg add -f os-sing-box-1.1.4.pkg
 ```
 
 Refresh the OPNsense WebGUI and go to:
@@ -154,13 +154,13 @@ make package ABI=native
 Output file:
 
 ```text
-dist/os-sing-box-1.1.3.pkg
+dist/os-sing-box-1.1.4.pkg
 ```
 
 Inspect package metadata:
 
 ```sh
-pkg info -F dist/os-sing-box-1.1.3.pkg
+pkg info -F dist/os-sing-box-1.1.4.pkg
 ```
 
 ## Common Commands

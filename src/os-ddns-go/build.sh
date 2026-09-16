@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ddns-go}"
-VERSION="${VERSION:-1.1.2}"
+VERSION="${VERSION:-1.1.3}"
 ORIGIN="${ORIGIN:-opnsense/os-ddns-go}"
 COMMENT="${COMMENT:-DDNS-Go dynamic DNS integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"

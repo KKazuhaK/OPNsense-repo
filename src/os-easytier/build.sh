@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-easytier}"
-VERSION="${VERSION:-1.1.2}"
+VERSION="${VERSION:-1.1.3}"
 ORIGIN="${ORIGIN:-opnsense/os-easytier}"
 COMMENT="${COMMENT:-EasyTier mesh VPN integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"

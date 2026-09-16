@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-ddclient-opnwall}"
-VERSION="${VERSION:-1.0.4}"
+VERSION="${VERSION:-1.0.5}"
 ORIGIN="${ORIGIN:-opnwall/os-ddclient-opnwall}"
 COMMENT="${COMMENT:-Extended Dynamic DNS client for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/Opnwall/}"

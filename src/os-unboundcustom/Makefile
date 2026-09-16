@@ -1,5 +1,5 @@
 PLUGIN_NAME=        unboundcustom
-PLUGIN_VERSION=     1.0.5
+PLUGIN_VERSION=     1.0.6
 PLUGIN_COMMENT=     Safe custom options for Unbound DNS
 PLUGIN_MAINTAINER=  https://github.com/Opnwall/
 

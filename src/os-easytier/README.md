@@ -2,7 +2,7 @@
 
 `os-easytier` 是适用于 OPNsense 的 EasyTier 组网 VPN 插件。它集成 EasyTier Core，可在 **VPN > EasyTier** 中完成配置、服务管理、状态查看、节点查看和日志排查。
 
-当前插件版本：`1.1.2`
+当前插件版本：`1.1.3`
 
 内置 EasyTier 版本：`2.6.4`
 

@@ -76,7 +76,7 @@ OPNsense DNS 时继续由 Unbound 解析，透明接管要求真实 IP，不能�
 ## 安装命令
 将安装包上传到 OPNsense 后执行：
 ```sh
-pkg add -f os-sing-box-1.1.3.pkg
+pkg add -f os-sing-box-1.1.4.pkg
 ```
 刷新 OPNsense WebGUI，进入：
 ```text
@@ -112,11 +112,11 @@ make package
 生成文件：
 
 ```text
-dist/os-sing-box-1.1.3.pkg
+dist/os-sing-box-1.1.4.pkg
 ```
 检查包元数据：
 ```sh
-pkg info -F dist/os-sing-box-1.1.3.pkg
+pkg info -F dist/os-sing-box-1.1.4.pkg
 ```
 ## 常用命令
 服务控制：

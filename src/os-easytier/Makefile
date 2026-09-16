@@ -1,5 +1,5 @@
 PKG_NAME?=os-easytier
-VERSION?=1.1.2
+VERSION?=1.1.3
 ABI?=native
 
 .PHONY: package clean

@@ -15,6 +15,7 @@ from unittest.mock import patch
 PACKAGE = Path(__file__).resolve().parents[2]
 SCRIPTS = PACKAGE / 'src/usr/local/opnsense/scripts/easytier'
 sys.path.insert(0, str(PACKAGE.parent / 'common'))
+import process_identity
 spec = importlib.util.spec_from_file_location('easytier_network_test', SCRIPTS / 'network.py')
 n = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(n)
@@ -64,6 +65,39 @@ class NetworkTests(unittest.TestCase):
             with self.subTest(change=change), patch.object(
                     n, 'process', return_value=kernel_process(expected, **change)):
                 self.assertFalse(n.same_process(expected))
+
+    def test_clock_step_rebases_recorded_births_into_the_live_frame(self):
+        core = process_receipt(42, [n.CORE, '--config-file', str(n.RUNTIME),
+                                    '--rpc-portal', '127.0.0.1:30120'], birth='1770000000:42')
+        supervisor = process_receipt(41, n.supervisor_arguments(), birth='1770000000:41')
+        launcher = process_receipt(
+            43, n.launcher_arguments(descriptor=8, portal='127.0.0.1:30120'), birth='1770000000:43')
+        n.JOURNAL.write_text(json.dumps({'schema': 1, 'mode': 'supervised', 'boot': '1770000000:0',
+                                         'core': core, 'supervisor': supervisor, 'launcher': launcher}))
+        live = {42: kernel_process(core, birth='1770000300:42'),
+                41: kernel_process(supervisor, birth='1770000300:41'),
+                43: kernel_process(launcher, birth='1770000300:43')}
+        with patch.object(n, 'process', side_effect=lambda pid: live.get(pid)), \
+                patch.object(process_identity, 'boot_time', return_value=(1770000300, 0)):
+            record = n.load_record()
+            self.assertEqual(record['boot'], '1770000300:0')
+            self.assertEqual(record['core']['birth'], '1770000300:42')
+            self.assertEqual(record['supervisor']['birth'], '1770000300:41')
+            self.assertEqual(record['launcher']['birth'], '1770000300:43')
+            self.assertTrue(n.same_process(record['core']))
+            self.assertTrue(n.same_process(record['supervisor']))
+            self.assertTrue(n.same_process(record['launcher']))
+
+    def test_legacy_journal_without_boot_keeps_the_exact_comparison(self):
+        core = process_receipt(42, [n.CORE, '--config-file', str(n.RUNTIME),
+                                    '--rpc-portal', '127.0.0.1:30120'], birth='1770000000:42')
+        n.JOURNAL.write_text(json.dumps({'schema': 1, 'mode': 'supervised', 'core': core}))
+        with patch.object(n, 'process', return_value=kernel_process(core, birth='1770000300:42')), \
+                patch.object(process_identity, 'boot_time', return_value=(1770000300, 0)):
+            record = n.load_record()
+            self.assertNotIn('boot', record)
+            self.assertEqual(record['core']['birth'], '1770000000:42')
+            self.assertFalse(n.same_process(record['core']))
 
     def test_signal_rechecks_exact_identity_and_preserves_reused_pid(self):
         arguments = n.supervisor_arguments()

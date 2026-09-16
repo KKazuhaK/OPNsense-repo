@@ -48,6 +48,77 @@ def relative_birth(birth, boot):
     return (int(match.group(1)) - boot_sec) * 1000000 + int(match.group(2)) - boot_usec
 
 
+def rebase_birth(birth, delta):
+    """Move a birth by delta microseconds, keeping the canonical text form."""
+    match = BIRTH.fullmatch(birth) if isinstance(birth, str) else None
+    if match is None or type(delta) is not int:
+        return None
+    total = int(match.group(1)) * 1000000 + int(match.group(2)) + delta
+    if total < 0:
+        return None
+    seconds, microseconds = divmod(total, 1000000)
+    return str(seconds) + ':' + str(microseconds)
+
+
+def sysctl_value(name):
+    """Read one bounded kernel value without a process selector."""
+    if not isinstance(name, str) or not name:
+        raise RuntimeError('A kernel value name is required.')
+    library = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 8)()
+    count = ctypes.c_size_t(8)
+    if library.sysctlnametomib(name.encode(), mib, ctypes.byref(count)):
+        raise OSError(ctypes.get_errno(), 'Cannot resolve a kernel value.')
+    if not 0 < count.value <= len(mib):
+        raise RuntimeError('Invalid kernel value selector.')
+    size = ctypes.c_size_t()
+    if library.sysctl(mib, count, None, ctypes.byref(size), None, 0) or size.value > 4096:
+        raise OSError(ctypes.get_errno(), 'Cannot read a bounded kernel value.')
+    buffer = ctypes.create_string_buffer(size.value)
+    if library.sysctl(mib, count, buffer, ctypes.byref(size), None, 0):
+        raise OSError(ctypes.get_errno(), 'The kernel value changed.')
+    return buffer.raw[:size.value]
+
+
+def boot_time():
+    """Return the current kern.boottime as (seconds, microseconds), or None."""
+    try:
+        raw = sysctl_value('kern.boottime')
+    except (OSError, AttributeError):
+        return None
+    if len(raw) != 16:
+        return None
+    sec, usec = struct.unpack('=qq', raw)
+    if sec <= 0 or not 0 <= usec < 1000000:
+        return None
+    return sec, usec
+
+
+def boot_token():
+    """Return the current boot as a canonical 'seconds:microseconds' token."""
+    value = boot_time()
+    return None if value is None else str(value[0]) + ':' + str(value[1])
+
+
+def birth_frame_shift(token):
+    """Return (delta, current_token) to move recorded births into the live frame.
+
+    Journals store the boot they were written under; after a wall-clock step
+    every recorded start can be moved by the boot difference so the unchanged
+    process still compares equal. None means the journal cannot be rebased and
+    callers must keep the exact comparison.
+    """
+    try:
+        recorded = parse_boot(token)
+    except ValueError:
+        return None
+    current = boot_time()
+    if current is None:
+        return None
+    delta = (current[0] - recorded[0]) * 1000000 + current[1] - recorded[1]
+    return delta, str(current[0]) + ':' + str(current[1])
+
+
 def kernel_value(name, pid):
     if type(pid) is not int or not 0 < pid < 2147483648:
         raise RuntimeError('Refusing an invalid process PID.')

@@ -11,9 +11,63 @@ import re
 import signal
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import time
+
+BOOT = re.compile(r'^\{\s*sec\s*=\s*([0-9]+),\s*usec\s*=\s*([0-9]+)\s*\}')
+BIRTH = re.compile(r'^([0-9]+):([0-9]{1,6})$')
+
+
+def parse_boot(value):
+    """Parse a kern.boottime reading or a canonical boot token."""
+    if not isinstance(value, str):
+        return None
+    match = BOOT.match(value.strip())
+    if match is None:
+        match = BIRTH.fullmatch(value.strip())
+    if match is None:
+        return None
+    sec, usec = int(match.group(1)), int(match.group(2))
+    if not 0 <= usec < 1000000:
+        return None
+    return sec, usec
+
+
+def boot_token():
+    """Read the current boot time through one bounded sysctl call."""
+    try:
+        result = subprocess.run(['/sbin/sysctl', '-n', 'kern.boottime'],
+                                capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    parsed = parse_boot(result.stdout.decode('utf-8', 'replace'))
+    return None if parsed is None else str(parsed[0]) + ':' + str(parsed[1])
+
+
+def birth_frame_shift(token):
+    """Return (delta, current token) so recorded births enter the live frame."""
+    recorded = parse_boot(token)
+    current = parse_boot(boot_token())
+    if recorded is None or current is None:
+        return None
+    delta = (current[0] - recorded[0]) * 1000000 + current[1] - recorded[1]
+    return delta, str(current[0]) + ':' + str(current[1])
+
+
+def rebase_birth(birth, delta):
+    """Move a birth by delta microseconds, keeping the canonical text form."""
+    match = BIRTH.fullmatch(birth) if isinstance(birth, str) else None
+    if match is None or type(delta) is not int:
+        return None
+    total = int(match.group(1)) * 1000000 + int(match.group(2)) + delta
+    if total < 0:
+        return None
+    seconds, microseconds = divmod(total, 1000000)
+    return str(seconds) + ':' + str(microseconds)
 
 
 def kernel_value(name, pid):
@@ -63,9 +117,19 @@ class ProcessTable:
             before = precise_metadata(pid)
             if before is None:
                 return None
-            executable = os.fsdecode(kernel_value('kern.proc.pathname', pid).rstrip(b'\0'))
-            raw = kernel_value('kern.proc.args', pid)
-            argv = [os.fsdecode(item) for item in raw.rstrip(b'\0').split(b'\0')]
+            try:
+                executable = os.fsdecode(kernel_value('kern.proc.pathname', pid).rstrip(b'\0'))
+                raw = kernel_value('kern.proc.args', pid)
+                argv = [os.fsdecode(item) for item in raw.rstrip(b'\0').split(b'\0')]
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ESRCH):
+                    raise RuntimeError('Cannot establish DDClient process ownership.') from error
+                # The kinfo identity already proved this process was alive. A
+                # vanished pathname or argv means its executable was replaced,
+                # never that a live process is gone.
+                if precise_metadata(pid) is None:
+                    return None
+                raise RuntimeError('The executable of live DDClient process ' + str(pid) + ' is unavailable.') from error
             after = precise_metadata(pid)
             if after is None:
                 return None
@@ -166,8 +230,8 @@ class Owner:
             return None
         identity = document.get('identity') if isinstance(document, dict) else None
         snapshot = document.get('snapshot') if isinstance(document, dict) else None
-        if (not isinstance(document, dict) or set(document) != {
-                'version', 'snapshot', 'identity', 'script', 'interpreter', 'pidfile'} or
+        keys = {'version', 'snapshot', 'identity', 'script', 'interpreter', 'pidfile'}
+        if (not isinstance(document, dict) or set(document) not in (keys, keys | {'boot'}) or
                 document.get('version') != 1 or document.get('script') != self.script or
                 document.get('interpreter') != self.interpreter or
                 document.get('pidfile') != str(self.pidfile.absolute()) or
@@ -178,6 +242,16 @@ class Owner:
                 not 1 < identity['pid'] <= 2147483647 or
                 not isinstance(identity.get('birth'), str) or not self.matches(identity)):
             raise RuntimeError('The saved identity does not match this DDClient instance.')
+        if 'boot' in document and document['boot'] is not None and not isinstance(document['boot'], str):
+            raise RuntimeError('The saved identity does not match this DDClient instance.')
+        if isinstance(document.get('boot'), str):
+            shift = birth_frame_shift(document['boot'])
+            if shift is not None:
+                delta, current = shift
+                moved = rebase_birth(identity['birth'], delta)
+                if moved is not None:
+                    identity['birth'] = moved
+                    document['boot'] = current
         return document
 
     def same(self, expected):
@@ -192,6 +266,7 @@ class Owner:
             try:
                 document = self.current()
                 if document is not None:
+                    document['boot'] = boot_token()
                     persist(self.journal, document)
                     if not self.check(document):
                         raise RuntimeError('The process changed while recording its identity.')
@@ -268,7 +343,9 @@ class Owner:
         if self.pid() == (pid, document['snapshot']):
             self.pidfile.unlink()
         try:
-            if json.loads(secure_read(self.journal)[0]) == document:
+            # A wall-clock step rewrites the recorded birth into the live frame
+            # in memory, so accept either the exact file or its rebased view.
+            if json.loads(secure_read(self.journal)[0]) == document or self.load() == document:
                 self.journal.unlink()
         except FileNotFoundError:
             pass

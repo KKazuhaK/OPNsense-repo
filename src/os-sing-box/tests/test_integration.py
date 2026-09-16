@@ -16,6 +16,7 @@ from unittest.mock import patch
 HELPERS = Path(__file__).resolve().parents[1] / 'src/usr/local/opnsense/scripts/singbox'
 sys.path.insert(0, str(HELPERS))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'common'))
+import process_identity
 spec = importlib.util.spec_from_file_location('singbox_integration', HELPERS / 'integration.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
@@ -236,6 +237,62 @@ class FakeRouting:
     def routes(self, fib):
         assert fib == 0
         return {}
+
+
+class ClockStepTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.manager = m.Manager(self.root / 'state', FakeRouting(), self.root / 'core.pid',
+                                 log=self.root / 'service.log')
+
+    def core(self, birth='1770000000:12345'):
+        return {'pid': 12345, 'birth': birth, 'uid': os.geteuid(),
+                'executable': os.path.realpath(m.CORE),
+                'arguments': [m.CORE, 'run', '-c', str(m.STATE / 'runtime.json')]}
+
+    def watcher(self, birth='1770000000:54321'):
+        arguments = [sys.executable, str(Path(m.__file__).resolve()), 'watch']
+        return {'pid': 12346, 'birth': birth, 'uid': os.geteuid(),
+                'executable': os.path.realpath(sys.executable), 'arguments': arguments}
+
+    def live(self, receipt, birth):
+        return {'pid': receipt['pid'], 'ppid': 1, 'uid': receipt['uid'], 'birth': birth,
+                'executable': receipt['executable'], 'stopped': False, 'argv': receipt['arguments']}
+
+    def test_clock_step_rebases_recorded_births_into_the_live_frame(self):
+        record = {'schema': 1, 'boot': '1770000000:0',
+                  'core': self.core(), 'watcher': self.watcher()}
+        m.write_json(self.manager.record_path, record)
+        live = {record['core']['pid']: self.live(record['core'], '1770000300:12345'),
+                record['watcher']['pid']: self.live(record['watcher'], '1770000300:54321')}
+        with patch.object(m, 'process', side_effect=lambda pid: copy.deepcopy(live.get(pid))), \
+                patch.object(process_identity, 'boot_time', return_value=(1770000300, 0)):
+            loaded = self.manager.read_record()
+            self.assertEqual(loaded['boot'], '1770000300:0')
+            self.assertEqual(loaded['core']['birth'], '1770000300:12345')
+            self.assertEqual(loaded['watcher']['birth'], '1770000300:54321')
+            self.assertTrue(m.owned(loaded))
+            self.assertTrue(m.owned(loaded, 'watcher'))
+            health = m.core_health(loaded)
+            self.assertTrue(health['process_alive'])
+            self.assertTrue(health['healthy'])
+
+    def test_legacy_record_without_boot_keeps_the_exact_comparison(self):
+        record = {'schema': 1, 'core': self.core(), 'watcher': self.watcher()}
+        m.write_json(self.manager.record_path, record)
+        live = {record['core']['pid']: self.live(record['core'], '1770000300:12345'),
+                record['watcher']['pid']: self.live(record['watcher'], '1770000300:54321')}
+        with patch.object(m, 'process', side_effect=lambda pid: copy.deepcopy(live.get(pid))), \
+                patch.object(process_identity, 'boot_time', return_value=(1770000300, 0)):
+            loaded = self.manager.read_record()
+            self.assertNotIn('boot', loaded)
+            self.assertEqual(loaded['core']['birth'], '1770000000:12345')
+            self.assertEqual(loaded['watcher']['birth'], '1770000000:54321')
+            self.assertFalse(m.owned(loaded))
+            self.assertFalse(m.owned(loaded, 'watcher'))
+            self.assertFalse(m.core_health(loaded)['process_alive'])
 
 
 class OwnedTunTests(unittest.TestCase):

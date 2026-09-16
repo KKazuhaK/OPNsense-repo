@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 PACKAGE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE.parent / 'common'))
+import process_identity
 spec = importlib.util.spec_from_file_location('unboundcustom_apply', PACKAGE / 'src/opnsense/scripts/OPNsense/Unboundcustom/apply.py')
 apply = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(apply)
@@ -254,6 +255,43 @@ class ApplyTests(unittest.TestCase):
         self.running = {'pid': 11, 'birth': '999:1234'}
         self.assertTrue(self.attempt()['restarted'])
 
+    def test_receipt_boot_rebases_the_same_resolver_across_a_wall_clock_step(self):
+        with patch.object(process_identity, 'boot_time', return_value=(1000, 0)):
+            self.assertEqual(self.attempt()['status'], 'ok')
+        receipt = json.loads((self.state / 'applied.json').read_text())
+        self.assertEqual(receipt['boot'], '1000:0')
+        self.assertEqual(receipt['resolver'], {'pid': 11, 'birth': '201:1234'})
+        # The kernel moves both kern.boottime and every birth by the same +300s.
+        self.running = {'pid': 11, 'birth': '501:1234'}
+        with patch.object(process_identity, 'boot_time', return_value=(1300, 0)):
+            report = self.attempt()
+        self.assertEqual(report['status'], 'ok')
+        self.assertFalse(report['restarted'])
+        self.assertEqual(self.restarts(), 1)
+        self.assertEqual(self.running, {'pid': 11, 'birth': '501:1234'})
+        receipt = json.loads((self.state / 'applied.json').read_text())
+        self.assertEqual(receipt['boot'], '1300:0')
+        self.assertEqual(receipt['resolver'], {'pid': 11, 'birth': '501:1234'})
+
+    def test_legacy_receipt_without_boot_keeps_exact_comparisons_across_a_step(self):
+        with patch.object(process_identity, 'boot_time', return_value=(1000, 0)):
+            self.assertEqual(self.attempt()['status'], 'ok')
+        receipt = json.loads((self.state / 'applied.json').read_text())
+        receipt.pop('boot')
+        (self.state / 'applied.json').write_text(json.dumps(receipt))
+        with patch.object(process_identity, 'boot_time', return_value=(1000, 0)):
+            self.assertFalse(self.attempt()['restarted'])
+        self.assertEqual(self.restarts(), 1)
+        receipt = json.loads((self.state / 'applied.json').read_text())
+        receipt.pop('boot')
+        (self.state / 'applied.json').write_text(json.dumps(receipt))
+        # Legacy receipts are never rebased, so a +300s step cannot claim a no-op.
+        self.running = {'pid': 11, 'birth': '501:1234'}
+        with patch.object(process_identity, 'boot_time', return_value=(1300, 0)):
+            self.assertTrue(self.attempt()['restarted'])
+        self.assertEqual(self.restarts(), 2)
+        self.assertEqual(self.running['pid'], 12)
+
     def test_template_or_validation_failure_restores_exact_files_without_restart(self):
         for failure, code in [('template', 'template_failed'), ('validation', 'validation_failed')]:
             with self.subTest(failure=failure):
@@ -411,7 +449,8 @@ class ApplyTests(unittest.TestCase):
                  'closure': None, 'resolver': None}
         cases = ['{broken', '[]', 'null', '42', '"text"', '{}', json.dumps({**valid, 'owned': []}),
                  json.dumps({**valid, 'owned': {}}), json.dumps({**valid, 'resolver': {'pid': True, 'birth': '1:1'}}),
-                 json.dumps({**valid, 'closure': 'bad'})]
+                 json.dumps({**valid, 'closure': 'bad'}), json.dumps({**valid, 'boot': 5}),
+                 json.dumps({**valid, 'boot': None, 'extra': 1})]
         for bad in ({'data': '@bad', 'mode': 0o600, 'uid': 0, 'gid': 0},
                     {'data': '', 'mode': True, 'uid': 0, 'gid': 0}, []):
             cases.append(json.dumps({**valid, 'owned': {str(self.fragment): bad, str(self.runtime): None}}))

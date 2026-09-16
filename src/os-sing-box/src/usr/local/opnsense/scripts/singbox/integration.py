@@ -18,7 +18,7 @@ import tempfile
 import time
 
 from routing import Routing, RoutingError
-from process_identity import process
+from process_identity import birth_frame_shift, boot_token, process, rebase_birth
 
 STATE = Path('/var/db/os-sing-box')
 POLICY = Path('/usr/local/etc/sing-box/integration.json')
@@ -258,6 +258,23 @@ def snapshot_identity(value):
     return {key: value[key] for key in ('pid', 'birth', 'uid', 'executable')} | {'arguments': value['argv']}
 
 
+def rebase_record_births(record):
+    """Move recorded births into the live clock frame after a wall-clock step."""
+    token = record.get('boot') if isinstance(record, dict) else None
+    if not isinstance(token, str):
+        return
+    shift = birth_frame_shift(token)
+    if shift is None:
+        return
+    delta, current = shift
+    for identity in (record.get('core'), record.get('watcher'), record.get('launcher')):
+        if isinstance(identity, dict) and isinstance(identity.get('birth'), str):
+            moved = rebase_birth(identity['birth'], delta)
+            if moved is not None:
+                identity['birth'] = moved
+    record['boot'] = current
+
+
 def core_arguments():
     return [CORE, 'run', '-c', str(STATE / 'runtime.json')]
 
@@ -407,6 +424,7 @@ class Manager:
                 or any(value.get(key) is not None and not isinstance(value.get(key), dict)
                        for key in ('core', 'watcher', 'launcher'))):
             raise IntegrationError('The service ownership record is invalid.')
+        rebase_record_births(value)
         return value
 
     def capture_launcher(self, pid, arguments):
@@ -800,7 +818,7 @@ class Manager:
         if settings['transparent']:
             self.sync_filter_configuration()
         record = {'schema': 1, 'core': None, 'watcher': None, 'launcher': None,
-                  'transparent': settings['transparent']}
+                  'transparent': settings['transparent'], 'boot': boot_token()}
         child = None
         watcher = None
         read_descriptor = None

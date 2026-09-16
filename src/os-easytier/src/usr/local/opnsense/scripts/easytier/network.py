@@ -17,7 +17,7 @@ import tempfile
 import time
 import tomllib
 
-from process_identity import process
+from process_identity import birth_frame_shift, boot_token, process, rebase_birth
 
 ROOT = Path('/var/run/easytier-network')
 JOURNAL = ROOT / 'owner.json'
@@ -201,6 +201,23 @@ def identity(pid, parent=None):
 
 def same_process(record):
     return isinstance(record, dict) and identity(record.get('pid')) == record
+
+
+def rebase_record_births(record):
+    """Move recorded births into the live clock frame after a wall-clock step."""
+    token = record.get('boot') if isinstance(record, dict) else None
+    if not isinstance(token, str):
+        return
+    shift = birth_frame_shift(token)
+    if shift is None:
+        return
+    delta, current = shift
+    for identity in (record.get('core'), record.get('supervisor'), record.get('launcher')):
+        if isinstance(identity, dict) and isinstance(identity.get('birth'), str):
+            moved = rebase_birth(identity['birth'], delta)
+            if moved is not None:
+                identity['birth'] = moved
+    record['boot'] = current
 
 
 def exact_command(record, arguments):
@@ -876,6 +893,7 @@ def load_record():
         raise PolicyError('The EasyTier ownership journal is invalid.') from None
     if not isinstance(record, dict):
         raise PolicyError('The EasyTier ownership journal is invalid.')
+    rebase_record_births(record)
     return record
 
 
@@ -948,7 +966,7 @@ def stop_legacy():
         name = ''
     current = interface_identity(name) if isinstance(name, str) and IFNAME.fullmatch(name) else None
     record = {'schema': 1, 'mode': 'legacy', 'token': secrets.token_hex(16),
-              'core': core, 'routes': {}, 'active': False,
+              'core': core, 'routes': {}, 'active': False, 'boot': boot_token(),
               'rejected_routes': {}, 'imported_route_count': 0, 'error': ''}
     if current and current['opened_by'] == core['pid'] and current['original'].startswith('tun'):
         receipt = {**current, 'phase': 'claiming', 'preclaim': dict(current)}
@@ -1052,7 +1070,7 @@ def supervise():
         atomic(RUNTIME, render(runtime))
         supervisor = capture_supervisor(os.getpid())
         record = {'schema': 1, 'mode': 'supervised', 'token': secrets.token_hex(16),
-                  'supervisor': supervisor, 'active': False,
+                  'supervisor': supervisor, 'active': False, 'boot': boot_token(),
                   'routes': {}, 'rejected_routes': {}, 'imported_route_count': 0, 'error': ''}
         interrupted = False
         def terminate(_number, _frame):

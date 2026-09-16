@@ -43,6 +43,7 @@ class OwnershipCommandTests(unittest.TestCase):
         self.driver.write_text('''import importlib.util,json,os,sys
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('production',sys.argv[1]); module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+if os.environ.get('OWNER_TEST_BOOT'): module.boot_token=lambda: os.environ['OWNER_TEST_BOOT']
 path=Path(os.environ['OWNER_TEST_TABLE'])
 class FixtureTable:
     def read(self,pid):
@@ -117,6 +118,27 @@ except Exception as error:
         self.pidfile.symlink_to(alternate)
         self.assertNotEqual(self.run_action('stop').returncode, 0)
         self.assertEqual(self.state()['signals'], [])
+
+    def test_owner_journal_rebases_and_stops_the_same_process_after_a_clock_step(self):
+        self.assertEqual(self.run_action('record', OWNER_TEST_BOOT='1000:0').returncode, 0)
+        journal = Path(str(self.pidfile) + '.identity.json')
+        self.assertEqual(json.loads(journal.read_text())['boot'], '1000:0')
+        # The kernel moves kern.boottime and the live birth by the same +300s.
+        self.edit(lambda state: state['processes']['12345'].update({'birth': '1300:123456'}))
+        self.assertEqual(self.run_action('stop', OWNER_TEST_BOOT='1300:0').returncode, 0)
+        self.assertEqual(self.state()['signals'], [[12345, signal.SIGTERM]])
+        self.assertFalse(self.pidfile.exists())
+        self.assertFalse(journal.exists())
+
+    def test_legacy_owner_journal_without_boot_keeps_exact_comparisons(self):
+        self.assertEqual(self.run_action('record', OWNER_TEST_BOOT='1000:0').returncode, 0)
+        journal = Path(str(self.pidfile) + '.identity.json')
+        document = json.loads(journal.read_text())
+        document.pop('boot')
+        journal.write_text(json.dumps(document))
+        # The shifted boot reader must not move a legacy birth; exact text matches.
+        self.assertEqual(self.run_action('stop', OWNER_TEST_BOOT='1300:0').returncode, 0)
+        self.assertEqual(self.state()['signals'], [[12345, signal.SIGTERM]])
 
     def test_saved_birth_and_pid_inode_mismatch_refuses_stop(self):
         self.assertEqual(self.run_action('record').returncode, 0)
@@ -264,6 +286,19 @@ class PreciseMetadataTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'identity changed or is incomplete'):
                     control.stop()
             self.assertEqual(pidfile.read_text(), '12345\n')
+
+    def test_replaced_executable_of_a_live_process_fails_closed_and_exit_stays_empty(self):
+        table = owner.ProcessTable()
+        identity = {'pid': 12345, 'ppid': 100, 'uid': os.geteuid(), 'birth': '1000:123456'}
+        for number in (errno.ENOENT, errno.ESRCH):
+            with (self.subTest(number=number),
+                  mock.patch.object(owner, 'precise_metadata', return_value=identity),
+                  mock.patch.object(owner, 'kernel_value', side_effect=OSError(number, 'replaced'))):
+                with self.assertRaisesRegex(RuntimeError, 'live DDClient process 12345 is unavailable'):
+                    table.read(12345)
+        with (mock.patch.object(owner, 'precise_metadata', side_effect=[identity, None]),
+              mock.patch.object(owner, 'kernel_value', side_effect=OSError(errno.ENOENT, 'exited'))):
+            self.assertIsNone(table.read(12345))
 
 
 if __name__ == '__main__':

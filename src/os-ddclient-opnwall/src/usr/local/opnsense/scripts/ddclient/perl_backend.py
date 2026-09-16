@@ -8,7 +8,7 @@ import signal
 import subprocess
 import sys
 import time
-from process_owner import Owner, ProcessTable, persist, secure_read
+from process_owner import Owner, ProcessTable, birth_frame_shift, boot_token, persist, rebase_birth, secure_read
 
 PERL = '/usr/local/bin/perl'
 PROGRAM = '/usr/local/sbin/ddclient'
@@ -39,6 +39,8 @@ class Child:
                 not isinstance(record.get('launch'), list) or record['launch'][:3] != [PERL, PROGRAM, '-foreground'] or
                 not isinstance(record.get('identity'), dict)):
             raise RuntimeError('Invalid Perl child ownership; no process was adopted.')
+        if 'boot' in record and record['boot'] is not None and not isinstance(record['boot'], str):
+            raise RuntimeError('Invalid Perl child ownership; no process was adopted.')
         identity = record['identity']
         if (type(identity.get('pid')) is not int or not 1 < identity['pid'] <= 2147483647 or
                 identity.get('uid') != os.geteuid() or identity.get('executable') != self.perl or
@@ -54,6 +56,18 @@ class Child:
                     not isinstance(launcher.get('argv'), list) or not launcher['argv'] or
                     any(not isinstance(value, str) or '\0' in value for value in launcher['argv'])):
                 raise RuntimeError('Invalid Perl child launcher identity.')
+        if isinstance(record.get('boot'), str):
+            shift = birth_frame_shift(record['boot'])
+            if shift is not None:
+                delta, current = shift
+                for key in ('identity', 'launcher'):
+                    details = record.get(key)
+                    if not isinstance(details, dict):
+                        continue
+                    moved = rebase_birth(details.get('birth'), delta)
+                    if moved is not None:
+                        details['birth'] = moved
+                record['boot'] = current
         return record
 
     def owns(self, record, current):
@@ -121,7 +135,8 @@ class Child:
                     launch_identity = {key: current[key] for key in ('pid', 'birth', 'uid', 'executable', 'argv')}
                     record = {'version': 2, 'identity': expected, 'launcher': launch_identity,
                               'launch': arguments, 'perl': self.perl,
-                              'program': PROGRAM, 'pidfile': str(self.pidfile.absolute())}
+                              'program': PROGRAM, 'pidfile': str(self.pidfile.absolute()),
+                              'boot': boot_token()}
                     persist(self.journal, record)
                     recorded = True
                     if self.table.read(process.pid) != current:

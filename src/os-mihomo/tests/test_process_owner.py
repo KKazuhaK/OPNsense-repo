@@ -47,11 +47,12 @@ class ProcessOwnershipTests(unittest.TestCase):
         if number in (signal.SIGTERM, signal.SIGKILL):
             self.live.pop(pid, None)
 
-    def group(self, tag='mihomo', executable=owner.CORE, argv=None):
+    def group(self, tag='mihomo', executable=owner.CORE, argv=None, boot=None):
         return owner.ProcessGroup(tag, self.parent_pid, self.child_pid, self.journal,
                                   executable, argv or self.child_argv,
                                   process_reader=self.reader, signaler=self.signaler,
-                                  sleeper=lambda unused: None)
+                                  sleeper=lambda unused: None,
+                                  boot_reader=lambda: boot)
 
     def install_pid_files(self, parent=101, child=102):
         self.parent_pid.write_text(str(parent) + '\n')
@@ -69,10 +70,34 @@ class ProcessOwnershipTests(unittest.TestCase):
         self.assertTrue(group.running())
 
         record = json.loads(self.journal.read_text())
-        self.assertEqual({'version', 'tag', 'parent', 'child'}, set(record))
+        self.assertEqual({'version', 'tag', 'boot', 'parent', 'child'}, set(record))
         self.assertEqual(0o600, self.journal.stat().st_mode & 0o777)
         self.assertEqual(self.live[101]['birth'], record['parent']['birth'])
         self.assertEqual(self.child_argv, record['child']['argv'])
+
+    def test_clock_step_keeps_the_recorded_core_owned(self):
+        self.install_pid_files()
+        group = self.group(boot='{ sec = 1780000000, usec = 100 }')
+        self.assertTrue(group.running())
+        # A wall-clock step moves kern.boottime and every live process start
+        # time by the same delta; identity must not be lost.
+        for value in self.live.values():
+            sec, usec = value['birth'].split(':')
+            value['birth'] = '%d:%s' % (int(sec) + 300, usec)
+        stepped = self.group(boot='{ sec = 1780000300, usec = 100 }')
+        self.assertTrue(stepped.running(adopt=False))
+        stepped.stop()
+        self.assertIn((102, signal.SIGTERM), self.signals)
+        self.assertFalse(self.journal.exists())
+
+    def test_legacy_journal_without_a_boot_field_still_loads(self):
+        self.install_pid_files()
+        group = self.group()
+        group.adopt()
+        record = json.loads(self.journal.read_text())
+        record.pop('boot')
+        self.journal.write_text(json.dumps(record))
+        self.assertTrue(self.group().running(adopt=False))
 
     def test_adoption_rejects_wrong_uid_executable_argv_and_parent_relationship(self):
         cases = {

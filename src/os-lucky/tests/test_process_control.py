@@ -58,6 +58,15 @@ class IdentityTests(unittest.TestCase):
             with patch.object(i, 'kernel_value', side_effect=[self.raw(), b'/tmp/binary\0', b'/tmp/binary\0', self.raw(pid=43)]):
                 with self.assertRaises(RuntimeError): i.process(42)
 
+    def test_live_process_with_a_replaced_executable_is_not_reported_gone(self):
+        with patch.object(i.os, 'uname', return_value=types.SimpleNamespace(machine='amd64')):
+            with patch.object(i, 'metadata', side_effect=[{'pid': 42}, {'pid': 42}]), \
+                    patch.object(i, 'kernel_value', side_effect=OSError(2, 'gone')):
+                with self.assertRaises(RuntimeError): i.process(42)
+            with patch.object(i, 'metadata', side_effect=[{'pid': 42}, None]), \
+                    patch.object(i, 'kernel_value', side_effect=OSError(3, 'ended')):
+                self.assertIsNone(i.process(42))
+
 
 class ControlTests(unittest.TestCase):
     def setUp(self):
@@ -123,14 +132,27 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):self.c.stop()
         self.assertFalse(self.signals)
 
-    def test_recorded_birth_and_boot_reuse_preserve_foreign_pid_file(self):
-        for kind in ('birth','boot'):
+    def test_recorded_birth_reuse_preserves_foreign_pid_file(self):
+        self.running(); self.c.record()
+        self.kernel[11]['birth'] = '1780000001:11'
+        with self.assertRaises(RuntimeError): self.c.stop()
+        self.assertTrue(self.pidfile.exists()); self.assertFalse(self.signals)
+
+    def test_clock_step_keeps_a_live_writer_owned(self):
+        boot = '{ sec = 1780000000, usec = 100 }'
+        with patch.object(m, 'boot', return_value=boot):
             self.running(); self.c.record()
-            if kind=='birth':self.kernel[11]['birth']='1780000001:11'
-            else:
-                record=json.loads(self.c.journal.read_text());record['boot']='different-boot';m.persist(self.c.journal,record)
-            with self.assertRaises(RuntimeError):self.c.stop()
-            self.assertTrue(self.pidfile.exists()); self.assertFalse(self.signals)
+            self.assertTrue(self.c.status())
+            shifted = '{ sec = 1780000300, usec = 100 }'
+            for value in self.kernel.values():
+                sec, usec = value['birth'].split(':')
+                value['birth'] = '%d:%s' % (int(sec) + 300, usec)
+            with patch.object(m, 'boot', return_value=shifted):
+                self.assertTrue(self.c.status())
+                self.c.stop()
+        self.assertFalse(self.kernel); self.assertFalse(self.c.journal.exists())
+        self.assertIn((11, signal.SIGTERM), self.signals)
+        self.assertIn((22, signal.SIGTERM), self.signals)
 
     def test_previous_boot_receipt_without_pidfile_is_retired_without_signals(self):
         self.running(); self.c.record()

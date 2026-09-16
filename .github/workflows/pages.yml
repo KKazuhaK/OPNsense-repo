@@ -1,0 +1,60 @@
+name: Deploy signed GitHub Pages repository
+on:
+  push:
+    branches: [gh-pages]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate signed release and assets
+        id: release
+        run: |
+          test -f index.html
+          test -f kazuha.conf
+          if find . -type f -not -path './.git/*' | grep -E '\.(key|pem)$|/(AGENTS|CLAUDE|HANDOFF|MEMORY)\.md$'; then exit 1; fi
+          if grep -R --exclude-dir=.git -l -E -- '-----BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----' .; then exit 1; fi
+          python3 verify-repo.py .
+          python3 -c 'import json; print("source_commit=" + json.load(open("release.json"))["source_commit"])' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.source_commit }}
+          path: source
+      - run: python -m pip install -r source/tests/requirements.txt
+      - name: Test the source that produced the candidate
+        run: |
+          shellcheck source/src/os-mihomo/packaging/prepare-builder.sh
+          python -B source/tests/run.py
+          find source/src -type f \( -name '*.php' -o -name '*.inc' \) -print0 | xargs -0 -n 1 php -l
+          shellcheck source/build-repo.sh source/publish-repo.sh source/src/os-mihomo/build.sh source/src/os-mihomo/packaging/freebsd/+PRE_INSTALL source/src/os-mihomo/packaging/freebsd/+POST_INSTALL source/src/os-mihomo/packaging/freebsd/+PRE_DEINSTALL source/src/os-mihomo/packaging/freebsd/+POST_DEINSTALL source/src/os-mihomo/tests/jail/run.sh source/src/os-mihomo/tests/jail/prepare.sh source/src/os-sing-box/build.sh source/src/os-sing-box/src/usr/local/etc/sing-box/sub/sub.sh
+          python3 source/verify-repo.py . --source source
+          shellcheck source/client.sh source/src/os-kazuha-repo/build.sh source/src/os-kazuha-repo/src/usr/local/opnsense/scripts/firmware/repos/kazuha.sh source/src/os-kazuha-repo/packaging/freebsd/+POST_INSTALL source/src/os-kazuha-repo/packaging/freebsd/+POST_DEINSTALL
+      - name: Prepare static site
+        run: |
+          mkdir -p _site
+          cp index.html kazuha.pub kazuha.conf SHA256SUMS.txt release.json release.sig _site/
+          cp client.sh check-upgrade.py verify-repo.py _site/
+          cp -RL repo _site/
+          touch _site/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - uses: actions/deploy-pages@v4
+        id: deployment

@@ -2,7 +2,50 @@
 """Read exact FreeBSD amd64 process metadata without parsing displayed argv."""
 import ctypes
 import os
+import re
 import struct
+
+
+BIRTH = re.compile(r'^([0-9]+):([0-9]{1,6})$')
+BOOT = re.compile(r'^\{\s*sec\s*=\s*([0-9]+),\s*usec\s*=\s*([0-9]+)\s*\}')
+
+
+def parse_boot(value):
+    """Parse a kern.boottime reading into (seconds, microseconds).
+
+    sysctl appends a human-readable date after the structure, so only the
+    leading timeval is significant.
+    """
+    if not isinstance(value, str):
+        raise ValueError('A kernel boot time is required.')
+    match = BOOT.match(value.strip())
+    if match is None:
+        match = BIRTH.fullmatch(value.strip())
+    if match is None:
+        raise ValueError('A kernel boot time is invalid.')
+    sec, usec = int(match.group(1)), int(match.group(2))
+    if not 0 <= usec < 1000000:
+        raise ValueError('A kernel boot time is invalid.')
+    return sec, usec
+
+
+def relative_birth(birth, boot):
+    """Return a birth time measured from its boot time, or None.
+
+    FreeBSD moves kern.boottime and every existing process start time by the
+    same delta when the wall clock is stepped, so this difference is stable
+    within one boot and cannot be confused with a reboot by the clock alone.
+    """
+    if not isinstance(birth, str) or boot is None:
+        return None
+    match = BIRTH.fullmatch(birth)
+    if match is None:
+        return None
+    try:
+        boot_sec, boot_usec = parse_boot(boot)
+    except ValueError:
+        return None
+    return (int(match.group(1)) - boot_sec) * 1000000 + int(match.group(2)) - boot_usec
 
 
 def kernel_value(name, pid):
@@ -56,8 +99,18 @@ def process(pid):
         before = metadata(pid)
         if before is None:
             return None
-        executable = os.fsdecode(kernel_value('kern.proc.pathname', pid).rstrip(b'\0'))
-        argv = [os.fsdecode(item) for item in kernel_value('kern.proc.args', pid).rstrip(b'\0').split(b'\0')]
+        try:
+            executable = os.fsdecode(kernel_value('kern.proc.pathname', pid).rstrip(b'\0'))
+            argv = [os.fsdecode(item) for item in kernel_value('kern.proc.args', pid).rstrip(b'\0').split(b'\0')]
+        except OSError as error:
+            if error.errno not in (2, 3):
+                raise RuntimeError('Cannot establish process ownership.') from error
+            # kern.proc.pid already proved this process was alive. A missing
+            # pathname or argument vector means its executable was removed or
+            # replaced in place (a package upgrade), never that it exited.
+            if metadata(pid) is None:
+                return None
+            raise RuntimeError('The executable of live process ' + str(pid) + ' is unavailable.') from error
         after = metadata(pid)
         if before != after or not executable or not argv or not argv[0]:
             return None

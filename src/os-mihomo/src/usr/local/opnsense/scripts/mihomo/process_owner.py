@@ -6,10 +6,11 @@ from pathlib import Path
 import re
 import signal
 import stat
+import subprocess
 import tempfile
 import time
 
-from process_identity import process as read_process
+from process_identity import process as read_process, relative_birth
 
 
 LIMIT = 64 * 1024
@@ -49,7 +50,8 @@ def stable(identity):
 
 def valid_identity(identity):
     return bool(
-        isinstance(identity, dict) and set(identity) == set(IDENTITY_FIELDS)
+        isinstance(identity, dict)
+        and {key for key in identity if not key.startswith('_')} == set(IDENTITY_FIELDS)
         and type(identity.get('pid')) is int and 1 < identity['pid'] < 2147483648
         and type(identity.get('ppid')) is int and 0 <= identity['ppid'] < 2147483648
         and type(identity.get('uid')) is int and 0 <= identity['uid'] <= 4294967295
@@ -129,9 +131,22 @@ def unlink_snapshot(path, captured):
         Path(path).unlink()
 
 
+def kernel_boot():
+    """Best-effort kern.boottime text; None when the host cannot report it."""
+    try:
+        result = subprocess.run(['/sbin/sysctl', '-n', 'kern.boottime'],
+                                capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode or not result.stdout or len(result.stdout) > 4096:
+        return None
+    return result.stdout.decode(errors='replace').strip()
+
+
 class ProcessGroup:
     def __init__(self, tag, parent_pid, child_pid, journal, child_executable,
-                 child_argv, process_reader=None, signaler=None, sleeper=None):
+                 child_argv, process_reader=None, signaler=None, sleeper=None,
+                 boot_reader=None):
         self.tag = tag
         self.parent_pid = Path(parent_pid)
         self.child_pid = Path(child_pid)
@@ -141,6 +156,27 @@ class ProcessGroup:
         self.process_reader = process_reader or read_process
         self.signaler = signaler or os.kill
         self.sleeper = sleeper or time.sleep
+        self.boot_reader = boot_reader or kernel_boot
+        self._live_boot = None
+
+    def live_boot(self):
+        if self._live_boot is None:
+            self._live_boot = self.boot_reader()
+        return self._live_boot
+
+    def same_birth(self, recorded, current):
+        """Compare births relative to their own boot reading.
+
+        FreeBSD moves kern.boottime and every process start time by the same
+        delta when the clock is stepped, so an absolute comparison would call
+        a live core foreign after any NTP step. Legacy journals without a
+        usable boot keep the original exact comparison.
+        """
+        value = relative_birth(recorded.get('birth'), recorded.get('_boot'))
+        live = relative_birth(current.get('birth'), self.live_boot())
+        if value is None or live is None:
+            return recorded.get('birth') == current.get('birth')
+        return value == live
 
     def identity(self, pid):
         try:
@@ -164,8 +200,10 @@ class ProcessGroup:
         # The daemon is launched without respawn. Its child remains ours if the
         # supervisor exits first and init reparents that same birth/executable/
         # NUL-argv identity; ppid proves adoption, not continuing ownership.
-        return bool(current and all(current[field] == identity[field]
-                                    for field in CONTINUITY_FIELDS))
+        if not current or any(current[field] != identity[field]
+                              for field in CONTINUITY_FIELDS if field != 'birth'):
+            return False
+        return self.same_birth(identity, current)
 
     def load(self):
         try:
@@ -176,12 +214,17 @@ class ProcessGroup:
             record = json.loads(content)
         except (UnicodeError, ValueError, TypeError) as error:
             raise OwnershipError('The Mihomo process ownership journal is invalid.') from error
-        if (not isinstance(record, dict) or set(record) != {'version', 'tag', 'parent', 'child'}
+        if (not isinstance(record, dict)
+                or set(record) - {'boot'} != {'version', 'tag', 'parent', 'child'}
                 or record.get('version') != 1 or record.get('tag') != self.tag
+                or (record.get('boot') is not None and not isinstance(record.get('boot'), str))
                 or not self.parent_matches(record.get('parent'))
                 or not self.child_matches(record.get('child'))
                 or record['child']['ppid'] != record['parent']['pid']):
             raise OwnershipError('The Mihomo process ownership journal is invalid.')
+        if isinstance(record.get('boot'), str):
+            record['parent']['_boot'] = record['boot']
+            record['child']['_boot'] = record['boot']
         return record, (snapshot, content)
 
     def persist(self, parent, child):
@@ -189,7 +232,8 @@ class ProcessGroup:
         if (not self.parent_matches(parent) or not self.child_matches(child)
                 or child['ppid'] != parent['pid']):
             raise OwnershipError('The Mihomo daemon did not establish an exact parent and child identity.')
-        record = {'version': 1, 'tag': self.tag, 'parent': parent, 'child': child}
+        record = {'version': 1, 'tag': self.tag, 'boot': self.live_boot(),
+                  'parent': parent, 'child': child}
         atomic(self.journal, (json.dumps(record, sort_keys=True) + '\n').encode())
         if not self.same(parent) or not self.same(child):
             raise OwnershipError('The Mihomo process identity changed while it was recorded.')

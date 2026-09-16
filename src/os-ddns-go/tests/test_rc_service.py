@@ -60,9 +60,12 @@ state={'111': {'pid':111,'ppid':1,'uid':os.geteuid(),'birth':'1770000000:1','sto
         common = PACKAGE.parent / 'common'
         controller = self.root / 'process_control_actual.py'
         controller.write_bytes((common / 'process_control.py').read_bytes())
+        identity_actual = self.root / 'process_identity_actual.py'
+        identity_actual.write_bytes((common / 'process_identity.py').read_bytes())
         identity = self.root / 'process_identity.py'
         identity.write_text(r"""import json,os
 from pathlib import Path
+from process_identity_actual import parse_boot, relative_birth
 def state():
     path=Path(os.environ['TEST_ROOT'])/'kernel.json'
     return json.loads(path.read_text()) if path.exists() else {}

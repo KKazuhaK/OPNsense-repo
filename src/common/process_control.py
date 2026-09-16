@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 
-from process_identity import process
+from process_identity import process, relative_birth
 
 LIMIT = 1024 * 1024
 
@@ -65,12 +65,21 @@ def persist(path, data):
     try:
         with os.fdopen(descriptor, 'w') as handle:
             os.fchmod(handle.fileno(), 0o600)
-            json.dump(data, handle, sort_keys=True)
+            json.dump(public(data), handle, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def public(value):
+    """Strip verifier-private keys before a record reaches the disk."""
+    if isinstance(value, dict):
+        return {key: public(item) for key, item in value.items() if not key.startswith('_')}
+    if isinstance(value, list):
+        return [public(item) for item in value]
+    return value
 
 
 def positive_pid(text):
@@ -98,8 +107,36 @@ class Control:
         self.tag = tag
         self.binary = str(Path(binary).resolve())
         self.expected = [str(binary), *arguments]
+        self._boot = None
+        self._live_boot = None
         if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', tag):
             raise RuntimeError('Invalid daemon service tag.')
+
+    def live_boot(self):
+        """Cache one boot reading for the current operation."""
+        if self._live_boot is None:
+            self._live_boot = boot()
+        return self._live_boot
+
+    def same_birth(self, recorded, current):
+        """Compare births relative to their own boot reading.
+
+        FreeBSD moves kern.boottime and every process start time by the same
+        delta when the clock is stepped, so an absolute comparison would call
+        a live writer foreign after any NTP step. Legacy records without a
+        parseable boot keep the original exact comparison.
+        """
+        value = relative_birth(recorded.get('birth'), recorded.get('_boot'))
+        live = relative_birth(current.get('birth'), self.live_boot())
+        if value is None or live is None:
+            return recorded.get('birth') == current.get('birth')
+        return value == live
+
+    def birth_key(self, identity):
+        value = relative_birth(identity.get('birth'), identity.get('_boot'))
+        if value is None:
+            value = relative_birth(identity.get('birth'), self.live_boot())
+        return (identity['pid'], value if value is not None else identity['birth'])
 
     def parent_matches(self, identity):
         if not identity or identity.get('executable') != '/usr/sbin/daemon' or identity.get('uid') != os.geteuid():
@@ -125,37 +162,41 @@ class Control:
                     raise RuntimeError('A recorded process identity is invalid.')
                 if kind == 'parent' and not self.parent_matches(item) or kind == 'child' and (item.get('executable') != self.binary or item.get('argv') != argv):
                     raise RuntimeError('A recorded process identity is not owned by this service.')
+                item['_boot'] = record['boot']
+        self._boot = record['boot']
         return record
 
     def read(self, allow_empty=False):
+        self._live_boot = None
         try:
             pid = positive_pid(secure_read(self.pidfile, 64).decode().strip())
         except FileNotFoundError:
             record = self.load_journal()
-            if record is not None and record['boot'] != boot():
-                # Processes cannot survive a kernel boot. With no current PID
-                # file, the old receipt cannot authorize a signal and can be
-                # retired so the configured service starts normally.
+            if record is None:
+                return None
+            live_parent = record.get('parent') if record.get('parent') and self.same(record['parent']) else None
+            live_children = [child for child in record['children'] if self.same(child)]
+            if live_parent is None and not live_children:
+                # No recorded process survives, so the receipt cannot authorize
+                # a signal and is retired so the configured service can start.
                 if self.load_journal() == record:
                     self.journal.unlink(missing_ok=True)
                 return None
-            if record and record.get('parent'):
-                # The durable birth/executable/title receipt remains sufficient
-                # ownership if daemon(8) lost its PID file. Keep a live exact
-                # supervisor recoverable; retire only an exited one.
-                if not self.same(record['parent']):
-                    record['parent'] = None
+            # The durable birth/executable/title receipt remains sufficient
+            # ownership if daemon(8) lost its PID file. Keep a live exact
+            # supervisor recoverable; retire only an exited one.
+            record['parent'] = live_parent
             return record
         identity = process(pid)
+        if identity is not None:
+            identity['_boot'] = self.live_boot()
         record = self.load_journal()
         if record is not None:
-            if record['boot'] != boot():
-                raise RuntimeError('The process record belongs to a different kernel boot; settings were preserved.')
             parent = record.get('parent')
             recorded_pid = record.get('supervisor_pid', parent['pid'] if parent else None)
             if recorded_pid != pid:
                 raise RuntimeError('The PID file does not match the service identity record.')
-            if identity and (parent is None or identity['birth'] != parent['birth'] or not self.parent_matches(identity)):
+            if identity and (parent is None or not self.same_birth(parent, identity) or not self.parent_matches(identity)):
                 raise RuntimeError('The service PID was reused or belongs to another process.')
             if identity:
                 # Snapshot current children for daemon -r; retained historical
@@ -168,20 +209,19 @@ class Control:
                 record['parent'] = None
             return record
         if not identity:
-            return {'schema': 1, 'parent': None, 'supervisor_pid': pid, 'children': [], 'argv': self.expected, 'boot': boot()}
+            return {'schema': 1, 'parent': None, 'supervisor_pid': pid, 'children': [], 'argv': self.expected, 'boot': self.live_boot()}
         if not self.parent_matches(identity):
             raise RuntimeError('The PID does not identify this daemon supervisor.')
         application = self.application_children(identity, self.expected)
         if not application and not allow_empty:
             raise RuntimeError('Cannot establish ownership without the expected application child.')
-        return {'schema': 1, 'parent': identity, 'supervisor_pid': pid, 'children': application, 'argv': self.expected, 'boot': boot()}
+        return {'schema': 1, 'parent': identity, 'supervisor_pid': pid, 'children': application, 'argv': self.expected, 'boot': self.live_boot()}
 
-    @staticmethod
-    def merge_children(*groups):
+    def merge_children(self, *groups):
         result = {}
         for group in groups:
             for child in group:
-                result[(child['pid'], child['birth'])] = child
+                result[self.birth_key(child)] = child
         return list(result.values())
 
     def application_children(self, parent, expected):
@@ -191,12 +231,15 @@ class Control:
             if identity and identity['ppid'] == parent['pid']:
                 if identity['uid'] != os.geteuid() or identity['executable'] != self.binary or identity['argv'] != expected:
                     raise RuntimeError('Unexpected supervisor child; refusing to stop or import settings.')
+                identity['_boot'] = self.live_boot()
                 owned.append(identity)
         return owned
 
     def same(self, identity):
         current = process(identity['pid'])
-        if not current or any(current[key] != identity[key] for key in ('pid', 'birth', 'uid', 'executable')):
+        if not current or any(current[key] != identity[key] for key in ('pid', 'uid', 'executable')):
+            return False
+        if not self.same_birth(identity, current):
             return False
         if identity['executable'] == '/usr/sbin/daemon':
             return self.parent_matches(current)

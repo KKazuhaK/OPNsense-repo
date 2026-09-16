@@ -59,6 +59,9 @@ jobs:
           prepare: |
             set -eu
             sh src/os-mihomo/packaging/prepare-builder.sh
+            # The runner-owned checkout is mounted into this VM, so git refuses it
+            # until the shared safe.directory entry exists.
+            git config --global --add safe.directory '*'
             # The OPNsense base package provides this compatibility link on routers.
             test -x /usr/local/bin/python3 || ln -s "python${TARGET_PYTHON}" /usr/local/bin/python3
             test -f /usr/local/etc/php.ini || cp /usr/local/etc/php.ini-production /usr/local/etc/php.ini

@@ -108,7 +108,7 @@ def bind_packages(source, packages, source_commit):
             digest = hashlib.sha256(payload).hexdigest()
             if digest != source_hashes[relative]:
                 raise ValueError(name + ' embeds routing code from a different source revision.')
-            if manifest.get('files', {}).get(install) != '1$' + digest:
+            if not verifier.file_checksum_matches(manifest.get('files', {}).get(install), payload):
                 raise ValueError(name + ' manifest does not bind the shared routing payload.')
             embedded[relative] = {'install': install, 'sha256': digest}
             (route_hashes if relative.endswith('/route_control.py') else tun_hashes).add(digest)

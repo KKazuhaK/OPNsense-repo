@@ -304,13 +304,24 @@ class CatalogMembershipTests(ReleaseFixture):
                                 for version in versions]
             return '\n'.join(lines).encode()
 
+        # The older archive stays downloadable, covered by the signed report instead of a catalog.
+        report['superseded'] = verify.superseded_archives(self.site)
+        self.assertEqual(['os-demo-1.2.9.pkg'], [Path(entry['path']).name for entry in report['superseded']])
         # Offered both, pkg picks by version text and 1.2.9 would win.
         with self.assertRaisesRegex(ValueError, 'offers os-demo more than once'):
             self.checked_site(report, catalog('1.2.10', '1.2.9'))
         with self.assertRaisesRegex(ValueError, 'offers os-demo 1.2.9 although os-demo-1.2.10.pkg is published'):
             self.checked_site(report, catalog('1.2.9'))
-        # The older archive stays downloadable without being offered.
         self.assertEqual(report, self.checked_site(report, catalog('1.2.10')))
+        unrecorded = dict(report, superseded=[])
+        with self.assertRaisesRegex(ValueError, 'neither offered by a signed catalog nor recorded'):
+            self.checked_site(unrecorded, catalog('1.2.10'))
+        (repository / 'All' / 'os-demo-1.2.9.pkg').write_bytes(b'replaced')
+        with self.assertRaisesRegex(ValueError, 'neither offered by a signed catalog nor recorded'):
+            self.checked_site(report, catalog('1.2.10'))
+        (repository / 'All' / 'os-demo-1.2.9.pkg').unlink()
+        with self.assertRaisesRegex(ValueError, 'superseded archive recorded in the signed report is missing'):
+            self.checked_site(report, catalog('1.2.10'))
 
     def test_catalog_input_takes_the_numerically_newest_archive_of_each_package(self):
         all_dir = self.root / 'All'

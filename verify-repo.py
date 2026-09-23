@@ -627,9 +627,22 @@ def prepare_release(site, source, commit, packages):
                 additional.append({'path': destination, 'sha256': digest, 'name': name, 'abi': abi})
     if seen != set(by_tuple):
         raise ValueError('Every enabled target requires its own native tested package.')
-    report = {'schema_version': 2, 'source_commit': commit, 'packages': released, 'additional_packages': additional}
+    report = {'schema_version': 2, 'source_commit': commit, 'packages': released, 'additional_packages': additional,
+              'superseded': superseded_archives(site)}
     (site / 'release.json').write_text(json.dumps(report, sort_keys=True) + '\n')
     return report
+
+
+def superseded_archives(site):
+    """Digests of the archives no catalog offers, so the signed report still covers them."""
+    superseded = []
+    for all_dir in sorted({path.parent for path in (site / 'repo').rglob('*.pkg') if path.parent.name == 'All'}):
+        offered = set(newest_archives(all_dir))
+        for path in sorted(all_dir.glob('*.pkg')):
+            if path not in offered:
+                superseded.append({'path': path.relative_to(site).as_posix(),
+                                   'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    return superseded
 
 FINGERPRINT = '92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b'
 
@@ -780,6 +793,21 @@ def verify(site, source=None):
             raise ValueError('Additional release package differs from the signed report.')
         if source:
             verify_source_package(extra, source, plugin=entry.get('name', 'os-sing-box'))
+    # Catalogs offer only the newest version; every other published archive must
+    # carry the digest the signed report recorded for it.
+    superseded = {}
+    for entry in report.get('superseded', []):
+        superseded[release_path(site, entry.get('path')).resolve()] = entry.get('sha256')
+    archives = sorted(path for path in (site / 'repo').rglob('*.pkg') if path.parent.name == 'All')
+    for path in archives:
+        if path.resolve() in listed:
+            continue
+        if superseded.get(path.resolve()) != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise ValueError('Archive is neither offered by a signed catalog nor recorded in the signed report: '
+                             + path.relative_to(site).as_posix())
+        count += 1
+    if any(not path.is_file() for path in superseded):
+        raise ValueError('A superseded archive recorded in the signed report is missing.')
     print('Catalog signatures, ' + str(count) + ' package digests and FreeBSD release report verified.')
     return report
 

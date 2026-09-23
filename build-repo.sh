@@ -16,10 +16,11 @@ mkdir -p "$REPO_ROOT"
 if [ -d "$LEGACY_REPO" ]; then
     (cd "$LEGACY_REPO" && tar -cf - .) | (cd "$REPO_ROOT" && tar -xf -)
 fi
-site_dir="$(dirname "$REPO_ROOT")"
-python3 "$SCRIPT_DIR/verify-repo.py" "$site_dir" --prepare --source "$SCRIPT_DIR" --source-commit "$SOURCE_COMMIT" "$@"
 # Withdraw the unsafe 1.1.0 upgrade candidate while retaining 1.0.2 for rollback.
 find "$REPO_ROOT" -type f -name 'os-mihomo-1.1.0.pkg' -delete
+site_dir="$(dirname "$REPO_ROOT")"
+# The signed report also records every superseded archive the catalogs no longer offer.
+python3 "$SCRIPT_DIR/verify-repo.py" "$site_dir" --prepare --source "$SCRIPT_DIR" --source-commit "$SOURCE_COMMIT" "$@"
 # Each catalog belongs to one ABI and, when dependencies differ, one series.
 find "$REPO_ROOT" -type d -name All | while IFS= read -r all_dir; do
     catalog_input="$(mktemp -d "${TMPDIR:-/tmp}/kazuha-catalog.XXXXXX")"

@@ -15,7 +15,7 @@ Copy the clean source revision to the recipe's native build host, excluding loca
 python3.13 -B -m unittest discover -s src/os-mihomo/tests -v
 python3.13 -B -m unittest discover -s src/os-sing-box/tests -v
 sh src/os-mihomo/tests/jail/run.sh \
-  src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.2.10.pkg legacy-1.0.2.pkg
+  src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.3.0.pkg legacy-1.0.2.pkg
 ```
 
 The harness requires root, VIMAGE, TUN and enough disk for its disposable filesystem. It creates an isolated VNET with synthetic upstreams and its own FIBs. It does not connect the jail to production interfaces. Its report identifies the exact package SHA-256 and executed checks. Test adapters replace OPNsense configd/filter/template/GUI infrastructure; actual package hooks, core, daemon, TUN, routes and Unbound are exercised. Remaining production checks are listed below.
@@ -27,7 +27,7 @@ Preserve a local legacy repo tree for compatibility downloads. Use the exact cle
 ```sh
 SOURCE_COMMIT=<tested-40-character-commit> \
   LEGACY_REPO=/path/to/legacy/repo \
-  sh build-repo.sh src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.2.10.pkg \
+  sh build-repo.sh src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.3.0.pkg \
     src/os-sing-box/dist/os-sing-box-1.1.5.pkg \
     src/os-kazuha-repo/dist/os-kazuha-repo-1.0.1.pkg
 python3 verify-repo.py .site --source .
@@ -39,7 +39,7 @@ Each Mihomo package reads its adjacent `test-report.json`; `TEST_REPORT` remains
 
 Every plugin except Mihomo -- which keeps its own committed recipe in `src/os-mihomo/packaging/target.py` -- is published through a committed staging record in `packaging/plugins.json`. The record says which committed directory is staged where, which vendored artifact may be unpacked and under which pinned SHA-256, which files the build generates, the dependencies the manifest must declare, and the version this source publishes. `verify-repo.py` rebuilds the package from those records and compares inventory, per-file SHA-256, the bytes in the archive and all four lifecycle hooks. A plugin with no record, or a record marked `unsupported`, is refused; so is a vendored artifact whose committed digest no longer matches. Bumping a version means editing the record, the product version file and `build.sh` together. That product version file must be the JSON object OPNsense registers: `register.php` decodes every file under `/usr/local/opnsense/version` and skips any that does not decode or carries no `product_id`, which installs the package and then leaves it out of the configuration's plugin list for good -- never reinstalled by a firmware sync, never offered in the web interface. The verifier accepts no other format.
 
-A version that is already published may never be republished with different content. `python3 verify-repo.py .site --audit --source .` lists every recorded plugin as unpublished, unchanged, rejected, or changed without a version bump, and `build-repo.sh` refuses the last of those.
+A version that is already published may never be republished with different content. Earlier versions stay in each catalog, and among versions of one package pkg 2.3 installs the one whose version string sorts last as text, so a new version must also sort last as text (1.3.0 after 1.2.9, never 1.2.10); the verifier refuses a catalog where it would not. `python3 verify-repo.py .site --audit --source .` lists every recorded plugin as unpublished, unchanged, rejected, or changed without a version bump, and `build-repo.sh` refuses the last of those.
 
 What a package may contain is narrower than what a build can produce. A package is refused when its archive carries anything but plain files -- a symbolic or hard link has no per-file digest to compare -- when a member carries a setuid, setgid or sticky bit, when the manifest repeats a key (libpkg parses manifests with UCL, which need not resolve a repeated key the way this verifier does), when the manifest carries `lua_scripts`, `directories`, `config`, `users` or `groups`, which are machinery no staging record describes, or when `+COMPACT_MANIFEST` disagrees with `+MANIFEST`, since `pkg repo` copies the compact manifest into the signed catalog clients resolve from. Lifecycle hooks must be committed regular files under `src/<plugin>/packaging/freebsd/`; a symlinked hook is refused because its bytes are not in the repository. Staged file names are held to the same characters as install paths. A build may name its output file anything -- several `build.sh` scripts rename it -- because the release is published under the identity the manifest carries, not under the file name it arrives with.
 

@@ -289,6 +289,31 @@ class CatalogMembershipTests(ReleaseFixture):
         with self.assertRaisesRegex(ValueError, 'enabled target has no native release report'):
             self.checked_site(report, b'', source=True)
 
+    def test_catalog_where_pkg_would_not_select_the_newest_version_is_rejected(self):
+        report, repository = self.site_report()
+        entry = report['packages'][0]
+        tested = json.dumps({'path': 'All/' + Path(entry['path']).name,
+                             'abi': entry['abi'], 'sum': entry['sha256']})
+
+        def catalog(*versions):
+            lines = [tested]
+            for version in versions:
+                path = repository / 'All' / ('os-demo-' + version + '.pkg')
+                path.write_bytes(version.encode())
+                lines.append(json.dumps({'name': 'os-demo', 'version': version, 'path': 'All/' + path.name,
+                                         'abi': entry['abi'], 'sum': hashlib.sha256(version.encode()).hexdigest()}))
+            return '\n'.join(lines).encode()
+
+        # pkg picks the version that sorts last as text: 1.2.9 over 1.2.10.
+        with self.assertRaisesRegex(ValueError, 'pkg would install os-demo 1.2.9 instead of the newer 1.2.10'):
+            self.checked_site(report, catalog('1.2.9', '1.2.10'))
+        self.assertEqual(report, self.checked_site(report, catalog('1.2.9', '1.2.10', '1.3.0')))
+        self.assertEqual(report, self.checked_site(report, catalog('1.0.2', '1.1.1_2', '1.1.1')))
+
+    def test_pkg_version_order_uses_numeric_parts_revisions_and_epochs(self):
+        ordered = ['1.0.2', '1.2.9', '1.2.10', '1.3.0', '1.3.0_1', '1.3.1', '0.1,1']
+        self.assertEqual(ordered, sorted(reversed(ordered), key=verify.pkg_version_key))
+
     def test_catalog_package_digest_mismatch_is_rejected(self):
         report, repository = self.site_report()
         entry = report['packages'][0]

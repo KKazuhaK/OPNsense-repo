@@ -289,26 +289,60 @@ class CatalogMembershipTests(ReleaseFixture):
         with self.assertRaisesRegex(ValueError, 'enabled target has no native release report'):
             self.checked_site(report, b'', source=True)
 
-    def test_catalog_where_pkg_would_not_select_the_newest_version_is_rejected(self):
+    def test_catalog_offers_only_the_newest_version_of_each_package(self):
         report, repository = self.site_report()
         entry = report['packages'][0]
         tested = json.dumps({'path': 'All/' + Path(entry['path']).name,
                              'abi': entry['abi'], 'sum': entry['sha256']})
+        for version in ('1.2.9', '1.2.10'):
+            (repository / 'All' / ('os-demo-' + version + '.pkg')).write_bytes(version.encode())
 
         def catalog(*versions):
-            lines = [tested]
-            for version in versions:
-                path = repository / 'All' / ('os-demo-' + version + '.pkg')
-                path.write_bytes(version.encode())
-                lines.append(json.dumps({'name': 'os-demo', 'version': version, 'path': 'All/' + path.name,
-                                         'abi': entry['abi'], 'sum': hashlib.sha256(version.encode()).hexdigest()}))
+            lines = [tested] + [json.dumps({'name': 'os-demo', 'version': version,
+                                            'path': 'All/os-demo-' + version + '.pkg', 'abi': entry['abi'],
+                                            'sum': hashlib.sha256(version.encode()).hexdigest()})
+                                for version in versions]
             return '\n'.join(lines).encode()
 
-        # pkg picks the version that sorts last as text: 1.2.9 over 1.2.10.
-        with self.assertRaisesRegex(ValueError, 'pkg would install os-demo 1.2.9 instead of the newer 1.2.10'):
-            self.checked_site(report, catalog('1.2.9', '1.2.10'))
-        self.assertEqual(report, self.checked_site(report, catalog('1.2.9', '1.2.10', '1.3.0')))
-        self.assertEqual(report, self.checked_site(report, catalog('1.0.2', '1.1.1_2', '1.1.1')))
+        # The older archive stays downloadable, covered by the signed report instead of a catalog.
+        report['superseded'] = verify.superseded_archives(self.site)
+        self.assertEqual(['os-demo-1.2.9.pkg'], [Path(entry['path']).name for entry in report['superseded']])
+        # Offered both, pkg picks by version text and 1.2.9 would win.
+        with self.assertRaisesRegex(ValueError, 'offers os-demo more than once'):
+            self.checked_site(report, catalog('1.2.10', '1.2.9'))
+        with self.assertRaisesRegex(ValueError, 'offers os-demo 1.2.9 although os-demo-1.2.10.pkg is published'):
+            self.checked_site(report, catalog('1.2.9'))
+        self.assertEqual(report, self.checked_site(report, catalog('1.2.10')))
+        unrecorded = dict(report, superseded=[])
+        with self.assertRaisesRegex(ValueError, 'neither offered by a signed catalog nor recorded'):
+            self.checked_site(unrecorded, catalog('1.2.10'))
+        (repository / 'All' / 'os-demo-1.2.9.pkg').write_bytes(b'replaced')
+        with self.assertRaisesRegex(ValueError, 'neither offered by a signed catalog nor recorded'):
+            self.checked_site(report, catalog('1.2.10'))
+        (repository / 'All' / 'os-demo-1.2.9.pkg').unlink()
+        with self.assertRaisesRegex(ValueError, 'superseded archive recorded in the signed report is missing'):
+            self.checked_site(report, catalog('1.2.10'))
+
+    def test_catalog_input_takes_the_numerically_newest_archive_of_each_package(self):
+        all_dir = self.root / 'All'
+        all_dir.mkdir()
+
+        def archive(name, version):
+            payload = json.dumps({'name': name, 'version': version}).encode()
+            with tarfile.open(all_dir / (name + '-' + version + '.pkg'), 'w:gz') as stream:
+                item = tarfile.TarInfo('+MANIFEST')
+                item.size = len(payload)
+                stream.addfile(item, io.BytesIO(payload))
+
+        for version in ('1.0.2', '1.2.1', '1.2.9', '1.2.10'):
+            archive('os-mihomo', version)
+        for version in ('1.1.1', '1.1.1_2', '1.0.2'):
+            archive('os-ttyd', version)
+        self.assertEqual(['os-mihomo-1.2.10.pkg', 'os-ttyd-1.1.1_2.pkg'],
+                         [path.name for path in verify.newest_archives(all_dir)])
+        archive('os-ttyd', '1.1.1_02')
+        with self.assertRaisesRegex(ValueError, 'Two archives carry os-ttyd'):
+            verify.newest_archives(all_dir)
 
     def test_pkg_version_order_uses_numeric_parts_revisions_and_epochs(self):
         ordered = ['1.0.2', '1.2.9', '1.2.10', '1.3.0', '1.3.0_1', '1.3.1', '0.1,1']

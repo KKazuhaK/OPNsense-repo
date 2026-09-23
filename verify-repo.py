@@ -627,9 +627,22 @@ def prepare_release(site, source, commit, packages):
                 additional.append({'path': destination, 'sha256': digest, 'name': name, 'abi': abi})
     if seen != set(by_tuple):
         raise ValueError('Every enabled target requires its own native tested package.')
-    report = {'schema_version': 2, 'source_commit': commit, 'packages': released, 'additional_packages': additional}
+    report = {'schema_version': 2, 'source_commit': commit, 'packages': released, 'additional_packages': additional,
+              'superseded': superseded_archives(site)}
     (site / 'release.json').write_text(json.dumps(report, sort_keys=True) + '\n')
     return report
+
+
+def superseded_archives(site):
+    """Digests of the archives no catalog offers, so the signed report still covers them."""
+    superseded = []
+    for all_dir in sorted({path.parent for path in (site / 'repo').rglob('*.pkg') if path.parent.name == 'All'}):
+        offered = set(newest_archives(all_dir))
+        for path in sorted(all_dir.glob('*.pkg')):
+            if path not in offered:
+                superseded.append({'path': path.relative_to(site).as_posix(),
+                                   'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    return superseded
 
 FINGERPRINT = '92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b'
 
@@ -660,22 +673,55 @@ def pkg_version_key(version):
     return int(match.group(3) or 0), parts, int(match.group(2) or 0)
 
 
-def check_selected_versions(manifests, repository):
-    """Refuse a catalog in which pkg would not install the newest version of a package.
+ARCHIVE_NAME = re.compile(r'(os-[a-z0-9][a-z0-9-]*?)-(' + VERSION_PATTERN + r')\.pkg')
 
-    Among several versions of one name in one repository, pkg 2.3 selects the
-    version string that sorts last as text, so 1.2.9 would win over 1.2.10 for
-    fresh installs and upgrades alike.
+
+def newest_archives(all_dir):
+    """Choose what a catalog offers: the newest archive of every package in All/.
+
+    Every published archive stays downloadable from All/, but each catalog lists
+    one version per package. Offered several versions of one name, pkg 2.3 picks
+    by version text, so 1.2.9 beat 1.2.10; offered one, pkg compares versions the
+    usual way (1.2.10 > 1.2.9) and upgrades to it.
     """
-    versions = {}
+    newest = {}
+    for path in sorted(Path(all_dir).glob('*.pkg')):
+        # Archives are published under the identity they carry (name-version.pkg).
+        # Early archives use pkg's UCL manifest, so the name is what can be read
+        # for every one of them; a JSON manifest must agree with it.
+        match = ARCHIVE_NAME.fullmatch(path.name)
+        if not match:
+            raise ValueError('Archive is not published as name-version.pkg: ' + path.name)
+        name, version = match.groups()
+        try:
+            manifest = manifest_of(path)
+        except ValueError:
+            manifest = None
+        if manifest is not None and (manifest.get('name'), manifest.get('version')) != (name, version):
+            raise ValueError('Archive name differs from the package it carries: ' + path.name)
+        if name in newest and pkg_version_key(version) == pkg_version_key(newest[name][1]):
+            raise ValueError('Two archives carry %s %s.' % (name, version))
+        if name not in newest or pkg_version_key(version) > pkg_version_key(newest[name][1]):
+            newest[name] = (path, version)
+    return sorted(path for path, version in newest.values())
+
+
+def check_catalog_versions(manifests, repo, relative):
+    """Refuse a catalog that offers several versions of a package, or not its newest."""
+    offered = {}
     for item in manifests:
-        if isinstance(item.get('name'), str) and isinstance(item.get('version'), str):
-            versions.setdefault(item['name'], []).append(item['version'])
-    for name, found in sorted(versions.items()):
-        selected, newest = max(found), max(found, key=pkg_version_key)
-        if selected != newest:
-            raise ValueError('pkg would install %s %s instead of the newer %s from %s; '
-                             'release a version that also sorts last as text.' % (name, selected, newest, repository))
+        name, version = item.get('name'), item.get('version')
+        if isinstance(name, str) and isinstance(version, str):
+            if name in offered:
+                raise ValueError('%s offers %s more than once; pkg would choose between the versions by text.'
+                                 % (relative, name))
+            offered[name] = version
+    for path in sorted((repo / 'All').glob('*.pkg')):
+        match = ARCHIVE_NAME.fullmatch(path.name)
+        if match and match.group(1) in offered and \
+                pkg_version_key(match.group(2)) > pkg_version_key(offered[match.group(1)]):
+            raise ValueError('%s offers %s %s although %s is published.'
+                             % (relative, match.group(1), offered[match.group(1)], path.name))
 
 
 def verify(site, source=None):
@@ -730,7 +776,7 @@ def verify(site, source=None):
         verify_catalog(repo / 'data.pkg', 'data', public_key)
         payload = verify_catalog(repo / 'packagesite.pkg', 'packagesite.yaml', public_key)
         manifests = [json.loads(line) for line in payload.splitlines() if line.strip()]
-        check_selected_versions(manifests, relative)
+        check_catalog_versions(manifests, repo, relative)
         for item in manifests:
             path = (repo / item['path']).resolve()
             if not path.is_relative_to((repo / 'All').resolve()) or path.suffix != '.pkg' or item['abi'] not in {abi, 'FreeBSD:*:amd64'}:
@@ -747,6 +793,21 @@ def verify(site, source=None):
             raise ValueError('Additional release package differs from the signed report.')
         if source:
             verify_source_package(extra, source, plugin=entry.get('name', 'os-sing-box'))
+    # Catalogs offer only the newest version; every other published archive must
+    # carry the digest the signed report recorded for it.
+    superseded = {}
+    for entry in report.get('superseded', []):
+        superseded[release_path(site, entry.get('path')).resolve()] = entry.get('sha256')
+    archives = sorted(path for path in (site / 'repo').rglob('*.pkg') if path.parent.name == 'All')
+    for path in archives:
+        if path.resolve() in listed:
+            continue
+        if superseded.get(path.resolve()) != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise ValueError('Archive is neither offered by a signed catalog nor recorded in the signed report: '
+                             + path.relative_to(site).as_posix())
+        count += 1
+    if any(not path.is_file() for path in superseded):
+        raise ValueError('A superseded archive recorded in the signed report is missing.')
     print('Catalog signatures, ' + str(count) + ' package digests and FreeBSD release report verified.')
     return report
 
@@ -856,9 +917,14 @@ if __name__ == '__main__':
     parser.add_argument('--prepare', action='store_true')
     parser.add_argument('--audit', action='store_true', help='report plugins whose source changed without a version bump')
     parser.add_argument('--source-commit')
+    parser.add_argument('--catalog-into', type=Path,
+                        help='copy the newest archive of each package in SITE (an All/ directory) into this directory')
     parser.add_argument('packages', nargs='*', type=Path)
     args = parser.parse_args()
-    if args.prepare:
+    if args.catalog_into:
+        for archive in newest_archives(args.site):
+            shutil.copyfile(archive, args.catalog_into / archive.name)
+    elif args.prepare:
         prepare_release(args.site.resolve(), args.source.resolve(), args.source_commit or '', args.packages)
     elif args.audit:
         audit_versions(args.site.resolve(), args.source.resolve())

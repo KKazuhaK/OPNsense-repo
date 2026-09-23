@@ -511,6 +511,84 @@ class RoutingTests(unittest.TestCase):
             ip = ipaddress.ip_address('10.2.0.8')
             self.assertEqual(any(ip.version == net.version and ip in net for net in selected), mode == 'blacklist')
 
+    def test_capture_interfaces_narrow_candidates_across_multi_wan_and_multi_lan(self):
+        self.context = {'interfaces': [
+            {'name': 'wan', 'device': 'vtnet0', 'networks': ['192.0.2.0/24'], 'wan': True},
+            {'name': 'opt1', 'device': 'pppoe0', 'networks': ['198.51.100.7/32'], 'wan': True},
+            {'name': 'lan', 'device': 'bridge0', 'networks': ['10.0.0.0/24'], 'wan': False},
+            {'name': 'opt2', 'device': 'igc2', 'networks': [], 'wan': False},
+            {'name': 'opt5', 'device': 'vlan0.20', 'networks': ['10.20.0.0/24'], 'wan': False},
+            {'name': 'opt6', 'device': 'igc4', 'networks': ['10.30.0.0/16'], 'wan': False},
+            {'name': 'openvpn', 'device': 'openvpn', 'networks': [], 'wan': False, 'virtual': True},
+            {'name': 'opt8', 'device': m.TUN, 'networks': ['198.18.0.0/30'], 'wan': False}],
+            'local_addresses': ['192.0.2.2', '198.51.100.7', '10.0.0.1', '10.20.0.1', '10.30.0.1']}
+
+        def captured(selection):
+            self.settings['capture_interfaces'] = selection
+            self.write_inputs()
+            settings, context, _ = self.routing.routing_inputs()
+            content, interfaces, _ = self.routing.policy(settings, context, self.kernel.tables[0], {4}, 1)
+            devices = {line.split()[3] for line in content.splitlines() if line.startswith('match in on ')}
+            local = [line for line in content.splitlines() if line.startswith('table <mihomo_local>')][0]
+            return devices, interfaces, local
+
+        # Automatic: every internal interface with an address, never an uplink or the TUN.
+        devices, count, local = captured([])
+        self.assertEqual({'bridge0', 'vlan0.20', 'igc4'}, devices)
+        self.assertEqual(3, count)
+        # A selection narrows the candidates without narrowing what bypasses:
+        # the router's addresses on every network still stay off the TUN.
+        devices, count, narrowed = captured(['opt5'])
+        self.assertEqual({'vlan0.20'}, devices)
+        self.assertEqual(local, narrowed)
+        self.assertEqual({'bridge0', 'igc4'}, captured(['lan', 'opt6', 'opt5'])[0] - {'vlan0.20'})
+        # An uplink of a multi-WAN router, the TUN, an interface group, a
+        # bridge member without an address or a missing interface captures nothing.
+        for selection in (['wan'], ['opt1'], ['opt8'], ['openvpn'], ['opt2'], ['opt99']):
+            self.assertEqual((set(), 0), captured(selection)[:2], selection)
+        self.assertEqual({'bridge0'}, captured(['opt1', 'lan', 'opt99'])[0])
+        # Anything that is not a list of identifiers is refused before capture.
+        for invalid in ('lan', ['lan;pfctl'], [7], ['x' * 40], ['opt%d' % n for n in range(m.DEVICE_LIMIT + 1)]):
+            self.settings['capture_interfaces'] = invalid
+            self.write_inputs()
+            with self.assertRaises(m.RoutingError, msg=invalid):
+                self.routing.routing_inputs()
+
+    def test_capture_waits_for_a_selected_interface_to_gain_its_address(self):
+        # A VPN server assigned as an interface starts after the core at boot
+        # and raises no WAN event, so the refresh itself has to notice it.
+        self.settings['capture_interfaces'] = ['opt5']
+        down = {'name': 'opt5', 'device': 'vlan0.20', 'networks': [], 'wan': False}
+        self.context['interfaces'].append(down)
+        self.write_inputs()
+        self.assertFalse(self.routing.execute('enable')['active'])
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+        mutations = lambda: [call for call in self.kernel.calls
+                             if route_mutation(call) or call[:3] == ['/sbin/pfctl', '-a', m.ANCHOR] and '-f' in call]
+        before = len(mutations())
+        for _ in range(2):
+            status = self.routing.execute('refresh')
+            self.assertFalse(status['active'])
+            self.assertEqual(0, status['interface_count'])
+        self.assertEqual(before, len(mutations()), 'waiting must not repeat the withdrawal on every tick')
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+        down['networks'] = ['10.20.0.0/24']
+        self.context['local_addresses'].append('10.20.0.1')
+        self.write_inputs()
+        status = self.routing.execute('refresh')
+        self.assertTrue(status['active'])
+        self.assertEqual(1, status['interface_count'])
+        self.assertNotIn('awaiting_sources', self.routing.load())
+        # Transparent routing switched off while waiting stops the wait.
+        down['networks'] = []
+        self.write_inputs()
+        self.routing.execute('enable')
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+        self.settings['transparent'] = False
+        self.write_inputs()
+        self.assertFalse(self.routing.execute('refresh')['active'])
+        self.assertNotIn('awaiting_sources', self.routing.load())
+
     def test_marker_requires_private_regular_file(self):
         self.routing.execute('enable')
         self.routing.marker.chmod(0o644)

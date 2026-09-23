@@ -45,7 +45,7 @@ class SettingsController extends ApiControllerBase
                            'allow_lan'];
     private const CHOICES = ['dns_mode' => 'fake-ip', 'geo_source' => 'metacubex', 'device_mode' => 'off',
                              'tun_stack' => 'gvisor'];
-    private const LISTS = ['dns_default', 'dns_nameserver', 'dns_proxy_nameserver', 'device_list'];
+    private const LISTS = ['dns_default', 'dns_nameserver', 'dns_proxy_nameserver', 'device_list', 'capture_interfaces'];
     /* Sent as numbers rather than strings, because the backend distinguishes
        them: a port that arrives as "7890" fails its type check. */
     private const NUMBERS = ['mixed_port' => 7890, 'socks_port' => 7891, 'tun_mtu' => 1420];

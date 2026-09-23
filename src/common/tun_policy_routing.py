@@ -303,7 +303,8 @@ class TunPolicyRouting:
                     or not isinstance(record['routes'], dict)
                     or not isinstance(record.get('resume', False), bool)
                     or not isinstance(record.get('pf_collision', False), bool)
-                    or not isinstance(record.get('route_recovery_ambiguous', False), bool)):
+                    or not isinstance(record.get('route_recovery_ambiguous', False), bool)
+                    or not isinstance(record.get('awaiting_sources', False), bool)):
                 raise ValueError
             if record.get('pf_collision') and (
                     record['active'] or not record['pending']):
@@ -831,12 +832,45 @@ class TunPolicyRouting:
         self.save(record)
         return self.status(record)
 
+    def sources_available(self, record):
+        """Whether capture withdrawn for lack of sources could select one now.
+
+        None means capture is no longer wanted at all: the core is down or the
+        routing inputs are off. This only evaluates the policy; it changes no
+        route, anchor or state.
+        """
+        if not self.core_alive():
+            return None
+        inputs = self.routing_inputs()
+        if inputs is None:
+            return None
+        settings, context, ipv6_enabled = inputs
+        native = {key: route for key, route in self.routes(0).items()
+                  if route['interface'] != self.TUN}
+        _, interface_count, _ = self.policy(
+            settings, context, native, {4, 6} if ipv6_enabled else {4},
+            record['fib'] or 1)
+        return interface_count > 0
+
     def enable(self, record, refresh=False):
         resume = refresh or record.get('resume') is True
         if refresh and not record['active']:
             if record.get('resume') is True:
                 return self.enable(record)
-            return self.disable(record) if record['pending'] else self.status(record)
+            if record['pending']:
+                return self.disable(record)
+            # An interface can gain its address after the core started, with
+            # no WAN event to restart it, so a capture withdrawn for lack of
+            # sources keeps looking instead of staying off until a restart.
+            if record.get('awaiting_sources') is True:
+                available = self.sources_available(record)
+                if available is not False:
+                    record.pop('awaiting_sources', None)
+                    self.save(record)
+                if available:
+                    return self.enable(record)
+            return self.status(record)
+        record.pop('awaiting_sources', None)
         if not self.core_alive():
             return self.disable(record)
         inputs = self.routing_inputs()
@@ -867,7 +901,10 @@ class TunPolicyRouting:
             }
             desired[route_key(default)] = default
         if not interface_count:
-            return self.disable(record)
+            result = self.disable(record)
+            record['awaiting_sources'] = True
+            self.save(record)
+            return result
         try:
             current_anchor = self.check_anchor()
             self.check_firewall_ownership(record)

@@ -63,6 +63,10 @@ function mihomo_routing_context(iterable $mapping, array $lines): array
             'name' => (string)$name, 'device' => $device,
             'networks' => $networks[$device] ?? [],
             'wan' => $name === 'wan' || !empty($entry['gateway']) || !empty($entry['gatewayv6']),
+            /* For the capture interface picker: the operator's own label, and
+               whether this is an interface group rather than an interface. */
+            'descr' => is_string($entry['descr'] ?? null) && $entry['descr'] !== '' ? $entry['descr'] : strtoupper((string)$name),
+            'virtual' => !empty($entry['virtual']),
         ];
     }
     return ['interfaces' => $interfaces,
@@ -116,28 +120,60 @@ function mihomo_syslog()
 }
 
 
-function mihomo_newwanip($verbose = false, $interfaces = null, $family = null)
+/**
+ * Decide whether an address event is a reason to restart the core.
+ *
+ * Only WAN-like interfaces carry the core's own traffic, so only their address
+ * changes matter. rc.newwanip reloads the filter before it runs this hook, and
+ * that reload rewrites the routing context with the same WAN flags that keep
+ * those interfaces out of capture, so both decisions come from one source:
+ * the name 'wan' or a gateway OPNsense resolves for the interface, which covers
+ * every WAN of a multi-WAN setup whether static, DHCP or PPPoE. LAN, bridge,
+ * VLAN, VPN-without-gateway and tun_mihomo events do not restart it; the last
+ * one mattered most, because enabling transparent routing raises it and a
+ * restart would tear down what had just been armed. Without a readable context,
+ * or for an interface it does not list, the event restarts as it always did.
+ *
+ * @return string|null the family to pass on, or null to leave the core alone
+ */
+function mihomo_newwanip_restart($interfaces, $family, $context, array $devices)
 {
-    /* Enabling transparent routing assigns and brings up tun_mihomo, and that
-       raises this event. Treating it as a WAN change restarts the core that had
-       just created the interface, which tears the whole thing down moments
-       after it started. Only a change on some other interface is a reason to
-       restart. */
+    $family = is_string($family) ? $family : '';
     $names = array_filter((array)$interfaces, 'is_string');
-    if (!empty($names)) {
-        $devices = [];
-        foreach (config_read_array('interfaces') as $key => $entry) {
-            $devices[$key] = $entry['if'] ?? '';
-        }
-        $elsewhere = false;
-        foreach ($names as $name) {
-            if (($devices[$name] ?? '') !== 'tun_mihomo') {
-                $elsewhere = true;
+    if (empty($names)) {
+        return $family;
+    }
+    $wan = [];
+    if (is_array($context) && is_array($context['interfaces'] ?? null)) {
+        foreach ($context['interfaces'] as $item) {
+            if (is_array($item) && is_string($item['name'] ?? null)) {
+                $wan[$item['name']] = ($item['wan'] ?? null) === true;
             }
         }
-        if (!$elsewhere) {
-            return;
+    }
+    foreach ($names as $name) {
+        if (($devices[$name] ?? '') === 'tun_mihomo') {
+            continue;
+        }
+        if (!array_key_exists($name, $wan) || $wan[$name]) {
+            return $family;
         }
     }
-    exec('/usr/local/sbin/configctl mihomo wan-restart');
+    return null;
+}
+
+function mihomo_newwanip($verbose = false, $interfaces = null, $family = null)
+{
+    $devices = [];
+    foreach (config_read_array('interfaces') as $key => $entry) {
+        $devices[$key] = $entry['if'] ?? '';
+    }
+    $raw = @file_get_contents('/var/db/os-mihomo/routing-context.json');
+    $context = is_string($raw) ? json_decode($raw, true) : null;
+    $restart = mihomo_newwanip_restart($interfaces, $family, $context, $devices);
+    if ($restart !== null) {
+        /* The family lets the manager ignore DHCPv6 renewals while its own
+           IPv6 support is off. */
+        exec('/usr/local/sbin/configctl mihomo wan-restart ' . escapeshellarg($restart));
+    }
 }

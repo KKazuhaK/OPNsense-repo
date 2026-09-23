@@ -36,7 +36,7 @@ BACKUP_KEYS = ('subscription_url', 'secret', 'device', 'service_enabled', 'trans
                'tun_stack', 'tun_mtu', 'dns_mode', 'dns_hijack', 'dns_fallback', 'router_dns',
                'dns_override', 'ipv6', 'geo_source', 'dns_default', 'dns_nameserver',
                'dns_proxy_nameserver',
-               'device_mode', 'device_list', 'controller')
+               'device_mode', 'device_list', 'capture_interfaces', 'controller')
 BACKUP_WARNING = 'The operation completed, but the Mihomo configuration backup could not be updated.'
 BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. The current local configuration is retained. '
                             'Stop the service and use Repair saved backup to validate and import the edited backup.')
@@ -246,6 +246,13 @@ def advertises_ipv6(content):
         root = ET.fromstring(content)
     except ET.ParseError:
         raise Error("Unable to inspect the router IPv6 configuration.") from None
+
+    def switched_on(node, tag):
+        # MVC BooleanField: absent or empty means off, unlike the legacy
+        # presence tags below where an empty element means on.
+        child = node.find(tag) if node is not None else None
+        return child is not None and (child.text or '').strip().lower() not in {'', '0', 'false', 'no'}
+
     for group in ('radvd', 'dhcpdv6'):
         for entry in root.findall('./' + group + '/*'):
             enabled = entry.find('enable')
@@ -253,9 +260,49 @@ def advertises_ipv6(content):
                 return True
             if group == 'radvd' and entry.findtext('mode', '').lower() not in {'', 'disabled'}:
                 return True
-    for service in ('Kea/dhcp6', 'Dhcprelay/dhcp6', 'RouterAdvertisements'):
+    for service in ('Dhcprelay/dhcp6', 'RouterAdvertisements'):
         for entry in root.findall('./OPNsense/' + service + '//enabled'):
             if (entry.text or '').strip() == '1':
+                return True
+    # Kea keeps an unrelated dhcp6/ha/enabled, so only the server switch counts.
+    if switched_on(root.find('./OPNsense/Kea/dhcp6/general'), 'enabled'):
+        return True
+    interfaces = root.find('./interfaces')
+    enabled_ifs = {node.tag for node in (interfaces if interfaces is not None else [])
+                   if node.find('enable') is not None}
+    # radvd_enabled() walks only real interfaces; groups are marked virtual.
+    real_ifs = {node.tag for node in (interfaces if interfaces is not None else [])
+                if not (node.findtext('virtual') or '').strip()}
+    # OPNsense 26.7 radvd, mirroring radvd_enabled() in plugins.inc.d/radvd.inc:
+    # an enabled manual entry advertises, a disabled one silences its interface,
+    # and every other enabled track6 interface advertises automatically.
+    explicit_off = set()
+    for entry in root.findall('./OPNsense/radvd/entries'):
+        name = entry.findtext('interface', '')
+        if switched_on(entry, 'enabled'):
+            if name in enabled_ifs:
+                return True
+        else:
+            explicit_off.add(name)
+    for node in (interfaces if interfaces is not None else []):
+        if (node.tag in enabled_ifs and node.tag in real_ifs and node.tag not in explicit_off
+                and node.findtext('ipaddrv6', '') == 'track6' and node.find('dhcpd6track6allowoverride') is None):
+            return True
+    # A DHCPv6 relay on an enabled interface hands clients IPv6 configuration
+    # from another server.
+    servers = {node.get('uuid'): node.findtext('server', '') for node in root.findall('./OPNsense/DHCRelay/destinations')}
+    for relay in root.findall('./OPNsense/DHCRelay/relays'):
+        if (switched_on(relay, 'enabled') and relay.findtext('interface', '') in enabled_ifs
+                and ':' in servers.get(relay.findtext('destination', ''), '')):
+            return True
+    # Dnsmasq renders a range as IPv6 unless it starts with an IPv4 address,
+    # and only an IPv6 range makes it answer DHCPv6 or send RAs: the global
+    # enable-ra switch alone advertises nothing.
+    dnsmasq = root.find('./dnsmasq')
+    if switched_on(dnsmasq, 'enable'):
+        for entry in dnsmasq.findall('./dhcp_ranges'):
+            start = entry.findtext('start_addr', '').strip()
+            if not start or ':' in start:
                 return True
     return False
 
@@ -291,6 +338,9 @@ GEO_UPDATE_HOURS = 24
 
 DEVICE_MODES = ('off', 'whitelist', 'blacklist')
 DEVICE_LIMIT = 64
+# OPNsense interface identifiers such as lan, wan and optN.
+INTERFACE_ID = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,31}')
+CAPTURE_LIMIT = 32
 
 
 def device_networks(entries):
@@ -306,6 +356,50 @@ def device_networks(entries):
     if len(networks) > DEVICE_LIMIT:
         raise Error('At most %d device entries may be listed.' % DEVICE_LIMIT)
     return networks
+
+
+def capture_interfaces(entries):
+    """Validate the interfaces transparent routing may capture from; empty means all."""
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise Error('The capture interfaces must be a list of interface identifiers.')
+    names = []
+    for entry in entries:
+        if not isinstance(entry, str) or not INTERFACE_ID.fullmatch(entry):
+            raise Error('Not an interface identifier: ' + str(entry))
+        if entry not in names:
+            names.append(entry)
+    if len(names) > CAPTURE_LIMIT:
+        raise Error('At most %d capture interfaces may be listed.' % CAPTURE_LIMIT)
+    return names
+
+
+def capture_candidates(path):
+    """Interfaces transparent routing can capture from, read from the routing context.
+
+    The firewall rewrites that context on every reload with the same WAN flags
+    the routing layer applies, so this list cannot offer an interface the
+    routing would refuse: WAN-like interfaces of a multi-WAN router, the TUN,
+    loopback and virtual interface groups never appear.
+    """
+    try:
+        context = json.loads(Path(path).read_bytes())
+    except (OSError, ValueError):
+        return []
+    found = []
+    for item in context.get('interfaces', []) if isinstance(context, dict) else []:
+        if (not isinstance(item, dict) or item.get('wan') is not False or item.get('virtual') is True
+                or not isinstance(item.get('name'), str) or not INTERFACE_ID.fullmatch(item['name'])
+                or item.get('device') in ('tun_mihomo', 'lo0', None)):
+            continue
+        networks = [value for value in item.get('networks', [])
+                    if isinstance(value, str) and not value.lower().startswith('fe80:')]
+        found.append({'name': item['name'], 'device': str(item['device']),
+                      'descr': str(item.get('descr') or item['name'].upper()), 'networks': networks})
+    order = lambda item: (item['name'] != 'lan', int(item['name'][3:]) if re.fullmatch(r'opt[0-9]+', item['name']) else 0,
+                          item['name'])
+    return sorted(found, key=order)
 
 
 # Where each DHCP backend OPNsense can run keeps its reservations. A device
@@ -455,18 +549,30 @@ def routing_settings(settings):
     return result
 
 
-def device_routing_policy(settings):
+def device_routing_policy(settings, candidates=None):
     """Describe source selection without exposing firewall implementation."""
     if not settings.get('transparent'):
         return []
+    selected = capture_interfaces(settings.get('capture_interfaces'))
+    scope = []
+    if selected:
+        known = {item['name']: item for item in candidates or []}
+        labels = [('%s (%s)' % (known[name]['descr'], name)) if name in known else name for name in selected]
+        scope.append('Capture only from: ' + ', '.join(labels) + '.')
+        if candidates is not None:
+            missing = [name for name in selected if name not in known]
+            if missing:
+                scope.append('Not captured because they are missing, disabled or WAN-like: ' + ', '.join(missing) + '.')
+            elif not any(':' not in net or settings.get('ipv6') for name in selected for net in known[name]['networks']):
+                scope.append('None of the selected interfaces has an address to capture from.')
     mode = settings.get('device_mode', 'off')
     networks = device_networks(settings.get('device_list'))
     if mode == 'off' or not networks:
-        return ['Internal devices may enter TUN.',
-                'Router traffic and WAN connections bypass TUN.']
+        return scope + ['Internal devices may enter TUN.',
+                        'Router traffic and WAN connections bypass TUN.']
     action = 'Enter TUN' if mode == 'whitelist' else 'Bypass TUN'
     other = 'Other devices bypass TUN.' if mode == 'whitelist' else 'Other internal devices may enter TUN.'
-    return [action + ': ' + str(net) for net in networks] + [other,
+    return scope + [action + ': ' + str(net) for net in networks] + [other,
             'Router traffic and WAN connections bypass TUN.']
 
 
@@ -2056,7 +2162,7 @@ class Manager:
                 for field in BACKUP_KEYS:
                     if field not in stored or stored[field] == '':
                         continue
-                    fallback = settings.get(field, [] if field in (*DNS_SERVER_FIELDS, 'device_list') else
+                    fallback = settings.get(field, [] if field in (*DNS_SERVER_FIELDS, 'device_list', 'capture_interfaces') else
                                             'off' if field == 'device_mode' else LOOPBACK_CONTROLLER)
                     decoded = json.loads(stored[field]) if not isinstance(fallback, str) else self._backup_text(stored[field])
                     if isinstance(fallback, bool) and type(decoded) is int and decoded in (0, 1):
@@ -2301,6 +2407,7 @@ class Manager:
         if settings.get('device_mode', 'off') not in DEVICE_MODES:
             raise Error('The device policy must be one of: ' + ', '.join(DEVICE_MODES) + '.')
         device_networks(settings.get('device_list'))
+        capture_interfaces(settings.get('capture_interfaces'))
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
             raise Error("A nonempty dashboard secret is required.")
         controller = settings.get("controller", "127.0.0.1:9090")
@@ -2829,9 +2936,11 @@ class Manager:
             self.system.restore_cron()
             return {'restored': True}
         if action == 'devices':
+            candidates = capture_candidates(self.state / 'routing-context.json')
             return {'devices': known_devices(self.system.run, self.root),
                     'rules': [],
-                    'routing': device_routing_policy(self.settings())}
+                    'interfaces': candidates,
+                    'routing': device_routing_policy(self.settings(), candidates)}
         if action == "queue-update":
             return self.queue_update()
         if action == "sub-update":
@@ -2853,10 +2962,12 @@ class Manager:
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
                         'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
-                        'device_mode', 'device_list', 'mixed_port', 'socks_port',
+                        'device_mode', 'device_list', 'capture_interfaces', 'mixed_port', 'socks_port',
                         'allow_lan', 'bind_address', 'tun_stack', 'tun_mtu', *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
+            if 'capture_interfaces' in value:
+                settings['capture_interfaces'] = capture_interfaces(value['capture_interfaces'])
             if 'dashboard_any' in value:
                 current = settings.get('controller') or LOOPBACK_CONTROLLER
                 port = current.rsplit(':', 1)[-1] if ':' in current else str(CONTROLLER_PORT)
@@ -2890,6 +3001,11 @@ class Manager:
                 self.write_settings(settings)
             if action == "wan-restart" and not self.system.running():
                 return {"running": False}
+            if action == "wan-restart" and argument == "inet6" and not settings.get("ipv6"):
+                # With Mihomo IPv6 off nothing here depends on the WAN's IPv6
+                # address, and every DHCPv6 renewal would otherwise reset all
+                # proxied connections.
+                return {"running": True}
             if action in {"restart", "wan-restart"} and self.system.running():
                 self.stop(settings)
             if self.system.running():

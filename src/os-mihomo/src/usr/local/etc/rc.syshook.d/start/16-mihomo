@@ -1,0 +1,20 @@
+#!/bin/sh
+
+# Start Mihomo once per boot.
+#
+# rc.d/mihomo is never enabled through /etc/rc.conf.d, so the 20-freebsd pass
+# that starts ordinary services skips it, and without this hook the proxy stays
+# down after every reboot. Enabling it there would not help either: shutdown
+# runs 'rc.freebsd stop', which would call 'mihomo.py stop' and record an
+# administrative stop, so the next boot would skip it again.
+#
+# 'boot' does nothing when the operator stopped the service, only republishes
+# status when the core is already running, and otherwise starts the core with
+# the saved routing policy after clearing whatever an unclean shutdown left.
+# The manager serialises it against a concurrent WAN event or GUI action.
+#
+# The configuration test can take several seconds and syshooks run one after
+# another, so the start is detached rather than holding up the rest of boot.
+
+/usr/sbin/daemon -f /usr/local/bin/python3 /usr/local/opnsense/scripts/mihomo/mihomo.py boot >/dev/null 2>&1 || true
+exit 0

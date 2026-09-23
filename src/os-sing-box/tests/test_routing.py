@@ -193,6 +193,25 @@ class RoutingTests(unittest.TestCase):
             path.write_text(json.dumps(value))
             path.chmod(0o600)
 
+    def test_withdrawn_capture_rearms_when_a_lan_address_appears(self):
+        # A LAN that comes up after the core leaves nothing to capture at
+        # first; the periodic refresh must arm capture once it has an address.
+        lan = self.context['interfaces'][1]
+        networks, lan['networks'] = lan['networks'], []
+        connected = {key: value for key, value in self.kernel.tables[0].items() if value['interface'] == 'vtnet1'}
+        for key in connected:
+            del self.kernel.tables[0][key]
+        self.write_inputs()
+        self.assertFalse(self.routing.execute('enable')['active'])
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+        self.assertFalse(self.routing.execute('refresh')['active'])
+        lan['networks'] = networks
+        self.kernel.tables[0].update(connected)
+        self.write_inputs()
+        status = self.routing.execute('refresh')
+        self.assertTrue(status['active'])
+        self.assertNotIn('awaiting_sources', self.routing.load())
+
     def test_enable_stop_and_reuse_preserve_main_routes_and_policy_states(self):
         original = copy.deepcopy(self.kernel.tables[0])
         result = self.routing.execute('enable')

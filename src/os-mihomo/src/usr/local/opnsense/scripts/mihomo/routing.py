@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 import yaml
@@ -23,6 +24,28 @@ STATE = '/var/db/os-mihomo'
 TUN = 'tun_mihomo'
 ANCHOR = 'mihomo'
 LABEL = 'mihomo-routing'
+# OPNsense interface identifiers such as lan, wan and optN.
+INTERFACE_ID = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,31}')
+
+
+def capture_scope(settings, context):
+    """Keep only the interfaces the operator chose to capture from.
+
+    An empty selection keeps today's behaviour: every interface that is not
+    WAN-like. A selection narrows the candidates before the shared policy sees
+    them, so WAN-like interfaces, the TUN and loopback stay excluded whatever
+    is listed, and a listed interface that is missing or disabled simply
+    contributes nothing. Router addresses and native routes, which keep traffic
+    to every local network off the TUN, are not part of what is narrowed.
+    """
+    selected = settings.get('capture_interfaces') or []
+    if (not isinstance(selected, list) or len(selected) > DEVICE_LIMIT
+            or not all(isinstance(name, str) and INTERFACE_ID.fullmatch(name) for name in selected)):
+        raise RoutingError('The capture interface selection is invalid.')
+    if not selected or not isinstance(context, dict) or not isinstance(context.get('interfaces'), list):
+        return context
+    return dict(context, interfaces=[item for item in context['interfaces']
+                                     if isinstance(item, dict) and item.get('name') in selected])
 
 
 def normalize_context(context):
@@ -75,7 +98,7 @@ class Routing(TunPolicyRouting):
             raise RoutingError('The routing DNS configuration is invalid.')
         if dns.get('enable') and dns.get('enhanced-mode') == 'fake-ip':
             raise RoutingError('Device routing requires real-address DNS responses.')
-        return settings, context, config.get('ipv6') is True
+        return settings, capture_scope(settings, context), config.get('ipv6') is True
 
 
 def main():

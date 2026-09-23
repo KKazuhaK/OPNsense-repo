@@ -66,49 +66,6 @@ class Routing(TunPolicyRouting):
     NATIVE_HELPER = '/usr/local/opnsense/scripts/mihomo/native_route.py'
     ROUTING_LOCK = '/var/run/mihomo-routing.lock'
 
-    def enable(self, record, refresh=False):
-        """Arm capture, and keep watching when there is nothing to capture yet.
-
-        The shared state machine withdraws capture when no selected interface
-        has an address, and a refresh of that inactive record returns without
-        looking again. A selected interface that gains its address later, such
-        as a VPN server assigned as an interface that starts after the core at
-        boot, raises no WAN event either, so capture would stay off until a
-        restart. Record the wait, re-evaluate on every refresh, and arm as soon
-        as a source exists.
-        """
-        if (refresh and not record['active'] and not record['pending']
-                and record.get('resume') is not True and record.get('awaiting_sources') is True):
-            if self.capturable(record) is False:
-                return self.status(record)
-            record.pop('awaiting_sources', None)
-            self.save(record)
-            return super().enable(record)
-        result = super().enable(record, refresh)
-        waiting = (not record['active'] and not record['pending']
-                   and self.capturable(record) is False)
-        if waiting != (record.get('awaiting_sources') is True):
-            if waiting:
-                record['awaiting_sources'] = True
-            else:
-                record.pop('awaiting_sources', None)
-            self.save(record)
-        return result
-
-    def capturable(self, record):
-        """None when capture is not wanted, else whether any source exists now."""
-        if not self.core_alive():
-            return None
-        inputs = self.routing_inputs()
-        if inputs is None:
-            return None
-        settings, context, ipv6_enabled = inputs
-        native = {key: route for key, route in self.routes(0).items()
-                  if route['interface'] != self.TUN}
-        families = {4, 6} if ipv6_enabled else {4}
-        _, interface_count, _ = self.policy(settings, context, native, families, record.get('fib') or 1)
-        return interface_count > 0
-
     def core_alive(self):
         try:
             return core_group(root=self.root,

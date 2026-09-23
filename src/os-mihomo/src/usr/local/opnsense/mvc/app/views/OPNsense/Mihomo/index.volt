@@ -183,7 +183,7 @@ $(function () {
         select.empty();
         captureCandidates.forEach(function (item) {
             known[item.name] = true;
-            const networks = (item.networks || []).filter(function (net) { return net.indexOf(':') === -1; });
+            const networks = (item.networks || []).filter(function (net) { return !/^fe80:/i.test(net); });
             select.append($('<option>').val(item.name)
                 .text(item.descr + ' (' + item.name + ', ' + item.device + ')')
                 .attr('data-subtext', networks.length ? networks.join(', ') : '{{ lang._('no address') }}'));

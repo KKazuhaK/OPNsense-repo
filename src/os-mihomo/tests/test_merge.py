@@ -444,6 +444,13 @@ class CaptureInterfaceTests(unittest.TestCase):
         settings['capture_interfaces'] = ['opt2']
         self.assertEqual('None of the selected interfaces has an address to capture from.',
                          m.device_routing_policy(settings, found)[1])
+        # An IPv6-only interface captures nothing while Mihomo IPv6 is off.
+        v6 = [{'name': 'opt6', 'device': 'igc6', 'descr': 'V6', 'networks': ['2001:db8:6::1/64']}]
+        settings['capture_interfaces'] = ['opt6']
+        self.assertEqual('None of the selected interfaces has an address to capture from.',
+                         m.device_routing_policy(settings, v6)[1])
+        self.assertEqual('Enter TUN: 192.168.3.0/24', m.device_routing_policy(dict(settings, ipv6=True), v6)[1])
+        settings['capture_interfaces'] = ['opt2']
         # Without the context the summary still states the selection.
         self.assertEqual('Capture only from: opt2.', m.device_routing_policy(settings)[0])
         self.assertEqual([], m.device_routing_policy(dict(settings, transparent=False), found))

@@ -554,6 +554,41 @@ class RoutingTests(unittest.TestCase):
             with self.assertRaises(m.RoutingError, msg=invalid):
                 self.routing.routing_inputs()
 
+    def test_capture_waits_for_a_selected_interface_to_gain_its_address(self):
+        # A VPN server assigned as an interface starts after the core at boot
+        # and raises no WAN event, so the refresh itself has to notice it.
+        self.settings['capture_interfaces'] = ['opt5']
+        down = {'name': 'opt5', 'device': 'vlan0.20', 'networks': [], 'wan': False}
+        self.context['interfaces'].append(down)
+        self.write_inputs()
+        self.assertFalse(self.routing.execute('enable')['active'])
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+        mutations = lambda: [call for call in self.kernel.calls
+                             if route_mutation(call) or call[:3] == ['/sbin/pfctl', '-a', m.ANCHOR] and '-f' in call]
+        before = len(mutations())
+        for _ in range(2):
+            status = self.routing.execute('refresh')
+            self.assertFalse(status['active'])
+            self.assertEqual(0, status['interface_count'])
+        self.assertEqual(before, len(mutations()), 'waiting must not repeat the withdrawal on every tick')
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+        down['networks'] = ['10.20.0.0/24']
+        self.context['local_addresses'].append('10.20.0.1')
+        self.write_inputs()
+        status = self.routing.execute('refresh')
+        self.assertTrue(status['active'])
+        self.assertEqual(1, status['interface_count'])
+        self.assertNotIn('awaiting_sources', self.routing.load())
+        # Transparent routing switched off while waiting stops the wait.
+        down['networks'] = []
+        self.write_inputs()
+        self.routing.execute('enable')
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+        self.settings['transparent'] = False
+        self.write_inputs()
+        self.assertFalse(self.routing.execute('refresh')['active'])
+        self.assertNotIn('awaiting_sources', self.routing.load())
+
     def test_marker_requires_private_regular_file(self):
         self.routing.execute('enable')
         self.routing.marker.chmod(0o644)

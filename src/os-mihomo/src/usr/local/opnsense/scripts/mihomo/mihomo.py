@@ -563,7 +563,7 @@ def device_routing_policy(settings, candidates=None):
             missing = [name for name in selected if name not in known]
             if missing:
                 scope.append('Not captured because they are missing, disabled or WAN-like: ' + ', '.join(missing) + '.')
-            elif not any(known[name]['networks'] for name in selected):
+            elif not any(':' not in net or settings.get('ipv6') for name in selected for net in known[name]['networks']):
                 scope.append('None of the selected interfaces has an address to capture from.')
     mode = settings.get('device_mode', 'off')
     networks = device_networks(settings.get('device_list'))

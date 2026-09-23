@@ -307,7 +307,7 @@ class CatalogMembershipTests(ReleaseFixture):
         # The older archive stays downloadable, covered by the signed report instead of a catalog.
         report['superseded'] = verify.superseded_archives(self.site)
         self.assertEqual(['os-demo-1.2.9.pkg'], [Path(entry['path']).name for entry in report['superseded']])
-        # Offered both, pkg picks by version text and 1.2.9 would win.
+        # Offered both, pkg does not reliably install the newest.
         with self.assertRaisesRegex(ValueError, 'offers os-demo more than once'):
             self.checked_site(report, catalog('1.2.10', '1.2.9'))
         with self.assertRaisesRegex(ValueError, 'offers os-demo 1.2.9 although os-demo-1.2.10.pkg is published'):

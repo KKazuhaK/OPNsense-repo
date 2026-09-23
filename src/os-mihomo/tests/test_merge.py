@@ -101,6 +101,53 @@ class MergeTests(unittest.TestCase):
         self.assertTrue(m.advertises_ipv6(b'<opnsense><dhcpdv6><lan><enable/></lan></dhcpdv6></opnsense>'))
         self.assertTrue(m.advertises_ipv6(b'<opnsense><OPNsense><Kea><dhcp6><general><enabled>1</enabled></general></dhcp6></Kea></OPNsense></opnsense>'))
 
+    def test_ipv6_guard_reads_opnsense_26_7_sources(self):
+        def config(interfaces='', opnsense='', dnsmasq=''):
+            return ('<opnsense><interfaces>%s</interfaces><OPNsense>%s</OPNsense>%s</opnsense>'
+                    % (interfaces, opnsense, dnsmasq)).encode()
+        v4_pool = ('<dnsmasq><enable>1</enable><dhcp><enable_ra>1</enable_ra></dhcp>'
+                   '<dhcp_ranges uuid="r"><interface>lan</interface><start_addr>192.168.2.1</start_addr>'
+                   '<end_addr>192.168.2.199</end_addr><constructor/><ra_mode/></dhcp_ranges></dnsmasq>')
+        wan = '<wan><enable>1</enable><ipaddr>dhcp</ipaddr><ipaddrv6>dhcp6</ipaddrv6></wan>'
+        # Shapes of the production routers: the global enable-ra switch with an
+        # IPv4-only pool sends nothing, and identity association only numbers
+        # the router's own LAN address.
+        self.assertFalse(m.advertises_ipv6(config(wan + '<lan><enable>1</enable><ipaddrv6/></lan>',
+                                                  '<radvd version="1.0.1"/>', v4_pool)))
+        self.assertFalse(m.advertises_ipv6(config(wan + '<lan><enable>1</enable><ipaddrv6>idassoc6</ipaddrv6>'
+                                                  '<track6-interface>wan</track6-interface></lan>', '', v4_pool)))
+        # Dnsmasq advertises only through an IPv6 range, and only while it runs.
+        v6_range = '<dhcp_ranges uuid="6"><start_addr>::</start_addr><constructor>lan</constructor><ra_mode>slaac</ra_mode></dhcp_ranges>'
+        self.assertTrue(m.advertises_ipv6(config(dnsmasq='<dnsmasq><enable>1</enable>' + v6_range + '</dnsmasq>')))
+        self.assertTrue(m.advertises_ipv6(config(dnsmasq='<dnsmasq><enable>1</enable><dhcp_ranges uuid="c">'
+                                                 '<start_addr/><constructor>lan</constructor></dhcp_ranges></dnsmasq>')))
+        self.assertFalse(m.advertises_ipv6(config(dnsmasq='<dnsmasq><enable>0</enable>' + v6_range + '</dnsmasq>')))
+        # radvd: an enabled entry on an enabled interface advertises.
+        lan = '<lan><enable>1</enable><ipaddr>192.168.0.1</ipaddr></lan>'
+        entry = '<radvd><entries uuid="e"><interface>lan</interface><enabled>%s</enabled></entries></radvd>'
+        self.assertTrue(m.advertises_ipv6(config(lan, entry % '1')))
+        self.assertFalse(m.advertises_ipv6(config('<lan><ipaddr>192.168.0.1</ipaddr></lan>', entry % '1')))
+        self.assertFalse(m.advertises_ipv6(config(lan, entry % '')))
+        # track6 advertises automatically unless it is handed off or explicitly silenced.
+        track = '<lan><enable>1</enable><ipaddrv6>track6</ipaddrv6><track6-interface>wan</track6-interface>%s</lan>'
+        self.assertTrue(m.advertises_ipv6(config(wan + track % '')))
+        self.assertFalse(m.advertises_ipv6(config(wan + track % '<dhcpd6track6allowoverride>1</dhcpd6track6allowoverride>')))
+        self.assertFalse(m.advertises_ipv6(config(wan + track % '', entry % '')))
+        self.assertFalse(m.advertises_ipv6(config(wan + '<lan><ipaddrv6>track6</ipaddrv6></lan>')))
+        # A relay counts only when it forwards to an IPv6 server.
+        relay = ('<DHCRelay><relays uuid="r"><enabled>%s</enabled><interface>lan</interface><destination>d</destination></relays>'
+                 '<destinations uuid="d"><name>up</name><server>%s</server></destinations></DHCRelay>')
+        self.assertTrue(m.advertises_ipv6(config(lan, relay % ('1', '2001:db8::53'))))
+        self.assertFalse(m.advertises_ipv6(config(lan, relay % ('1', '192.0.2.53'))))
+        self.assertFalse(m.advertises_ipv6(config(lan, relay % ('0', '2001:db8::53'))))
+        self.assertFalse(m.advertises_ipv6(config('<lan><ipaddr>192.168.0.1</ipaddr></lan>', relay % ('1', '2001:db8::53'))))
+        # Interface groups are virtual and never advertise on their own.
+        self.assertFalse(m.advertises_ipv6(config(wan + '<openvpn><enable>1</enable><virtual>1</virtual>'
+                                                  '<ipaddrv6>track6</ipaddrv6></openvpn>')))
+        # Kea's high-availability switch is not its DHCPv6 server.
+        self.assertFalse(m.advertises_ipv6(config(opnsense='<Kea><dhcp6><general><enabled>0</enabled></general>'
+                                                  '<ha><enabled>1</enabled></ha></dhcp6></Kea>')))
+
     def test_provider_fallback_is_not_silent_when_router_dns_enabled(self):
         self.settings['router_dns'] = True
         self.data['dns']['fallback'] = ['https://example.invalid/dns-query']
@@ -336,6 +383,70 @@ class ControllerTests(unittest.TestCase):
                 manager.check_settings(dict(self.settings, controller=bad))
         with self.assertRaises(m.Error):
             manager.check_settings(dict(self.settings, controller=m.ANY_CONTROLLER, secret=''))
+
+
+class CaptureInterfaceTests(unittest.TestCase):
+    """Which interfaces transparent routing may capture from, and how that reads."""
+
+    CONTEXT = {'interfaces': [
+        {'name': 'wan', 'device': 'igc1', 'networks': ['104.52.226.170/23'], 'wan': True, 'descr': 'WAN'},
+        {'name': 'opt7', 'device': 'pppoe0', 'networks': ['198.51.100.7/32'], 'wan': True, 'descr': 'WAN2'},
+        {'name': 'opt10', 'device': 'igc4', 'networks': ['10.30.0.1/16'], 'wan': False, 'descr': 'Lab'},
+        {'name': 'lan', 'device': 'bridge0', 'networks': ['192.168.0.1/22', 'fe80::1/64'], 'wan': False, 'descr': 'LAN'},
+        {'name': 'opt2', 'device': 'igc2', 'networks': [], 'wan': False, 'descr': 'LAN2'},
+        {'name': 'opt5', 'device': 'vlan0.20', 'networks': ['192.168.20.1/24'], 'wan': False},
+        {'name': 'openvpn', 'device': 'openvpn', 'networks': [], 'wan': False, 'virtual': True, 'descr': 'OpenVPN'},
+        {'name': 'opt8', 'device': 'tun_mihomo', 'networks': ['198.18.0.1/30'], 'wan': False},
+        {'name': 'lo0', 'device': 'lo0', 'networks': ['127.0.0.1/8'], 'wan': False},
+        {'name': 'bad name', 'device': 'igc9', 'networks': [], 'wan': False},
+        {'name': 'opt9', 'device': 'igc5', 'networks': [], 'wan': 'no'}],
+        'local_addresses': []}
+
+    def candidates(self, context):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'routing-context.json'
+            if context is not None:
+                path.write_text(context if isinstance(context, str) else json.dumps(context))
+            return m.capture_candidates(path)
+
+    def test_selection_is_validated_and_deduplicated(self):
+        self.assertEqual([], m.capture_interfaces(None))
+        self.assertEqual([], m.capture_interfaces([]))
+        self.assertEqual(['opt5', 'lan'], m.capture_interfaces(['opt5', 'lan', 'opt5']))
+        for invalid in ('lan', ['lan;pfctl'], ['Array'.lower() + ' x'], [7], [''], ['x' * 40], ['1lan'],
+                        ['opt%d' % n for n in range(m.CAPTURE_LIMIT + 1)]):
+            with self.assertRaises(m.Error, msg=invalid):
+                m.capture_interfaces(invalid)
+
+    def test_only_internal_interfaces_are_offered_in_a_stable_order(self):
+        found = self.candidates(self.CONTEXT)
+        self.assertEqual(['lan', 'opt2', 'opt5', 'opt10'], [item['name'] for item in found])
+        self.assertEqual({'name': 'lan', 'device': 'bridge0', 'descr': 'LAN', 'networks': ['192.168.0.1/22']}, found[0])
+        # A bridge member is offered but shows it has nothing to capture from.
+        self.assertEqual([], found[1]['networks'])
+        self.assertEqual('OPT5', found[2]['descr'])
+        for broken in (None, '', '{', '[]', json.dumps({'interfaces': 'x'})):
+            self.assertEqual([], self.candidates(broken), broken)
+
+    def test_policy_summary_names_the_scope_and_what_it_cannot_capture(self):
+        settings = {'transparent': True, 'device_mode': 'whitelist', 'device_list': ['192.168.3.0/24']}
+        found = self.candidates(self.CONTEXT)
+        automatic = m.device_routing_policy(settings, found)
+        self.assertEqual(['Enter TUN: 192.168.3.0/24', 'Other devices bypass TUN.',
+                          'Router traffic and WAN connections bypass TUN.'], automatic)
+        settings['capture_interfaces'] = ['lan', 'opt5']
+        self.assertEqual(['Capture only from: LAN (lan), OPT5 (opt5).'] + automatic,
+                         m.device_routing_policy(settings, found))
+        settings['capture_interfaces'] = ['lan', 'opt7', 'opt99']
+        self.assertEqual(['Capture only from: LAN (lan), opt7, opt99.',
+                          'Not captured because they are missing, disabled or WAN-like: opt7, opt99.'] + automatic,
+                         m.device_routing_policy(settings, found))
+        settings['capture_interfaces'] = ['opt2']
+        self.assertEqual('None of the selected interfaces has an address to capture from.',
+                         m.device_routing_policy(settings, found)[1])
+        # Without the context the summary still states the selection.
+        self.assertEqual('Capture only from: opt2.', m.device_routing_policy(settings)[0])
+        self.assertEqual([], m.device_routing_policy(dict(settings, transparent=False), found))
 
 
 class DeviceDiscoveryTests(unittest.TestCase):

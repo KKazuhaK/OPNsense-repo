@@ -127,6 +127,10 @@ $(function () {
             });
             updateDnsControls();
             $('#device_list').val((s.device_list || []).join('\n'));
+            /* The stored selection wins over whatever the picker showed. */
+            storedCapture = s.capture_interfaces || [];
+            captureReady = false;
+            renderCaptureInterfaces(captureCandidates);
             $('#merge_content').val(data.merge || '');
             $('#config_content').val(data.subscription || '');
             $('.selectpicker').selectpicker('refresh');
@@ -163,6 +167,39 @@ $(function () {
     }
 
     let lastDevices = {devices: [], rules: []};
+
+    /* Settings and candidates arrive in separate responses, in either order.
+       Until the stored selection has been applied the picker must not report
+       its own (empty) state back, or a save would clear the selection. */
+    let storedCapture = [];
+    let captureCandidates = [];
+    let captureReady = false;
+
+    function renderCaptureInterfaces(list) {
+        captureCandidates = Array.isArray(list) ? list : [];
+        const select = $('#capture_interfaces');
+        const current = captureReady ? (select.val() || []) : storedCapture;
+        const known = {};
+        select.empty();
+        captureCandidates.forEach(function (item) {
+            known[item.name] = true;
+            const networks = (item.networks || []).filter(function (net) { return net.indexOf(':') === -1; });
+            select.append($('<option>').val(item.name)
+                .text(item.descr + ' (' + item.name + ', ' + item.device + ')')
+                .attr('data-subtext', networks.length ? networks.join(', ') : '{{ lang._('no address') }}'));
+        });
+        /* A selected interface that is gone, disabled or now WAN-like stays
+           visible and selected, so saving never drops it silently. */
+        current.forEach(function (name) {
+            if (!known[name]) {
+                select.append($('<option>').val(name).text(name)
+                    .attr('data-subtext', '{{ lang._('unavailable: missing, disabled or WAN-like') }}'));
+            }
+        });
+        select.val(current);
+        select.selectpicker('refresh');
+        captureReady = true;
+    }
 
     function updateDnsControls() {
         const editable = $('#dns_override').is(':checked') && !$('#router_dns').is(':checked');
@@ -274,7 +311,10 @@ $(function () {
     }
 
     function loadDevices() {
-        get(api.devices, renderDevices);
+        get(api.devices, function (found) {
+            renderDevices(found);
+            renderCaptureInterfaces((found || {}).interfaces);
+        });
     }
 
     $('#mihomo-device-rows').on('change', '.mihomo-device', function () {
@@ -363,6 +403,7 @@ $(function () {
             geo_source: $('#geo_source').val(),
             device_mode: $('#device_mode').val(),
             device_list: $('#device_list').val(),
+            capture_interfaces: ($('#capture_interfaces').val() || []).join(','),
             dns_default: $('#dns_default').val(),
             dns_nameserver: $('#dns_nameserver').val(),
             dns_proxy_nameserver: $('#dns_proxy_nameserver').val()
@@ -629,6 +670,17 @@ $(function () {
                         &nbsp;&nbsp;
                     </td></tr></thead>
             <tbody>
+                <tr>
+                    <td><a id="help_for_captureif" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Capture interfaces') }}</td>
+                    <td>
+                        <select id="capture_interfaces" class="selectpicker" multiple data-style="btn-default" data-width="320px"
+                                data-live-search="true" data-show-subtext="true"
+                                data-none-selected-text="{{ lang._('Automatic (all internal interfaces)') }}"></select>
+                        <div class="hidden" data-for="help_for_captureif">
+                            {{ lang._('Limits transparent routing to traffic arriving on the selected interfaces. Leave it empty to use every internal interface, which is the behaviour of earlier versions. WAN-like interfaces are never captured and are not offered: an interface counts as WAN-like when it is the WAN or OPNsense resolves a gateway for it, which covers every uplink of a multi-WAN setup, PPPoE links and VPN exits with a gateway. For a bridged LAN select the bridge interface, not its members, because member ports carry no address. A VPN server appears here only once its tunnel is assigned as an interface. The device policy below then selects addresses within these interfaces. Traffic to any local network, on any interface, always bypasses the tunnel.') }}
+                        </div>
+                    </td>
+                </tr>
                 <tr>
                     <td><a id="help_for_devmode" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Mode') }}</td>
                     <td>

@@ -40,6 +40,15 @@ class ConfigdContractTests(unittest.TestCase):
         self.assertIsNotNone(staged, 'the argument must be a variable holding a path')
         self.assertEqual('$staged', staged.group(1))
 
+    def test_wan_events_forward_their_address_family(self):
+        # Without the family the manager cannot tell a DHCPv6 renewal from an
+        # IPv4 change, and every renewal resets all proxied connections.
+        hook = (ROOT / 'src/usr/local/etc/inc/plugins.inc.d/mihomo.inc').read_text()
+        self.assertTrue(configd_contract()['wan-restart'])
+        self.assertIn("configctl mihomo wan-restart ' . escapeshellarg($restart)", hook)
+        self.assertIn("$family = is_string($family) ? $family : '';", hook)
+        self.assertIn('action == "wan-restart" and argument == "inet6"', MANAGER.read_text())
+
     def test_argument_less_actions_use_the_plain_runner(self):
         service = (ROOT / 'src/usr/local/opnsense/mvc/app/controllers/OPNsense/Mihomo/Api/ServiceController.php').read_text()
         known = configd_contract()
@@ -114,6 +123,38 @@ class FrameworkApiTests(unittest.TestCase):
         self.assertIn("$('#dns_override,#router_dns').on('change', updateDnsControls);", view)
         for field in ('dns_default', 'dns_nameserver', 'dns_proxy_nameserver'):
             self.assertIn('id="effective_' + field + '"', view)
+
+
+class CaptureInterfaceViewTests(unittest.TestCase):
+    """The interface picker must never lose a stored selection or offer an uplink."""
+
+    def setUp(self):
+        self.view = VIEW.read_text()
+
+    def test_picker_is_a_multi_select_with_an_automatic_empty_state_and_help(self):
+        picker = re.search(r'<select id="capture_interfaces"[^>]*>', self.view)
+        self.assertIsNotNone(picker)
+        self.assertIn(' multiple ', picker.group(0))
+        self.assertIn('Automatic (all internal interfaces)', picker.group(0))
+        self.assertIn('id="help_for_captureif"', self.view)
+        self.assertIn('data-for="help_for_captureif"', self.view)
+
+    def test_stored_selection_survives_either_response_order_and_missing_interfaces(self):
+        # Settings and candidates arrive separately; the picker must not
+        # report its own empty state before the stored selection is applied.
+        self.assertIn('const current = captureReady ? (select.val() || []) : storedCapture;', self.view)
+        self.assertIn('storedCapture = s.capture_interfaces || [];', self.view)
+        self.assertIn('renderCaptureInterfaces((found || {}).interfaces);', self.view)
+        self.assertIn('if (!known[name])', self.view, 'a vanished interface must stay selected and visible')
+        self.assertEqual(1, self.view.count('get(api.devices'), 'one fetch serves the devices and the picker')
+
+    def test_selection_is_saved_and_carried_through_the_controllers(self):
+        self.assertIn("capture_interfaces: ($('#capture_interfaces').val() || []).join(','),", self.view)
+        settings = [p for p in CONTROLLERS if p.name == 'SettingsController.php'][0].read_text()
+        lists = re.search(r'LISTS = \[(.*?)\];', settings, re.S).group(1)
+        self.assertIn("'capture_interfaces'", lists)
+        service = [p for p in CONTROLLERS if p.name == 'ServiceController.php'][0].read_text()
+        self.assertIn("'interfaces' => $found['interfaces'] ?? []", service)
 
 
 class DeviceTabTests(unittest.TestCase):

@@ -88,6 +88,7 @@ elif args[0]!='info':
 ''')
         self.command('sha256', "import hashlib,sys\nprint(hashlib.sha256(open(sys.argv[-1],'rb').read()).hexdigest())\n")
         for name in ('usr/local/bin/mihomo', 'usr/bin/mihomo_sub', 'usr/local/etc/rc.d/mihomo',
+                     'usr/local/etc/rc.syshook.d/start/16-mihomo',
                      'usr/local/opnsense/scripts/mihomo/mihomo.py',
                      'usr/local/opnsense/scripts/mihomo/setup_unbound.php'):
             path = self.project / 'src' / name
@@ -182,6 +183,9 @@ runpy.run_path(args[0],run_name='__main__')
             product = json.load(archive.extractfile('usr/local/opnsense/version/mihomo'))
             self.assertEqual(manifest['annotations'], product)
             self.assertIn(b'/usr/local/bin/python3.13', archive.extractfile('usr/bin/mihomo_sub').read())
+            hook = archive.getmember('usr/local/etc/rc.syshook.d/start/16-mihomo')
+            self.assertEqual(0o755, hook.mode & 0o777)
+            self.assertIn(b'/usr/local/bin/python3.13', archive.extractfile(hook).read())
         self.assertIn('/usr/local/bin/python3.13', manifest['scripts']['pre-install'])
 
     def test_dependency_patch_mismatch_prevents_package_creation(self):
@@ -267,6 +271,28 @@ runpy.run_path(args[0],run_name='__main__')
         self.assertEqual(0, result.returncode, result.stderr)
         metadata = self.project / 'work/freebsd-pkg/FreeBSD:15:amd64/27.1/meta/build-target.json'
         self.assertEqual('27.1', json.loads(metadata.read_text())['native_product_abi'])
+
+
+class BootHookTests(unittest.TestCase):
+    """rc.freebsd never starts rc.d/mihomo, so this hook is the only boot start."""
+
+    PROJECT = Path(__file__).resolve().parents[1]
+    HOOK = PROJECT / 'src/usr/local/etc/rc.syshook.d/start/16-mihomo'
+
+    def test_hook_is_committed_executable_and_valid_shell(self):
+        self.assertTrue(self.HOOK.stat().st_mode & 0o111, 'rc.syshook skips hooks that are not executable')
+        subprocess.run(['sh', '-n', str(self.HOOK)], check=True)
+        self.assertIn('usr/local/etc/rc.syshook.d/start/16-mihomo', (self.PROJECT / 'build.sh').read_text())
+
+    def test_hook_starts_detached_through_the_idempotent_boot_action(self):
+        lines = [line for line in self.HOOK.read_text().splitlines() if line and not line.startswith('#')]
+        self.assertEqual(['/usr/sbin/daemon -f /usr/local/bin/python3 /usr/local/opnsense/scripts/mihomo/mihomo.py boot'
+                          ' >/dev/null 2>&1 || true', 'exit 0'], lines)
+
+    def test_hook_runs_after_boot_time_wan_events_and_before_services(self):
+        # 10-newwanip replays the boot-time WAN events; the core must not be
+        # started before them only to be restarted by them.
+        self.assertTrue('10-newwanip' < self.HOOK.name < '20-freebsd')
 
 
 class TargetTests(unittest.TestCase):

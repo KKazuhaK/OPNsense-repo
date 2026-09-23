@@ -152,6 +152,42 @@ class StateTests(unittest.TestCase):
         self.manager.dispatch('boot')
         self.assertFalse(self.system.alive)
 
+    def test_wan_restart_ignores_inet6_while_mihomo_ipv6_is_off(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.assertFalse(self.manager.settings()['ipv6'])
+        self.system.events.clear()
+        self.assertEqual({'running': True}, self.manager.dispatch('wan-restart', 'inet6'))
+        self.assertEqual([], self.system.events)
+        self.assertTrue(self.system.alive)
+        # IPv4 changes and events that name no family still restart the core.
+        for family in ('inet', '', None):
+            self.system.events.clear()
+            self.manager.dispatch('wan-restart', family)
+            self.assertIn('stop', self.system.events, family)
+            self.assertIn('start-transparent', self.system.events, family)
+            self.assertTrue(self.system.alive)
+
+    def test_wan_restart_follows_inet6_when_mihomo_ipv6_is_on(self):
+        self.manager.apply(SUBSCRIPTION)
+        settings = self.manager.settings()
+        settings['ipv6'] = True
+        self.manager.write_settings(settings)
+        self.manager.dispatch('enable-transparent')
+        self.system.events.clear()
+        self.manager.dispatch('wan-restart', 'inet6')
+        self.assertIn('stop', self.system.events)
+        self.assertTrue(self.system.alive)
+
+    def test_inet6_wan_event_does_not_revive_a_stopped_core(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.manager.dispatch('stop')
+        self.system.events.clear()
+        self.assertEqual({'running': False}, self.manager.dispatch('wan-restart', 'inet6'))
+        self.assertEqual([], self.system.events)
+        self.assertFalse(self.system.alive)
+
     def test_crash_fallback_is_per_router_and_keeps_opt_in(self):
         self.manager.apply(SUBSCRIPTION)
         self.manager.dispatch('enable-transparent')
@@ -175,6 +211,39 @@ class StateTests(unittest.TestCase):
         self.assertEqual('new-secret', m.parse_yaml(self.manager.config_file.read_bytes())['secret'])
         self.assertIn('stop', self.system.events)
         self.assertFalse(self.manager.source_file.exists())
+
+    def test_capture_interfaces_are_saved_normalised_and_reported(self):
+        payload = self.manager.state / 'request.json'
+        payload.write_text(json.dumps({'capture_interfaces': ['opt5', 'lan', 'opt5']}))
+        self.manager.dispatch('set-settings', str(payload))
+        self.assertEqual(['opt5', 'lan'], self.manager.settings()['capture_interfaces'])
+        # Settings that do not mention the field leave the selection alone.
+        payload.write_text(json.dumps({'secret': 'another-secret'}))
+        self.manager.dispatch('set-settings', str(payload))
+        self.assertEqual(['opt5', 'lan'], self.manager.settings()['capture_interfaces'])
+        payload.write_text(json.dumps({'capture_interfaces': []}))
+        self.manager.dispatch('set-settings', str(payload))
+        self.assertEqual([], self.manager.settings()['capture_interfaces'])
+        for invalid in (['lan;x'], 'lan', [1]):
+            payload.write_text(json.dumps({'capture_interfaces': invalid}))
+            with self.assertRaises(m.Error):
+                self.manager.dispatch('set-settings', str(payload))
+        self.assertEqual([], self.manager.settings()['capture_interfaces'])
+
+    def test_devices_action_offers_capture_candidates_from_the_routing_context(self):
+        (self.manager.state / 'routing-context.json').write_text(json.dumps({'interfaces': [
+            {'name': 'wan', 'device': 'igc1', 'networks': ['192.0.2.2/24'], 'wan': True},
+            {'name': 'lan', 'device': 'bridge0', 'networks': ['192.168.0.1/22'], 'wan': False, 'descr': 'LAN'},
+            {'name': 'opt5', 'device': 'vlan0.20', 'networks': ['192.168.20.1/24'], 'wan': False, 'descr': 'Guest'}],
+            'local_addresses': []}))
+        settings = self.manager.settings()
+        settings.update(transparent=True, capture_interfaces=['opt5', 'opt1'])
+        self.manager.write_settings(settings)
+        self.system.run = lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, b'', b'')
+        found = self.manager.dispatch('devices')
+        self.assertEqual(['lan', 'opt5'], [item['name'] for item in found['interfaces']])
+        self.assertEqual('Capture only from: Guest (opt5), opt1.', found['routing'][0])
+        self.assertIn('opt1', found['routing'][1])
 
     def test_settings_action_applies_listener_and_tun_fields_before_and_after_subscription(self):
         payload = self.manager.state / 'request.json'

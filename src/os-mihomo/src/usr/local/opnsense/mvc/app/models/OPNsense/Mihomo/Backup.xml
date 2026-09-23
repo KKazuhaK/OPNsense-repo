@@ -57,6 +57,7 @@
         <dns_proxy_nameserver type="TextField"/>
         <device_mode type="TextField"/>
         <device_list type="TextField"/>
+        <capture_interfaces type="TextField"/>
         <controller type="TextField"/>
 
         <!-- The overlay the operator hand-edits, verbatim. merge_preset names the

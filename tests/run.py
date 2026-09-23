@@ -22,6 +22,7 @@ PORTABLE_PHP = {
                     'src/os-sing-box/src/usr/local/opnsense/mvc/app/controllers/OPNsense/SingBox/Api')],
     'os-mihomo': [('src/os-mihomo/tests/native/test-backup-fields.php',),
                   ('src/os-mihomo/tests/native/test-routing-context.php',),
+                  ('src/os-mihomo/tests/native/test-newwanip-scope.php',),
                   ('src/os-mihomo/tests/native/test-tun-rule-ownership.php',)],
     'os-frp': [('src/os-frp/tests/native/test-backup-fields.php',)],
 }

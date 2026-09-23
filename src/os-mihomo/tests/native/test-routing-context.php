@@ -46,4 +46,15 @@ foreach (['192.168.8.1', '192.168.9.1', '198.51.100.1', '203.0.113.1', '2001:db8
         throw new RuntimeException('Router address was not excluded from device capture.');
     }
 }
+/* The picker shows the operator's label and never offers an interface group. */
+$labelled = mihomo_routing_context([
+    'lan' => ['if' => 'vtnet0', 'descr' => 'Home LAN'],
+    'opt5' => ['if' => 'vlan0.20'],
+    'openvpn' => ['if' => 'openvpn', 'descr' => 'OpenVPN', 'virtual' => '1'],
+], []);
+$labelled = array_column($labelled['interfaces'], null, 'name');
+if ($labelled['lan']['descr'] !== 'Home LAN' || $labelled['opt5']['descr'] !== 'OPT5'
+    || $labelled['lan']['virtual'] !== false || $labelled['openvpn']['virtual'] !== true) {
+    throw new RuntimeException('Interface labels or group markers were lost.');
+}
 echo "Routing context checks passed.\n";

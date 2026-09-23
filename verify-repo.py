@@ -680,9 +680,10 @@ def newest_archives(all_dir):
     """Choose what a catalog offers: the newest archive of every package in All/.
 
     Every published archive stays downloadable from All/, but each catalog lists
-    one version per package. Offered several versions of one name, pkg 2.3 picks
-    by version text, so 1.2.9 beat 1.2.10; offered one, pkg compares versions the
-    usual way (1.2.10 > 1.2.9) and upgrades to it.
+    one version per package. Offered several versions of one name, pkg 2.3 does not
+    reliably take the newest: the published catalog served 1.2.9 over 1.2.10 to
+    fresh installs and to upgrades from this repository. Offered one, pkg compares
+    versions the usual way (1.2.10 > 1.2.9) and upgrades to it.
     """
     newest = {}
     for path in sorted(Path(all_dir).glob('*.pkg')):
@@ -713,7 +714,7 @@ def check_catalog_versions(manifests, repo, relative):
         name, version = item.get('name'), item.get('version')
         if isinstance(name, str) and isinstance(version, str):
             if name in offered:
-                raise ValueError('%s offers %s more than once; pkg would choose between the versions by text.'
+                raise ValueError('%s offers %s more than once; pkg would not reliably install the newest.'
                                  % (relative, name))
             offered[name] = version
     for path in sorted((repo / 'All').glob('*.pkg')):

@@ -25,7 +25,8 @@ find "$REPO_ROOT" -type d -name All | while IFS= read -r all_dir; do
     catalog_input="$(mktemp -d "${TMPDIR:-/tmp}/kazuha-catalog.XXXXXX")"
     trap 'rm -rf "$catalog_input"' EXIT HUP INT TERM
     mkdir "$catalog_input/All"
-    (cd "$all_dir" && tar -cf - .) | (cd "$catalog_input/All" && tar -xf -)
+    # Offer only the newest version of each package; older archives stay downloadable.
+    python3 "$SCRIPT_DIR/verify-repo.py" "$all_dir" --catalog-into "$catalog_input/All"
     # pkg repo recurses, so never scan adjacent series through an ABI root.
     pkg repo -o "$(dirname "$all_dir")" "$catalog_input" "rsa:$SIGNING_KEY"
     rm -rf "$catalog_input"

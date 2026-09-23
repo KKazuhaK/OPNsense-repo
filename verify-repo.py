@@ -650,6 +650,34 @@ def verify_catalog(archive, member, public_key):
     return payload
 
 
+def pkg_version_key(version):
+    """Order versions the way pkg(8) compares them: epoch, dotted parts, revision."""
+    match = re.fullmatch(r'([^_,]+)(?:_([0-9]+))?(?:,([0-9]+))?', version)
+    if not match:
+        raise ValueError('Unrecognized package version in a catalog.')
+    parts = [(int(number) if number else -1, rest)
+             for number, rest in (re.fullmatch(r'([0-9]*)(.*)', part).groups() for part in match.group(1).split('.'))]
+    return int(match.group(3) or 0), parts, int(match.group(2) or 0)
+
+
+def check_selected_versions(manifests, repository):
+    """Refuse a catalog in which pkg would not install the newest version of a package.
+
+    Among several versions of one name in one repository, pkg 2.3 selects the
+    version string that sorts last as text, so 1.2.9 would win over 1.2.10 for
+    fresh installs and upgrades alike.
+    """
+    versions = {}
+    for item in manifests:
+        if isinstance(item.get('name'), str) and isinstance(item.get('version'), str):
+            versions.setdefault(item['name'], []).append(item['version'])
+    for name, found in sorted(versions.items()):
+        selected, newest = max(found), max(found, key=pkg_version_key)
+        if selected != newest:
+            raise ValueError('pkg would install %s %s instead of the newer %s from %s; '
+                             'release a version that also sorts last as text.' % (name, selected, newest, repository))
+
+
 def verify(site, source=None):
     public_key = site / 'kazuha.pub'
     if hashlib.sha256(public_key.read_bytes()).hexdigest() != FINGERPRINT:
@@ -702,6 +730,7 @@ def verify(site, source=None):
         verify_catalog(repo / 'data.pkg', 'data', public_key)
         payload = verify_catalog(repo / 'packagesite.pkg', 'packagesite.yaml', public_key)
         manifests = [json.loads(line) for line in payload.splitlines() if line.strip()]
+        check_selected_versions(manifests, relative)
         for item in manifests:
             path = (repo / item['path']).resolve()
             if not path.is_relative_to((repo / 'All').resolve()) or path.suffix != '.pkg' or item['abi'] not in {abi, 'FreeBSD:*:amd64'}:

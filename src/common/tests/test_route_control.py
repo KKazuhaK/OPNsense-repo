@@ -50,9 +50,10 @@ class SharedSourceTests(unittest.TestCase):
                 self.assertEqual({'route_control'}, {node.module for node in ast.walk(tree)
                                                      if isinstance(node, ast.ImportFrom)})
         shared_methods = {
-            'allocate', 'anchor', 'check_anchor', 'command', 'disable', 'enable',
-            'execute', 'load', 'occupied', 'path', 'policy', 'read',
-            'route_command', 'routes', 'save', 'status', 'sync',
+            'allocate', 'anchor', 'anchor_rules', 'check_anchor', 'command', 'disable', 'enable',
+            'execute', 'kill_redirect_states', 'load', 'neutralize_sources', 'occupied',
+            'owned_translation_line', 'path', 'policy', 'rdr_anchor_hooked', 'read',
+            'redirect_target', 'route_command', 'routes', 'save', 'status', 'sync',
         }
         for routing in [
                 REPO / 'src/os-mihomo/src/usr/local/opnsense/scripts/mihomo/routing.py',
@@ -426,6 +427,173 @@ class SharedPolicyTests(unittest.TestCase):
         self.assertEqual(errno.EEXIST, raised.exception.errno)
         self.assertIn('File exists', str(raised.exception))
         self.assertEqual(1, exchange.call_count)
+
+
+class TcpRedirectPolicyTests(unittest.TestCase):
+    class Adapter(policy.TunPolicyRouting):
+        STATE = '/var/db/test-routing'
+        TUN = 'tun_test'
+        ANCHOR = 'test'
+        LABEL = 'test-routing'
+        PF_PREFIX = 'test'
+        NATIVE_PYTHON = '/usr/local/bin/python3'
+        NATIVE_HELPER = '/usr/local/libexec/test-native-route'
+        ROUTING_LOCK = '/var/run/test-routing.lock'
+
+    SETTINGS = {'device_mode': 'off', 'device_list': []}
+    CONTEXT = {'interfaces': [
+        {'device': 'vtnet0', 'wan': True, 'networks': ['192.0.2.0/24']},
+        {'device': 'vtnet1', 'wan': False, 'networks': ['10.2.0.0/24', 'fd00::/64']},
+        {'device': 'vtnet2', 'wan': False, 'networks': ['10.3.0.0/24']},
+        {'device': 'vtnet3', 'wan': False, 'networks': ['fd01::/64']}],
+        'local_addresses': ['192.0.2.2', '10.2.0.1', '10.3.0.1']}
+    LOCAL = ('table <test_local> { 10.2.0.1/32, 10.3.0.1/32, 127.0.0.0/8, 169.254.0.0/16, '
+             '192.0.2.2/32, 224.0.0.0/4, 255.255.255.255/32, ::1/128, fe80::/10, ff00::/8 }')
+
+    def render(self, redirect=None, families=(4, 6)):
+        adapter = self.Adapter(Path('/nonexistent'))
+        return adapter.policy(self.SETTINGS, self.CONTEXT, {}, set(families), 7, redirect)[0]
+
+    @staticmethod
+    def match(interface, family, protocol, table):
+        return ('match in on %s %s proto %s from <%s> to !<test_local> %srtable 7 label "test-routing"'
+                % (interface, family, protocol, table, 'flags S/SA ' if protocol == 'tcp' else ''))
+
+    def test_policy_without_redirect_keeps_todays_exact_interleaved_text(self):
+        expected = [self.LOCAL,
+                    'table <test_sources_0> { 10.2.0.0/24, fd00::/64 }',
+                    self.match('vtnet1', 'inet', 'tcp', 'test_sources_0'),
+                    self.match('vtnet1', 'inet', 'udp', 'test_sources_0'),
+                    self.match('vtnet1', 'inet6', 'tcp', 'test_sources_0'),
+                    self.match('vtnet1', 'inet6', 'udp', 'test_sources_0'),
+                    'table <test_sources_1> { 10.3.0.0/24 }',
+                    self.match('vtnet2', 'inet', 'tcp', 'test_sources_1'),
+                    self.match('vtnet2', 'inet', 'udp', 'test_sources_1'),
+                    'table <test_sources_2> { fd01::/64 }',
+                    self.match('vtnet3', 'inet6', 'tcp', 'test_sources_2'),
+                    self.match('vtnet3', 'inet6', 'udp', 'test_sources_2')]
+        self.assertEqual('\n'.join(expected) + '\n', self.render())
+
+    def test_redirect_groups_translation_before_filters_and_only_for_ipv4_sources(self):
+        lines = self.render(7894).splitlines()
+        tables = [index for index, line in enumerate(lines) if line.startswith('table ')]
+        rdr = [index for index, line in enumerate(lines) if ' rdr ' in ' ' + line]
+        matches = [index for index, line in enumerate(lines) if line.startswith('match ')]
+        # PF refuses a translation rule after any filter rule, even across interfaces.
+        self.assertLess(max(tables), min(rdr))
+        self.assertLess(max(rdr), min(matches))
+        self.assertEqual([
+            'no rdr on vtnet1 inet proto tcp from <test_sources_0> to any port 53',
+            'rdr on vtnet1 inet proto tcp from <test_sources_0> to !<test_local> -> 127.0.0.1 port 7894',
+            'no rdr on vtnet2 inet proto tcp from <test_sources_1> to any port 53',
+            'rdr on vtnet2 inet proto tcp from <test_sources_1> to !<test_local> -> 127.0.0.1 port 7894',
+        ], [lines[index] for index in rdr])
+        # The TUN rules stay byte-identical: they carry DNS, UDP, IPv6 and any
+        # TCP the redirect does not take.
+        self.assertEqual(sorted(line for line in self.render().splitlines() if line.startswith('match ')),
+                         sorted(lines[index] for index in matches))
+        text = '\n'.join(lines)
+        self.assertNotIn('rdr pass', text)
+        self.assertNotIn('!=', text)
+        self.assertNotIn('inet6 proto tcp from <test_sources_2> to !<test_local> -> ', text)
+        self.assertFalse(any(' rdr ' in ' ' + line for line in self.render(7894, families=(6,)).splitlines()))
+
+    def test_translation_ownership_accepts_only_pfctl_forms_of_generated_rules(self):
+        adapter = self.Adapter(Path('/nonexistent'))
+        owned = [
+            'no rdr on vtnet1 inet proto tcp from <test_sources_1> to any port = domain',
+            'no rdr on vtnet1 inet proto tcp from <test_sources_1> to any port = 53',
+            'rdr on vtnet1 inet proto tcp from <test_sources_1> to ! <test_local> -> 127.0.0.1 port 7894',
+            'rdr on epair0a inet proto tcp from <test_sources_12> to !<test_local> -> 127.0.0.1 port 7894',
+        ]
+        foreign = [
+            'rdr pass on vtnet1 inet proto tcp from <test_sources_1> to ! <test_local> -> 127.0.0.1 port 7894',
+            'rdr on vtnet1 inet proto tcp from <test_sources_1> to ! <test_local> -> 10.0.0.9 port 7894',
+            'rdr on vtnet1 inet proto tcp from <test_sources_1> to ! <test_local> -> 127.0.0.1 port 53',
+            'rdr on vtnet1 inet proto tcp from <test_sources_1> to ! <test_local> -> 127.0.0.1 port 70000',
+            'rdr on vtnet1 inet proto udp from <test_sources_1> to ! <test_local> -> 127.0.0.1 port 7894',
+            'rdr on vtnet1 inet6 proto tcp from <test_sources_1> to ! <test_local> -> ::1 port 7894',
+            'rdr on vtnet1 inet proto tcp from <other_sources_1> to ! <test_local> -> 127.0.0.1 port 7894',
+            'rdr on vtnet1 inet proto tcp from any to ! <test_local> -> 127.0.0.1 port 7894',
+            'no rdr on vtnet1 inet proto tcp from <test_sources_1> to any port = 80',
+            'nat on vtnet0 inet from <test_sources_1> to any -> (vtnet0)',
+        ]
+        for line in owned:
+            with self.subTest(line=line):
+                self.assertTrue(adapter.owned_translation_line(line))
+        for line in foreign:
+            with self.subTest(line=line):
+                self.assertFalse(adapter.owned_translation_line(line))
+
+    def test_redirected_states_are_selected_from_real_pfctl_output(self):
+        # Headlines captured from pfctl -ss -vv on FreeBSD 15.1; the id lines
+        # follow the same output's format.
+        text = (
+            'all tcp 127.0.0.1:7894 (10.99.2.2:8080) <- 10.99.1.2:28251       ESTABLISHED:ESTABLISHED\n'
+            '   [1103344584 + 1280] wscale 7  [217659539 + 65792] wscale 7\n'
+            '   age 00:00:03, expires in 23:59:59, 168:325 pkts, 8835:474904 bytes, rule 1\n'
+            '   id: 5c00b46a00000001 creatorid: 7e715f53\n'
+            'all tcp 10.99.2.1:35533 -> 10.99.2.2:8080       FIN_WAIT_2:FIN_WAIT_2\n'
+            '   id: 5c00b46a00000002 creatorid: 7e715f53\n'
+            'all tcp 127.0.0.1:7895 (10.99.2.2:8080) <- 10.99.1.2:1       ESTABLISHED:ESTABLISHED\n'
+            '   id: 5c00b46a00000003 creatorid: 7e715f53\n'
+            'all tcp 127.0.0.1:7894 <- 10.99.1.2:2       ESTABLISHED:ESTABLISHED\n'
+            '   id: 5c00b46a00000004 creatorid: 7e715f53\n'
+            'vtnet1 tcp 127.0.0.1:7894 (203.0.113.9:443) <- 10.99.1.2:3       SYN_SENT:ESTABLISHED\n'
+            '   id: 5C00B46A00000005 creatorid: 7E715F53\n')
+        self.assertEqual(['5c00b46a00000001/7e715f53', '5c00b46a00000005/7e715f53'],
+                         policy.redirect_states(text, 7894))
+        broken = 'all tcp 127.0.0.1:7894 (10.99.2.2:8080) <- 10.99.1.2:1       ESTABLISHED:ESTABLISHED\n   age 1\n'
+        with self.assertRaisesRegex(policy.RoutingError, 'no valid identifier'):
+            policy.redirect_states(broken, 7894)
+        with patch.object(policy, 'MAX_STATES', 16), self.assertRaisesRegex(policy.RoutingError, 'limit'):
+            policy.redirect_states(text, 7894)
+
+    def test_journal_port_is_validated_and_reported_only_when_present(self):
+        for value in (7894, 1, 65535):
+            self.assertTrue(policy.valid_redirect_port(value))
+        for value in (53, 0, 65536, True, '7894', 7894.0, None):
+            self.assertFalse(policy.valid_redirect_port(value))
+        with tempfile.TemporaryDirectory() as root:
+            adapter = self.Adapter(Path(root))
+            base = {'schema': 1, 'fib': 7, 'active': True, 'pending': False, 'routes': {}}
+            adapter.save(dict(base))
+            self.assertNotIn('tcp_redirect_port', adapter.status(adapter.load()))
+            adapter.save(dict(base, tcp_redirect_port=7894))
+            self.assertEqual(7894, adapter.status(adapter.load())['tcp_redirect_port'])
+            for value in (53, 0, True, '7894'):
+                adapter.save(dict(base, tcp_redirect_port=value))
+                with self.subTest(value=value), self.assertRaises(policy.RoutingError):
+                    adapter.load()
+
+    def test_redirect_target_requires_opt_in_owned_port_and_hooked_anchor(self):
+        answers = {'hook': 'rdr-anchor "test" all\n', 'code': 0}
+
+        def run(args, **_options):
+            self.assertEqual(['/sbin/pfctl', '-sn'], args)
+            return subprocess.CompletedProcess(args, answers['code'], answers['hook'].encode(), b'')
+
+        class Redirecting(self.Adapter):
+            TCP_REDIRECT = True
+            offered = 7894
+
+            def redirect_port(self, _settings):
+                return self.offered
+
+        self.assertIsNone(self.Adapter(Path('/nonexistent'), run).redirect_target({}))
+        adapter = Redirecting(Path('/nonexistent'), run)
+        self.assertEqual(7894, adapter.redirect_target({}))
+        for hook, code in (('rdr-anchor "other" all\n', 0), ('', 0),
+                           ('rdr-anchor "test" all\n', 1), ('rdr-anchor "test/*" all\n', 0)):
+            answers.update(hook=hook, code=code)
+            with self.subTest(hook=hook, code=code):
+                self.assertIsNone(adapter.redirect_target({}))
+        adapter.offered = None
+        self.assertIsNone(adapter.redirect_target({}))
+        for value in (53, 0, True):
+            adapter.offered = value
+            with self.subTest(port=value), self.assertRaisesRegex(policy.RoutingError, 'port is invalid'):
+                adapter.redirect_target({})
 
 
 if __name__ == '__main__':

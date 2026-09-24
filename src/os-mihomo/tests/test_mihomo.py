@@ -212,6 +212,52 @@ class StateTests(unittest.TestCase):
         self.assertIn('stop', self.system.events)
         self.assertFalse(self.manager.source_file.exists())
 
+    def test_fast_tcp_path_renders_its_listener_and_guards_the_port(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        owned = {'name': m.REDIRECT_LISTENER, 'type': 'redir', 'port': m.REDIRECT_PORT, 'listen': '127.0.0.1'}
+        payload = self.manager.state / 'request.json'
+        payload.write_text(json.dumps({'tcp_redirect': True}))
+        self.manager.dispatch('set-settings', str(payload))
+        self.assertIs(True, self.manager.settings()['tcp_redirect'])
+        self.assertIn(owned, m.parse_yaml(self.manager.config_file.read_bytes())['listeners'])
+        for key in ('mixed_port', 'socks_port'):
+            payload.write_text(json.dumps({key: m.REDIRECT_PORT}))
+            with self.subTest(key=key), self.assertRaisesRegex(m.Error, 'transparent TCP listener'):
+                self.manager.dispatch('set-settings', str(payload))
+        payload.write_text(json.dumps({'tcp_redirect': 'yes'}))
+        with self.assertRaises(m.Error):
+            self.manager.dispatch('set-settings', str(payload))
+        self.assertIs(True, self.manager.settings()['tcp_redirect'])
+        payload.write_text(json.dumps({'tcp_redirect': False}))
+        self.manager.dispatch('set-settings', str(payload))
+        self.assertNotIn(owned, m.parse_yaml(self.manager.config_file.read_bytes()).get('listeners') or [])
+        # With the path off the port is an ordinary choice again.
+        payload.write_text(json.dumps({'mixed_port': m.REDIRECT_PORT}))
+        self.manager.dispatch('set-settings', str(payload))
+
+    def test_status_reports_the_fast_tcp_path_and_why_it_waits(self):
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        routing = self.manager.state / 'routing-state.json'
+        routing.write_text(json.dumps({'active': True, 'tcp_redirect_port': m.REDIRECT_PORT}))
+        status = self.manager.publish_status()
+        self.assertTrue(status['tcp_redirect'])
+        self.assertEqual('', status['tcp_redirect_note'])
+        routing.write_text(json.dumps({'active': True}))
+        self.assertFalse(self.manager.publish_status()['tcp_redirect'])
+        self.assertEqual('', self.manager.publish_status()['tcp_redirect_note'])
+        settings = self.manager.settings()
+        settings['tcp_redirect'] = True
+        self.manager.write_settings(settings)
+        self.assertIn('port %d is taken' % m.REDIRECT_PORT, self.manager.publish_status()['tcp_redirect_note'])
+        self.manager.apply(SUBSCRIPTION)
+        self.assertIn('until the core listener', self.manager.publish_status()['tcp_redirect_note'])
+        routing.write_text(json.dumps({'active': False, 'tcp_redirect_port': m.REDIRECT_PORT}))
+        status = self.manager.publish_status()
+        self.assertFalse(status['tcp_redirect'])
+        self.assertEqual('', status['tcp_redirect_note'])
+
     def test_capture_interfaces_are_saved_normalised_and_reported(self):
         payload = self.manager.state / 'request.json'
         payload.write_text(json.dumps({'capture_interfaces': ['opt5', 'lan', 'opt5']}))

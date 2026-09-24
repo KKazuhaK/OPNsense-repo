@@ -17,7 +17,7 @@ from tun_policy_routing import (
     parse_routes, route_identity, route_key, route_semantic, source_networks,
     state_tuple,
 )
-from process_owner import OwnershipError, core_group
+from process_owner import OwnershipError, REDIRECT_LISTENER, REDIRECT_PORT, core_group
 
 
 STATE = '/var/db/os-mihomo'
@@ -65,6 +65,7 @@ class Routing(TunPolicyRouting):
     NATIVE_PYTHON = '/usr/local/bin/python3'
     NATIVE_HELPER = '/usr/local/opnsense/scripts/mihomo/native_route.py'
     ROUTING_LOCK = '/var/run/mihomo-routing.lock'
+    TCP_REDIRECT = True
 
     def core_alive(self):
         try:
@@ -98,7 +99,42 @@ class Routing(TunPolicyRouting):
             raise RoutingError('The routing DNS configuration is invalid.')
         if dns.get('enable') and dns.get('enhanced-mode') == 'fake-ip':
             raise RoutingError('Device routing requires real-address DNS responses.')
+        self.config = config
         return settings, capture_scope(settings, context), config.get('ipv6') is True
+
+    def redirect_port(self, settings):
+        """Offer the TCP redirect only to the core's own, actually bound listener.
+
+        The rendered config alone is not proof: an upgrade rewrites it without a
+        restart, and another process could hold the port. Redirected TCP would
+        then fail, so every listener on the port must be the running core.
+        """
+        if settings.get('tcp_redirect') is not True:
+            return None
+        listeners = (getattr(self, 'config', None) or {}).get('listeners')
+        owned = [item for item in listeners if isinstance(item, dict)
+                 and item.get('name') == REDIRECT_LISTENER] if isinstance(listeners, list) else []
+        if owned != [{'name': REDIRECT_LISTENER, 'type': 'redir',
+                      'port': REDIRECT_PORT, 'listen': '127.0.0.1'}]:
+            return None
+        try:
+            group = core_group(root=self.root,
+                               process_reader=getattr(self, 'process_reader', None),
+                               sleeper=self.delay)
+            record = group.discover(adopt=False)
+            if record is None or not group.same(record['child']):
+                return None
+        except OwnershipError:
+            return None
+        value = self.command(['/usr/bin/sockstat', '-4', '-l', '-q', '-P', 'tcp',
+                              '-p', str(REDIRECT_PORT)], check=False)
+        rows = [line.split() for line in value.stdout.decode(errors='replace').splitlines()
+                if line.strip()]
+        expected = (str(record['child']['pid']), '127.0.0.1:%d' % REDIRECT_PORT)
+        if value.returncode or not rows or any(
+                len(row) < 6 or (row[2], row[5]) != expected for row in rows):
+            return None
+        return REDIRECT_PORT
 
 
 def main():

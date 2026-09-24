@@ -79,7 +79,8 @@ class BackupTests(unittest.TestCase):
         settings.update(subscription_url='https://provider.invalid/sub?token=private-provider-token',
                         secret='private-control-secret-中文', device='router-A', service_enabled=False,
                         transparent=True, transparent_consent=True, mixed_port=7895,
-                        device_mode='whitelist', device_list=['192.0.2.10'], capture_interfaces=['lan', 'opt5'])
+                        device_mode='whitelist', device_list=['192.0.2.10'], capture_interfaces=['lan', 'opt5'],
+                        tcp_redirect=True)
         self.manager.write_settings(settings)
         self.journals = {
             'dns-state.json': b'{"forwarding":"1","roots":{"test-root-uuid":"1"},"had_fake_ip_private_address":true}\r\n',
@@ -108,6 +109,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(settings['state_schema'], m.STATE_SCHEMA)
         self.assertEqual(settings['switch_schema'], m.SWITCH_SCHEMA)
         self.assertEqual(['lan', 'opt5'], settings['capture_interfaces'])
+        self.assertIs(True, settings['tcp_redirect'])
         self.assertEqual(self.system.cleaned, {name: json.loads(raw) for name, raw in self.journals.items()})
         self.assertEqual(json.loads(self.manager.selections_file.read_bytes()), {'Proxy / 中文': 'second'})
         self.assertEqual(self.store.value, original, 'restore overwrote the saved XML before it was applied')
@@ -126,6 +128,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(self.manager.settings()['secret'], 'partial-backup-secret')
         # A backup taken before capture interfaces existed means automatic.
         self.assertEqual([], self.manager.settings().get('capture_interfaces', []))
+        self.assertFalse(self.manager.settings().get('tcp_redirect', False))
         self.assertTrue(self.manager.mirror_backup()['ok'])
         self.assertEqual(self.store.value['future_field'], 'future exact bytes')
         self.assertEqual(self.store.value['checksum'], self.manager._backup_checksum(self.store.value))

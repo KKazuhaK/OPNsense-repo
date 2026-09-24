@@ -125,6 +125,30 @@ class FrameworkApiTests(unittest.TestCase):
             self.assertIn('id="effective_' + field + '"', view)
 
 
+class FastTcpPathTests(unittest.TestCase):
+    """The redirect needs its anchor hooked for translation, a form switch and a status."""
+
+    def test_the_anchor_is_registered_for_filtering_and_for_redirects(self):
+        hook = (ROOT / 'src/usr/local/etc/inc/plugins.inc.d/mihomo.inc').read_text()
+        body = re.search(r'function mihomo_firewall\(.*?\n}\n', hook, re.S).group(0)
+        calls = re.findall(r'\$fw->registerAnchor\(([^)]*)\);', body)
+        # A quick rdr-anchor does not parse and would stop the whole ruleset
+        # loading; tail placement keeps the operator's port forwards first.
+        self.assertEqual(["'mihomo', 'fw', 1, 'head', false", "'mihomo', 'rdr', 1, 'tail', false"], calls)
+
+    def test_the_switch_travels_through_form_controller_backup_and_status(self):
+        view = VIEW.read_text()
+        settings = [p for p in CONTROLLERS if p.name == 'SettingsController.php'][0].read_text()
+        self.assertIn('id="tcp_redirect"', view)
+        self.assertIn('data-for="help_for_tcpredirect"', view)
+        self.assertEqual(2, view.count("'allow_lan', 'tcp_redirect'].forEach"))
+        self.assertIn('id="mihomo-tcp-redirect"', view)
+        self.assertIn('state.tcp_redirect_note', view)
+        self.assertRegex(settings, r"FLAGS = \[[^\]]*'tcp_redirect'")
+        self.assertIsNotNone(ElementTree.parse(BACKUP_MODEL).find('./items/tcp_redirect'))
+        self.assertIn('127.0.0.1 port 7894', view)
+
+
 class CaptureInterfaceViewTests(unittest.TestCase):
     """The interface picker must never lose a stored selection or offer an uplink."""
 

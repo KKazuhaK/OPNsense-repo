@@ -106,7 +106,7 @@ $(function () {
                 ? '{{ lang._('Leave empty to keep the stored URL') }}'
                 : '{{ lang._('No subscription URL is stored yet') }}');
             ['dns_fallback', 'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dashboard_any',
-             'allow_lan'].forEach(function (flag) {
+             'allow_lan', 'tcp_redirect'].forEach(function (flag) {
                 $('#' + flag).prop('checked', !!s[flag]);
             });
             ['dns_mode', 'geo_source', 'device_mode', 'tun_stack'].forEach(function (choice) {
@@ -355,6 +355,9 @@ $(function () {
                 .text(routed ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
             $('#mihomo-dns').attr('class', 'label label-' + (state.dns_active ? 'success' : 'default'))
                 .text(state.dns_active ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
+            $('#mihomo-tcp-redirect').attr('class', 'label label-' + (state.tcp_redirect ? 'success' : 'default'))
+                .text(state.tcp_redirect ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
+            $('#mihomo-tcp-redirect-note').text(state.tcp_redirect_note || '');
             $('#mihomo-enable').toggle(!state.transparent);
             $('#mihomo-disable').toggle(!!state.transparent);
             const warnings = [state.error, state.backup_warning].filter(Boolean).join(' ');
@@ -413,7 +416,7 @@ $(function () {
             payload.settings[field] = $('#' + field).prop('value');
         });
         ['dns_fallback', 'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dashboard_any',
-         'allow_lan'].forEach(function (flag) {
+         'allow_lan', 'tcp_redirect'].forEach(function (flag) {
             payload.settings[flag] = $('#' + flag).is(':checked') ? 1 : 0;
         });
         call(api.set, payload, '{{ lang._('Settings saved. The configuration was regenerated from the stored subscription.') }}', $(this));
@@ -472,6 +475,7 @@ $(function () {
                 <tr><td>{{ lang._('Service') }}</td><td><span id="mihomo-service" class="label label-default">-</span></td></tr>
                 <tr><td>{{ lang._('Transparent routing') }}</td><td><span id="mihomo-transparent" class="label label-default">-</span></td></tr>
                 <tr><td>{{ lang._('DNS integration') }}</td><td><span id="mihomo-dns" class="label label-default">-</span></td></tr>
+                <tr><td>{{ lang._('Fast TCP path') }}</td><td><span id="mihomo-tcp-redirect" class="label label-default">-</span> <small id="mihomo-tcp-redirect-note" class="text-muted"></small></td></tr>
                 <tr>
                     <td><a id="help_for_service" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Service control') }}</td>
                     <td>
@@ -643,6 +647,15 @@ $(function () {
                         <span class="label label-warning mihomo-override" id="override_tun_stack" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_tunstack">
                             {{ lang._('This FreeBSD core supports gVisor for transparent routing. System and Mixed are unavailable because their TCP forwarding does not work on this build.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_tcpredirect" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Fast TCP path') }}</td>
+                    <td><input type="checkbox" id="tcp_redirect">
+                        <div class="hidden" data-for="help_for_tcpredirect">
+                            {{ lang._('Send captured IPv4 TCP to Mihomo through a firewall redirect instead of the gVisor TUN. The TUN caps each TCP connection at about 20 KB in flight, which on Wi-Fi limits a single download to a few tens of Mbps; the redirect uses the kernel TCP stack instead. UDP, QUIC, DNS and IPv6 stay on the TUN, and TCP falls back to the TUN whenever the redirect is not ready.') }}<br>
+                            {{ lang._('Firewall rules see redirected TCP as addressed to 127.0.0.1 port 7894. Block rules that match a destination host or port, and LAN rules that set a gateway, no longer apply to captured TCP. Check the captured interfaces for such rules before enabling this.') }}
                         </div>
                     </td>
                 </tr>

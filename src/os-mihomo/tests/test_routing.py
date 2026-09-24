@@ -733,6 +733,34 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(record['pending'])
         self.assertEqual(self.kernel.tables[fib]['4:0.0.0.0/0%']['gateway'], '192.0.2.1')
 
+    def test_first_redirect_enable_journals_the_port_before_loading_the_anchor(self):
+        # A failure right after the load must still find the translated states;
+        # the port therefore has to be durable before the rules exist.
+        self.ready_redirect()
+        self.kernel.states = self.REDIRECTED % (m.REDIRECT_PORT, 0xaa)
+        saved = []
+        original_save, original_anchor = self.routing.save, self.routing.anchor
+
+        def save(record):
+            saved.append(dict(record))
+            return original_save(record)
+
+        def anchor(content):
+            if content:
+                self.assertEqual(m.REDIRECT_PORT, saved[-1].get('tcp_redirect_port'))
+                self.assertTrue(saved[-1]['pending'])
+            original_anchor(content)
+            if content:
+                raise m.RoutingError('injected failure after the load')
+
+        with patch.object(self.routing, 'save', side_effect=save), \
+                patch.object(self.routing, 'anchor', side_effect=anchor), \
+                self.assertRaises(m.RoutingError):
+            self.routing.execute('enable')
+        self.assertIn('00000000000000aa/11223344', self.kernel.killed)
+        self.assertEqual('', self.kernel.anchor)
+        self.assertNotIn('tcp_redirect_port', self.routing.load())
+
     def test_journaled_port_lets_recovery_drop_redirected_states_after_a_crash(self):
         self.ready_redirect()
         self.routing.execute('enable')

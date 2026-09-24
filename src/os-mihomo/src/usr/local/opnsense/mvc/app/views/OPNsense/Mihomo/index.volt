@@ -655,7 +655,7 @@ $(function () {
                     <td><input type="checkbox" id="tcp_redirect">
                         <div class="hidden" data-for="help_for_tcpredirect">
                             {{ lang._('Send captured IPv4 TCP to Mihomo through a firewall redirect instead of the gVisor TUN. The TUN caps each TCP connection at about 20 KB in flight, which on Wi-Fi limits a single download to a few tens of Mbps; the redirect uses the kernel TCP stack instead. UDP, QUIC, DNS and IPv6 stay on the TUN, and TCP falls back to the TUN whenever the redirect is not ready.') }}<br>
-                            {{ lang._('Firewall rules see redirected TCP as addressed to 127.0.0.1 port 7894. Block rules that match a destination host or port, and LAN rules that set a gateway, no longer apply to captured TCP. Check the captured interfaces for such rules before enabling this.') }}
+                            {{ lang._('Firewall rules see redirected TCP as addressed to 127.0.0.1 port 7894. Block rules that match a destination host or port no longer apply to captured TCP, and pass rules limited to destination hosts or ports no longer match it, so it falls to the default block. A LAN rule that sets a gateway still matches and sends the redirected connection toward that gateway, where it is lost. Before enabling this, place a rule without a gateway that passes TCP from the captured sources to 127.0.0.1 port 7894 above any such rules, or keep those sources out of capture.') }}
                         </div>
                     </td>
                 </tr>

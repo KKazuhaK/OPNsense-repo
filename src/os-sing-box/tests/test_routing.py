@@ -210,6 +210,17 @@ class RoutingTests(unittest.TestCase):
             self.assertNotIn('tcp_redirect_port', result)
         self.assertNotIn('tcp_redirect_port', self.routing.load())
 
+    def test_foreign_anchor_rule_never_triggers_redirect_cleanup_for_sing_box(self):
+        self.routing.execute('enable')
+        self.kernel.anchor += '\nmatch in on vtnet1 label "operator"\n'
+        with self.assertRaises(m.RoutingError):
+            self.routing.execute('disable')
+        self.assertIn('operator', self.kernel.anchor)
+        for args in self.kernel.calls:
+            self.assertNotIn('-sT', args)
+            self.assertNotIn('flush', args)
+            self.assertNotIn('-sn', args)
+
     def test_withdrawn_capture_rearms_when_a_lan_address_appears(self):
         # A LAN that comes up after the core leaves nothing to capture at
         # first; the periodic refresh must arm capture once it has an address.

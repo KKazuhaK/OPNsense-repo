@@ -878,6 +878,9 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
             raise ValueError('Package lifecycle hook differs from source.')
 
 
+DRIFTED = 'changed without a version bump'
+
+
 def audit_versions(site, source):
     """Report plugins whose committed source no longer matches a published version."""
     findings = []
@@ -905,7 +908,7 @@ def audit_versions(site, source):
                 verify_source_package(package, source, plugin=plugin)
                 findings.append((plugin, 'unchanged', str(version)))
             except (ValueError, subprocess.CalledProcessError) as error:
-                findings.append((plugin, 'changed without a version bump', str(version) + ': ' + str(error)))
+                findings.append((plugin, DRIFTED, str(version) + ': ' + str(error)))
     for plugin, state, detail in findings:
         print(plugin + ': ' + state + (' (' + detail + ')' if detail else ''))
     return findings
@@ -928,6 +931,11 @@ if __name__ == '__main__':
     elif args.prepare:
         prepare_release(args.site.resolve(), args.source.resolve(), args.source_commit or '', args.packages)
     elif args.audit:
-        audit_versions(args.site.resolve(), args.source.resolve())
+        # Unpublished and rejected plugins are reported only; drift must stop a release.
+        findings = audit_versions(args.site.resolve(), args.source.resolve())
+        # One version published under several ABI trees drifts once, not once per tree.
+        drifted = list(dict.fromkeys(plugin + ' ' + detail for plugin, state, detail in findings if state == DRIFTED))
+        if drifted:
+            raise ValueError('Source changed without a version bump: ' + '; '.join(drifted))
     else:
         verify(args.site.resolve(), args.source.resolve() if args.source else None)

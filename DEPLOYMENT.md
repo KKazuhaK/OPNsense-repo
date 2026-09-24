@@ -15,7 +15,7 @@ Copy the clean source revision to the recipe's native build host, excluding loca
 python3.13 -B -m unittest discover -s src/os-mihomo/tests -v
 python3.13 -B -m unittest discover -s src/os-sing-box/tests -v
 sh src/os-mihomo/tests/jail/run.sh \
-  src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.3.0.pkg legacy-1.0.2.pkg
+  src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.4.0.pkg legacy-1.0.2.pkg
 ```
 
 The harness requires root, VIMAGE, TUN and enough disk for its disposable filesystem. It creates an isolated VNET with synthetic upstreams and its own FIBs. It does not connect the jail to production interfaces. Its report identifies the exact package SHA-256 and executed checks. Test adapters replace OPNsense configd/filter/template/GUI infrastructure; actual package hooks, core, daemon, TUN, routes and Unbound are exercised. Remaining production checks are listed below.
@@ -27,8 +27,8 @@ Preserve a local legacy repo tree for compatibility downloads. Use the exact cle
 ```sh
 SOURCE_COMMIT=<tested-40-character-commit> \
   LEGACY_REPO=/path/to/legacy/repo \
-  sh build-repo.sh src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.3.0.pkg \
-    src/os-sing-box/dist/os-sing-box-1.1.5.pkg \
+  sh build-repo.sh src/os-mihomo/dist/FreeBSD:15:amd64/os-mihomo-1.4.0.pkg \
+    src/os-sing-box/dist/os-sing-box-1.1.6.pkg \
     src/os-kazuha-repo/dist/os-kazuha-repo-1.0.1.pkg
 python3 verify-repo.py .site --source .
 ```

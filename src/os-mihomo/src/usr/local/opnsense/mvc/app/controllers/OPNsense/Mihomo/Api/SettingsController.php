@@ -42,7 +42,7 @@ class SettingsController extends ApiControllerBase
 
     /* Fields the form owns. Anything absent keeps whatever is stored. */
     private const FLAGS = ['dns_fallback', 'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dashboard_any',
-                           'allow_lan'];
+                           'allow_lan', 'tcp_redirect'];
     private const CHOICES = ['dns_mode' => 'fake-ip', 'geo_source' => 'metacubex', 'device_mode' => 'off',
                              'tun_stack' => 'gvisor'];
     private const LISTS = ['dns_default', 'dns_nameserver', 'dns_proxy_nameserver', 'device_list', 'capture_interfaces'];

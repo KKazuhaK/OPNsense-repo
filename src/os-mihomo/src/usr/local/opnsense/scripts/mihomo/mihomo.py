@@ -27,7 +27,8 @@ import zlib
 from urllib import parse as urlparse, request as urlrequest
 
 import yaml
-from process_owner import OwnershipError, core_group, valid_identity, watch_group
+from process_owner import (OwnershipError, REDIRECT_LISTENER, REDIRECT_PORT, core_group,
+                           valid_identity, watch_group)
 
 MAX_CONFIG = 16 * 1024 * 1024
 MAX_BACKUP = 24 * 1024 * 1024
@@ -36,7 +37,7 @@ BACKUP_KEYS = ('subscription_url', 'secret', 'device', 'service_enabled', 'trans
                'tun_stack', 'tun_mtu', 'dns_mode', 'dns_hijack', 'dns_fallback', 'router_dns',
                'dns_override', 'ipv6', 'geo_source', 'dns_default', 'dns_nameserver',
                'dns_proxy_nameserver',
-               'device_mode', 'device_list', 'capture_interfaces', 'controller')
+               'device_mode', 'device_list', 'capture_interfaces', 'controller', 'tcp_redirect')
 BACKUP_WARNING = 'The operation completed, but the Mihomo configuration backup could not be updated.'
 BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. The current local configuration is retained. '
                             'Stop the service and use Repair saved backup to validate and import the edited backup.')
@@ -927,6 +928,22 @@ def switch_overrides(overlay):
     return out
 
 
+def redirect_conflict(result):
+    """Name the first configured listener that already takes the redirect port."""
+    for key in ('port', 'socks-port', 'mixed-port', 'redir-port', 'tproxy-port'):
+        if type(result.get(key)) is int and result[key] == REDIRECT_PORT:
+            return key
+    for key, value in (('dns.listen', (result.get('dns') or {}).get('listen', '')),
+                       ('external-controller', result.get('external-controller', '')),
+                       ('external-controller-tls', result.get('external-controller-tls', ''))):
+        if isinstance(value, str) and value.rsplit(':', 1)[-1] == str(REDIRECT_PORT):
+            return key
+    for listener in result.get('listeners') or []:
+        if isinstance(listener, dict) and type(listener.get('port')) is int and listener['port'] == REDIRECT_PORT:
+            return 'listeners'
+    return None
+
+
 def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_advertised=False):
     result = merge_yaml(baseline(data), data)
     router_dns = settings.get('router_dns', False)
@@ -980,12 +997,27 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
             port = value.rsplit(':', 1)[-1]
             if not re.fullmatch('[0-9]{1,5}', port) or not 0 <= int(port) <= 65535 or int(port) == 53:
                 raise Error('Listeners require a numeric port other than 53.')
-    for listener in result.get('listeners', []):
+    listeners = result.get('listeners')
+    if listeners is None:
+        listeners = []
+    if not isinstance(listeners, list):
+        raise Error('Additional listeners must be a list.')
+    for listener in listeners:
         if not isinstance(listener, dict):
             raise Error('Additional listeners must be mappings.')
         port = listener.get('port', 0)
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535 or port == 53:
             raise Error("Additional listeners cannot bind port 53.")
+        if listener.get('name') == REDIRECT_LISTENER:
+            raise Error('The listener name %s is reserved.' % REDIRECT_LISTENER)
+    # Transparent TCP reaches the core through a PF redirect to this loopback
+    # listener. It is added after every merge so YAML cannot move or drop it,
+    # and left out when the port is taken; routing then keeps TCP on the TUN.
+    if tun.get('enable') is True and settings.get('tcp_redirect') is True and redirect_conflict(result) is None:
+        listeners.append({'name': REDIRECT_LISTENER, 'type': 'redir',
+                          'port': REDIRECT_PORT, 'listen': '127.0.0.1'})
+    if listeners or 'listeners' in result:
+        result['listeners'] = listeners
     # Device selection belongs to native source routing before the TUN. It must
     # never rewrite provider rules or restrict clients using an explicit proxy.
     result['rules'] = result.get('rules', [])
@@ -1753,10 +1785,28 @@ class System:
         integration = integration_state(result.stdout)
         context = Path(STATE) / 'routing-context.json'
         missing_context = context.is_symlink() or not context.is_file()
-        if retry or integration['filter_changed'] or missing_context:
+        if retry or integration['filter_changed'] or missing_context or self.redirect_hook_missing():
             self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
         pending.unlink(missing_ok=True)
         self.routing('enable')
+
+    def redirect_hook_missing(self):
+        """Whether the TCP redirect listener is configured but PF never evaluates its rules.
+
+        A package upgrade does not reload the filter, so the rdr-anchor hook the
+        plugin registers appears only with the next reload.
+        """
+        try:
+            config = parse_yaml((Path(STATE) / 'config.yaml').read_bytes())
+        except (Error, OSError):
+            return False
+        listeners = config.get('listeners')
+        if not isinstance(listeners, list) or not any(
+                isinstance(item, dict) and item.get('name') == REDIRECT_LISTENER for item in listeners):
+            return False
+        result = self.run(['/sbin/pfctl', '-sn'], check=False)
+        return result.returncode == 0 and 'rdr-anchor "mihomo" all' not in [
+            line.strip() for line in result.stdout.decode(errors='replace').splitlines()]
 
     def restore_integration(self, settings, payload):
         # Early boot restores only configuration; normal boot starts services.
@@ -2163,7 +2213,8 @@ class Manager:
                     if field not in stored or stored[field] == '':
                         continue
                     fallback = settings.get(field, [] if field in (*DNS_SERVER_FIELDS, 'device_list', 'capture_interfaces') else
-                                            'off' if field == 'device_mode' else LOOPBACK_CONTROLLER)
+                                            'off' if field == 'device_mode' else False if field == 'tcp_redirect'
+                                            else LOOPBACK_CONTROLLER)
                     decoded = json.loads(stored[field]) if not isinstance(fallback, str) else self._backup_text(stored[field])
                     if isinstance(fallback, bool) and type(decoded) is int and decoded in (0, 1):
                         decoded = bool(decoded)
@@ -2365,8 +2416,8 @@ class Manager:
 
     def check_settings(self, settings):
         for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns',
-                    'dns_override', 'ipv6', 'dns_hijack', 'allow_lan'):
-            if key not in settings and key in SWITCH_DEFAULTS:
+                    'dns_override', 'ipv6', 'dns_hijack', 'allow_lan', 'tcp_redirect'):
+            if key not in settings and (key in SWITCH_DEFAULTS or key == 'tcp_redirect'):
                 continue
             if not isinstance(settings.get(key), bool):
                 raise Error("Service policies must be boolean values.")
@@ -2431,16 +2482,23 @@ class Manager:
     def publish_status(self, settings=None, dns_active=False, error=""):
         settings = settings or self.settings()
         running = self.system.running()
-        routing_active = False
+        routing_active = tcp_redirect = False
         with contextlib.suppress(OSError, ValueError, TypeError):
             routing = json.loads((self.state / 'routing-state.json').read_bytes())
             routing_active = running and settings['transparent'] and isinstance(routing, dict) and routing.get('active') is True
+            tcp_redirect = routing_active and type(routing.get('tcp_redirect_port')) is int
+        redirect_note = ''
+        if settings.get('tcp_redirect') is True and routing_active and not tcp_redirect:
+            redirect_note = ('TCP stays on the TUN: port %d is taken by another listener.' % REDIRECT_PORT
+                             if not self.redirect_configured() else
+                             'TCP stays on the TUN until the core listener and the firewall redirect hook are ready.')
         overrides = []
         if self.merge_file.exists():
             with contextlib.suppress(Error, OSError):
                 overrides = switch_overrides(parse_yaml(self.merge_file.read_bytes()))
         status = {"running": running, "transparent": settings["transparent"],
-                  "routing_active": routing_active,
+                  "routing_active": routing_active, "tcp_redirect": tcp_redirect,
+                  "tcp_redirect_note": redirect_note,
                   "dns_active": dns_active, "dns_fallback": settings["dns_fallback"],
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
                   "error": bounded_routing_diagnostic(error), "backup_warning": self.backup_warning_file.read_text()
@@ -2448,6 +2506,13 @@ class Manager:
                       if self.proxy_warning_file.exists() else '', "updated": time.time()}
         atomic_write(self.status_file, json.dumps(status).encode(), 0o644)
         return status
+
+    def redirect_configured(self):
+        with contextlib.suppress(Error, OSError):
+            listeners = parse_yaml(self.config_file.read_bytes()).get('listeners')
+            return isinstance(listeners, list) and any(
+                isinstance(item, dict) and item.get('name') == REDIRECT_LISTENER for item in listeners)
+        return False
 
     def log(self, message):
         message = time.strftime("[%Y-%m-%d %H:%M:%S] ") + message + "\n"
@@ -2963,9 +3028,13 @@ class Manager:
             for key in ("subscription_url", "secret", "device", "dns_fallback",
                         'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
                         'device_mode', 'device_list', 'capture_interfaces', 'mixed_port', 'socks_port',
-                        'allow_lan', 'bind_address', 'tun_stack', 'tun_mtu', *DNS_SERVER_FIELDS):
+                        'allow_lan', 'bind_address', 'tun_stack', 'tun_mtu', 'tcp_redirect', *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
+            if settings.get('tcp_redirect') is True and any(
+                    key in value and settings.get(key) == REDIRECT_PORT for key in ('mixed_port', 'socks_port')):
+                raise Error('Port %d is used by the transparent TCP listener, so the mixed and SOCKS ports '
+                            'cannot take it while TCP redirection is on.' % REDIRECT_PORT)
             if 'capture_interfaces' in value:
                 settings['capture_interfaces'] = capture_interfaces(value['capture_interfaces'])
             if 'dashboard_any' in value:

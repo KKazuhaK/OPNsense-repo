@@ -29,6 +29,10 @@ CORE_JOURNAL = STATE + '/process-identity.json'
 WATCH_PARENT_PID = '/var/run/mihomo-watch.pid'
 WATCH_CHILD_PID = '/var/run/mihomo-watch-child.pid'
 WATCH_JOURNAL = STATE + '/watch-process-identity.json'
+# The core's loopback listener for PF-redirected transparent TCP. Both the
+# config renderer and the routing adapter must agree on it exactly.
+REDIRECT_LISTENER = 'opnsense-transparent-tcp'
+REDIRECT_PORT = 7894
 
 
 class OwnershipError(RuntimeError):

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 
 import yaml
 
@@ -60,6 +61,13 @@ class Kernel:
         self.empty_header_only = False
         self.diagnosis = b''
         self.delays = []
+        # TCP redirection: the root rdr-anchor hook, the core's listener as
+        # sockstat reports it, and translation rules the plugin does not own.
+        self.hooked = False
+        self.listener_rows = []
+        self.foreign_translation = ''
+        self.translation_flushed = False
+        self.flushed_tables = []
 
     def delay(self, seconds):
         self.delays.append(seconds)
@@ -102,9 +110,30 @@ class Kernel:
         elif args[:4] == ['/sbin/pfctl', '-a', m.ANCHOR, '-sr']:
             # Real pfctl -sr omits table definitions.
             output = ('\n'.join(line for line in self.anchor.splitlines() if line.startswith('match '))).encode()
+        elif args == ['/sbin/pfctl', '-sn']:
+            output = b'nat-anchor "acme-client/*" all\nrdr-anchor "acme-client/*" all\n'
+            if self.hooked:
+                output += b'rdr-anchor "mihomo" all\n'
+        elif args == ['/sbin/pfctl', '-a', m.ANCHOR, '-sn']:
+            # The printed forms pfctl 15.1 uses for the generated rules.
+            printed = [] if self.translation_flushed else [
+                line.replace(' to !<', ' to ! <').replace(' to any port 53', ' to any port = domain')
+                for line in self.anchor.splitlines() if line.startswith(('rdr ', 'no rdr '))]
+            output = '\n'.join(printed + [line for line in [self.foreign_translation] if line]).encode()
+        elif args == ['/sbin/pfctl', '-a', m.ANCHOR, '-sT']:
+            output = '\n'.join(line.split('<')[1].split('>')[0] for line in self.anchor.splitlines()
+                               if line.startswith('table ')).encode()
+        elif args[:4] == ['/sbin/pfctl', '-a', m.ANCHOR, '-t'] and args[5:] == ['-T', 'flush']:
+            self.flushed_tables.append(args[4])
+        elif args[0] == '/usr/bin/sockstat':
+            assert args == ['/usr/bin/sockstat', '-4', '-l', '-q', '-P', 'tcp', '-p', str(m.REDIRECT_PORT)], args
+            output = ''.join('root mihomo %s 5 tcp4 %s *:*\n' % row for row in self.listener_rows).encode()
         elif args[:3] == ['/sbin/pfctl', '-a', m.ANCHOR]:
             if '-f' in args:
                 self.anchor = Path(args[-1]).read_text()
+                # A load replaces every rule of the anchor, foreign ones included.
+                self.foreign_translation = ''
+                self.translation_flushed = False
         elif args == ['/sbin/pfctl', '-ss', '-vv']:
             output = self.states.encode()
         elif args[:3] == ['/sbin/pfctl', '-k', 'id']:
@@ -588,6 +617,163 @@ class RoutingTests(unittest.TestCase):
         self.write_inputs()
         self.assertFalse(self.routing.execute('refresh')['active'])
         self.assertNotIn('awaiting_sources', self.routing.load())
+
+    REDIRECTED = ('all tcp 127.0.0.1:%d (203.0.113.9:443) <- 10.0.0.5:5000       ESTABLISHED:ESTABLISHED\n'
+                  '   age 00:00:01, expires in 00:01:00, rule 1\n'
+                  '   id: %016x creatorid: 11223344\n')
+
+    def ready_redirect(self, pid=4242):
+        """Everything the fast TCP path needs: setting, listener, hook, owning core."""
+        self.settings['tcp_redirect'] = True
+        self.config['listeners'] = [{'name': m.REDIRECT_LISTENER, 'type': 'redir',
+                                     'port': m.REDIRECT_PORT, 'listen': '127.0.0.1'}]
+        self.write_inputs()
+        self.kernel.hooked = True
+        self.kernel.listener_rows = [(str(pid), '127.0.0.1:%d' % m.REDIRECT_PORT)]
+        group = MagicMock()
+        group.discover.return_value = {'child': {'pid': pid}}
+        group.same.return_value = True
+        patcher = patch.object(m, 'core_group', return_value=group)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return group
+
+    def translation(self):
+        return [line for line in self.kernel.anchor.splitlines() if line.startswith(('rdr ', 'no rdr '))]
+
+    def test_tcp_redirect_loads_only_for_an_owned_listener_behind_a_hooked_anchor(self):
+        self.ready_redirect()
+        result = self.routing.execute('enable')
+        self.assertTrue(result['active'])
+        self.assertEqual(m.REDIRECT_PORT, result['tcp_redirect_port'])
+        self.assertEqual([
+            'no rdr on vtnet1 inet proto tcp from <mihomo_sources_0> to any port 53',
+            'rdr on vtnet1 inet proto tcp from <mihomo_sources_0> to !<mihomo_local> -> 127.0.0.1 port %d'
+            % m.REDIRECT_PORT], self.translation())
+        lines = self.kernel.anchor.splitlines()
+        self.assertLess(max(index for index, line in enumerate(lines) if line.startswith(('rdr ', 'no rdr '))),
+                        min(index for index, line in enumerate(lines) if line.startswith('match ')))
+        self.assertIn('match in on vtnet1 inet proto tcp from <mihomo_sources_0>', self.kernel.anchor)
+        cases = [
+            ('setting off', lambda group: self.settings.update(tcp_redirect=False)),
+            ('listener not rendered', lambda group: self.config.pop('listeners')),
+            ('listener on another address', lambda group: self.config.update(listeners=[dict(
+                self.config['listeners'][0], listen='0.0.0.0')])),
+            ('listener duplicated', lambda group: self.config['listeners'].append(dict(self.config['listeners'][0]))),
+            ('filter never reloaded', lambda group: setattr(self.kernel, 'hooked', False)),
+            ('port held by another process', lambda group: setattr(
+                self.kernel, 'listener_rows', [('999', '127.0.0.1:%d' % m.REDIRECT_PORT)])),
+            ('wildcard listener beside the core', lambda group: self.kernel.listener_rows.append(
+                ('999', '*:%d' % m.REDIRECT_PORT))),
+            ('listener not bound yet', lambda group: setattr(self.kernel, 'listener_rows', [])),
+            ('core not recorded', lambda group: setattr(group.discover, 'return_value', None)),
+            ('core replaced', lambda group: setattr(group.same, 'return_value', False)),
+        ]
+        for name, change in cases:
+            with self.subTest(name):
+                group = self.ready_redirect()
+                self.routing.execute('refresh')
+                self.assertEqual(2, len(self.translation()))
+                change(group)
+                self.write_inputs()
+                result = self.routing.execute('refresh')
+                self.assertTrue(result['active'])
+                self.assertNotIn('tcp_redirect_port', result)
+                self.assertEqual([], self.translation())
+                self.assertIn('match in on vtnet1 inet proto tcp from <mihomo_sources_0>', self.kernel.anchor)
+
+    def test_redirect_refresh_stays_quiet_and_restores_a_flushed_translation(self):
+        self.ready_redirect()
+        self.routing.execute('enable')
+        self.kernel.calls.clear()
+        self.routing.execute('refresh')
+        self.assertFalse(any(args[0] == '/sbin/pfctl' and '-f' in args for args in self.kernel.calls))
+        self.assertFalse(any(route_mutation(args) for args in self.kernel.calls))
+        self.kernel.translation_flushed = True
+        self.routing.execute('refresh')
+        self.assertTrue(any(args[0] == '/sbin/pfctl' and '-f' in args for args in self.kernel.calls))
+        self.assertEqual(2, len(self.translation()))
+        self.assertFalse(self.kernel.translation_flushed)
+
+    def test_losing_the_listener_returns_tcp_to_the_tun_and_drops_redirected_states(self):
+        self.ready_redirect()
+        fib = self.routing.execute('enable')['fib']
+        self.kernel.states = self.REDIRECTED % (m.REDIRECT_PORT, 0xaa) + state(1, fib)
+        self.kernel.listener_rows = []
+        result = self.routing.execute('refresh')
+        self.assertTrue(result['active'])
+        self.assertNotIn('tcp_redirect_port', self.routing.load())
+        # Only connections bound to the withdrawn listener are dropped.
+        self.assertEqual(['00000000000000aa/11223344'], self.kernel.killed)
+        self.assertEqual([], self.translation())
+
+    def test_disable_withdraws_the_redirect_and_every_owned_state(self):
+        self.ready_redirect()
+        fib = self.routing.execute('enable')['fib']
+        self.kernel.states = (self.REDIRECTED % (m.REDIRECT_PORT, 0xaa) + state(1, fib)
+                              + self.REDIRECTED % (7999, 0xbb) + state(2, 0))
+        result = self.routing.execute('disable')
+        self.assertFalse(result['active'])
+        self.assertNotIn('tcp_redirect_port', result)
+        self.assertEqual('', self.kernel.anchor)
+        self.assertEqual(['0000000000000001/11223344', '00000000000000aa/11223344'], sorted(self.kernel.killed))
+        self.assertNotIn('tcp_redirect_port', self.routing.load())
+
+    def test_foreign_translation_rule_fails_closed_unflushed_and_empties_owned_sources(self):
+        self.ready_redirect()
+        fib = self.routing.execute('enable')['fib']
+        foreign = 'rdr on vtnet1 inet proto tcp from any to any port = http -> 10.0.0.9 port 3128'
+        self.kernel.foreign_translation = foreign
+        with self.assertRaises(m.RoutingError):
+            self.routing.execute('refresh')
+        self.assertEqual(foreign, self.kernel.foreign_translation)
+        self.assertEqual(['mihomo_sources_0'], self.kernel.flushed_tables)
+        record = self.routing.load()
+        self.assertFalse(record['active'])
+        self.assertTrue(record['pending'])
+        self.assertEqual(self.kernel.tables[fib]['4:0.0.0.0/0%']['gateway'], '192.0.2.1')
+
+    def test_first_redirect_enable_journals_the_port_before_loading_the_anchor(self):
+        # A failure right after the load must still find the translated states;
+        # the port therefore has to be durable before the rules exist.
+        self.ready_redirect()
+        self.kernel.states = self.REDIRECTED % (m.REDIRECT_PORT, 0xaa)
+        saved = []
+        original_save, original_anchor = self.routing.save, self.routing.anchor
+
+        def save(record):
+            saved.append(dict(record))
+            return original_save(record)
+
+        def anchor(content):
+            if content:
+                self.assertEqual(m.REDIRECT_PORT, saved[-1].get('tcp_redirect_port'))
+                self.assertTrue(saved[-1]['pending'])
+            original_anchor(content)
+            if content:
+                raise m.RoutingError('injected failure after the load')
+
+        with patch.object(self.routing, 'save', side_effect=save), \
+                patch.object(self.routing, 'anchor', side_effect=anchor), \
+                self.assertRaises(m.RoutingError):
+            self.routing.execute('enable')
+        self.assertIn('00000000000000aa/11223344', self.kernel.killed)
+        self.assertEqual('', self.kernel.anchor)
+        self.assertNotIn('tcp_redirect_port', self.routing.load())
+
+    def test_journaled_port_lets_recovery_drop_redirected_states_after_a_crash(self):
+        self.ready_redirect()
+        self.routing.execute('enable')
+        record = self.routing.load()
+        record.update(active=False, pending=True)
+        self.routing.save(record)
+        self.kernel.alive = False
+        self.kernel.states = self.REDIRECTED % (m.REDIRECT_PORT, 0xaa)
+        result = self.routing.execute('refresh')
+        self.assertFalse(result['active'])
+        self.assertIn('00000000000000aa/11223344', self.kernel.killed)
+        self.assertNotIn('tcp_redirect_port', self.routing.load())
+        self.assertEqual('', self.kernel.anchor)
 
     def test_marker_requires_private_regular_file(self):
         self.routing.execute('enable')

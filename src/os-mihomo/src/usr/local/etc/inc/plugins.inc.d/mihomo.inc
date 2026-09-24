@@ -78,6 +78,11 @@ function mihomo_firewall(\OPNsense\Firewall\Plugin $fw)
     /* Source selection must not pass packets around the administrator's
        filtering rules. The runtime anchor contains only non-quick matches. */
     $fw->registerAnchor('mihomo', 'fw', 1, 'head', false);
+    /* With TCP redirection on, the same anchor also holds rdr rules sending
+       selected IPv4 TCP to the core's loopback listener. Tail placement keeps
+       port forwards, reflection and captive portal redirects first; rdr
+       anchors take no quick flag. Empty unless the listener is verified. */
+    $fw->registerAnchor('mihomo', 'rdr', 1, 'tail', false);
     $lines = [];
     exec('/sbin/ifconfig -a', $lines);
     $context = mihomo_routing_context($fw->getInterfaceMapping(), $lines);

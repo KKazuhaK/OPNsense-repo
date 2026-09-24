@@ -385,6 +385,62 @@ class ControllerTests(unittest.TestCase):
             manager.check_settings(dict(self.settings, controller=m.ANY_CONTROLLER, secret=''))
 
 
+class RedirectListenerTests(unittest.TestCase):
+    """The fast TCP path's loopback listener is plugin policy, like the controller."""
+    OWNED = {'name': m.REDIRECT_LISTENER, 'type': 'redir', 'port': m.REDIRECT_PORT, 'listen': '127.0.0.1'}
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', **m.SWITCH_DEFAULTS,
+                         'tcp_redirect': True}
+        self.data = m.parse_yaml(SUBSCRIPTION)
+        self.data.pop('dns', None)
+
+    def rendered(self, overlay=None, preset='full', **settings):
+        base = m.parse_yaml((m.Path(m.__file__).resolve().parents[3]
+                             / ('share/mihomo/presets/' + preset + '.yaml')).read_bytes())
+        merged = m.merge_yaml(base, overlay or {})
+        return m.parse_yaml(m.render(self.data, {**self.settings, **settings}, overlay=merged))
+
+    def owned(self, generated):
+        return [item for item in generated.get('listeners') or [] if item.get('name') == m.REDIRECT_LISTENER]
+
+    def test_listener_exists_only_for_the_transparent_tun_with_the_setting_on(self):
+        self.assertEqual([self.OWNED], self.owned(self.rendered()))
+        self.assertEqual([self.OWNED], self.owned(self.rendered(preset='tun-only')))
+        self.assertEqual([], self.owned(self.rendered(tcp_redirect=False)))
+        self.assertEqual([], self.owned(self.rendered(transparent=False)))
+        self.assertEqual([], self.owned(self.rendered(preset='proxy-only')))
+        self.settings.pop('tcp_redirect')
+        generated = self.rendered()
+        self.assertEqual([], self.owned(generated))
+        self.assertNotIn('listeners', generated)
+
+    def test_merge_yaml_cannot_drop_move_or_claim_the_listener(self):
+        user = {'name': 'lan-socks', 'type': 'socks', 'port': 7900, 'listen': '0.0.0.0'}
+        self.assertEqual([user, self.OWNED], self.rendered({'listeners': [user]})['listeners'])
+        self.assertEqual([self.OWNED], self.rendered({'listeners': []})['listeners'])
+        self.assertEqual([self.OWNED], self.rendered({'listeners': None})['listeners'])
+        with self.assertRaisesRegex(m.Error, 'reserved'):
+            self.rendered({'listeners': [dict(self.OWNED, port=7999)]})
+        with self.assertRaisesRegex(m.Error, 'must be a list'):
+            self.rendered({'listeners': {'name': 'lan-socks'}})
+        # LAN exposure settings never move it off loopback.
+        self.assertEqual([self.OWNED], self.owned(self.rendered(allow_lan=True, bind_address='*')))
+
+    def test_a_taken_port_leaves_the_listener_out_without_failing_the_render(self):
+        collisions = [({'redir-port': m.REDIRECT_PORT}, {}), ({'tproxy-port': m.REDIRECT_PORT}, {}),
+                      ({'port': m.REDIRECT_PORT}, {}),
+                      ({'listeners': [{'name': 'lan-socks', 'type': 'socks', 'port': m.REDIRECT_PORT}]}, {}),
+                      ({'external-controller-tls': '127.0.0.1:%d' % m.REDIRECT_PORT}, {}),
+                      ({'mixed-port': m.REDIRECT_PORT}, {}), ({'socks-port': m.REDIRECT_PORT}, {}),
+                      ({}, {'controller': '127.0.0.1:%d' % m.REDIRECT_PORT})]
+        for overlay, settings in collisions:
+            with self.subTest(overlay=overlay, settings=settings):
+                self.assertEqual([], self.owned(self.rendered(overlay, **settings)))
+        self.assertIsNone(m.redirect_conflict({'mixed-port': 7890, 'dns': {'listen': '127.0.0.1:1053'}}))
+        self.assertEqual('dns.listen', m.redirect_conflict({'dns': {'listen': '127.0.0.1:%d' % m.REDIRECT_PORT}}))
+
+
 class CaptureInterfaceTests(unittest.TestCase):
     """Which interfaces transparent routing may capture from, and how that reads."""
 
@@ -1206,6 +1262,36 @@ class IntegrationReloadTests(unittest.TestCase):
                 with patch.object(self.system, 'run', side_effect=self.runner(output)):
                     self.system.tun()
                 self.assertEqual(1, len(self.filter_reloads()))
+
+    def test_redirect_listener_reloads_the_filter_until_its_rdr_hook_exists(self):
+        (self.state / 'routing-context.json').write_text('{}')
+        listener = {'name': m.REDIRECT_LISTENER, 'type': 'redir', 'port': m.REDIRECT_PORT, 'listen': '127.0.0.1'}
+        base = self.runner()
+
+        def with_hook(hooked):
+            def run(args, **kwargs):
+                if args == ['/sbin/pfctl', '-sn']:
+                    self.calls.append(args)
+                    hooks = b'rdr-anchor "acme-client/*" all\n' + (b'rdr-anchor "mihomo" all\n' if hooked else b'')
+                    return subprocess.CompletedProcess(args, 0, hooks, b'')
+                return base(args, **kwargs)
+            return run
+
+        # A package upgrade renders the listener but never reloads the filter.
+        (self.state / 'config.yaml').write_text(m.yaml.safe_dump({'listeners': [listener]}))
+        with patch.object(self.system, 'run', side_effect=with_hook(False)):
+            self.system.tun()
+        self.assertEqual(1, len(self.filter_reloads()))
+        self.calls.clear()
+        with patch.object(self.system, 'run', side_effect=with_hook(True)):
+            self.system.tun()
+        self.assertEqual([], self.filter_reloads())
+        self.calls.clear()
+        (self.state / 'config.yaml').write_text('listeners: []\n')
+        with patch.object(self.system, 'run', side_effect=with_hook(False)):
+            self.system.tun()
+        self.assertEqual([], self.filter_reloads())
+        self.assertNotIn(['/sbin/pfctl', '-sn'], self.calls)
 
     def test_failed_filter_reload_keeps_receipt_and_retry_cannot_skip_it(self):
         (self.state / 'routing-context.json').write_text('{}')

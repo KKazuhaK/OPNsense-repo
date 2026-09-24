@@ -193,6 +193,34 @@ class RoutingTests(unittest.TestCase):
             path.write_text(json.dumps(value))
             path.chmod(0o600)
 
+    def test_tcp_redirect_machinery_never_runs_for_sing_box(self):
+        # The shared module's redirect path is Mihomo's opt-in; sing-box keeps
+        # the exact TUN-only commands, anchor text and status.
+        self.assertFalse(m.Routing.TCP_REDIRECT)
+        self.assertNotIn('TCP_REDIRECT', vars(m.Routing))
+        self.assertNotIn('redirect_port', vars(m.Routing))
+        results = [self.routing.execute(action) for action in ('enable', 'refresh', 'disable', 'enable')]
+        self.assertTrue(results[-1]['active'])
+        for args in self.kernel.calls:
+            self.assertNotIn('-sn', args)
+            self.assertNotIn('/usr/bin/sockstat', args)
+            self.assertNotIn('-sT', args)
+        self.assertFalse(any(line.startswith(('rdr ', 'no rdr ')) for line in self.kernel.anchor.splitlines()))
+        for result in results:
+            self.assertNotIn('tcp_redirect_port', result)
+        self.assertNotIn('tcp_redirect_port', self.routing.load())
+
+    def test_foreign_anchor_rule_never_triggers_redirect_cleanup_for_sing_box(self):
+        self.routing.execute('enable')
+        self.kernel.anchor += '\nmatch in on vtnet1 label "operator"\n'
+        with self.assertRaises(m.RoutingError):
+            self.routing.execute('disable')
+        self.assertIn('operator', self.kernel.anchor)
+        for args in self.kernel.calls:
+            self.assertNotIn('-sT', args)
+            self.assertNotIn('flush', args)
+            self.assertNotIn('-sn', args)
+
     def test_withdrawn_capture_rearms_when_a_lan_address_appears(self):
         # A LAN that comes up after the core leaves nothing to capture at
         # first; the periodic refresh must arm capture once it has an address.

@@ -34,8 +34,8 @@ __all__ = [
     'DETAIL', 'DEVICE_LIMIT', 'IFNAME', 'LIMIT', 'MAX_CONFIG', 'MAX_STATES',
     'RESERVE_ATTEMPTS', 'RESERVE_BACKOFF', 'ROUTE_LIMIT', 'RouteControlError',
     'RoutingError', 'RoutingMutationAmbiguous', 'TunPolicyRouting', 'capture_states', 'failure', 'network',
-    'foreign_rtable_rules', 'normalize_context', 'parse_routes', 'route_identity', 'route_key',
-    'route_semantic', 'source_networks', 'state_tuple',
+    'foreign_rtable_rules', 'normalize_context', 'parse_routes', 'redirect_states', 'route_identity',
+    'route_key', 'route_semantic', 'source_networks', 'state_tuple', 'valid_redirect_port',
 ]
 
 
@@ -198,6 +198,31 @@ def capture_states(text, fib, tun):
     return list(dict.fromkeys(result))
 
 
+def valid_redirect_port(value):
+    """A loopback TCP redirect port: an integer listener port other than DNS."""
+    return type(value) is int and 1 <= value <= 65535 and value != 53
+
+
+def redirect_states(text, port):
+    """Select states PF translated to the core's loopback redirect listener."""
+    if len(text.encode()) > MAX_STATES:
+        raise RoutingError('The firewall state table exceeds its supported limit.')
+    result = []
+    headline = re.compile(r'\S+\s+tcp\s+127\.0\.0\.1:' + str(port)
+                          + r'\s+\(\S+\)\s+<-\s+\S+\s+\S+\s*')
+    for block in re.split(r'(?m)(?=^\S)', text):
+        # The parenthesized original destination marks a translated state; an
+        # untranslated connection to the listener is not one of ours.
+        if not block or not headline.fullmatch(block.splitlines()[0]):
+            continue
+        found = re.search(
+            r'\bid:\s+([0-9a-fA-F]{16})\s+creatorid:\s+([0-9a-fA-F]{8})\b', block)
+        if not found:
+            raise RoutingError('A redirected firewall state has no valid identifier.')
+        result.append(found.group(1).lower() + '/' + found.group(2).lower())
+    return list(dict.fromkeys(result))
+
+
 def foreign_rtable_rules(text, fib, anchor, label):
     """Find recursive PF rules that reuse a plugin's private routing table."""
     if len(text.encode()) > MAX_CONFIG:
@@ -244,6 +269,9 @@ class TunPolicyRouting:
     NATIVE_HELPER = None
     ROUTING_LOCK = None
     SINGLE_FIB_FALLBACK = False
+    # Adapters whose core listens for PF-redirected TCP opt in; every other
+    # adapter keeps exactly the TUN-only anchor, commands and status.
+    TCP_REDIRECT = False
 
     def __init__(self, root=Path('/'), run=None, delay=None):
         required = (self.STATE, self.TUN, self.ANCHOR, self.LABEL,
@@ -318,6 +346,8 @@ class TunPolicyRouting:
             for key, route in record['routes'].items():
                 self.validate_record_route(key, route)
             if len(record['routes']) > ROUTE_LIMIT:
+                raise ValueError
+            if 'tcp_redirect_port' in record and not valid_redirect_port(record['tcp_redirect_port']):
                 raise ValueError
             pending_route = record.get('pending_route')
             if pending_route is not None:
@@ -420,6 +450,34 @@ class TunPolicyRouting:
         """Return settings, routing context and whether IPv6 is enabled."""
         raise NotImplementedError
 
+    def redirect_port(self, settings):
+        """Return the loopback TCP redirect port the running core verifiably owns, or None."""
+        return None
+
+    def redirect_target(self, settings):
+        """Redirect TCP only to a listener the core owns, through a hooked anchor.
+
+        Without either, captured TCP stays on the TUN, so a missing listener
+        or an unhooked anchor slows flows down but never lets them bypass.
+        """
+        if not self.TCP_REDIRECT:
+            return None
+        port = self.redirect_port(settings)
+        if port is None:
+            return None
+        if not valid_redirect_port(port):
+            raise RoutingError('The TCP redirect port is invalid.')
+        return port if self.rdr_anchor_hooked() else None
+
+    def rdr_anchor_hooked(self):
+        """Whether the loaded main ruleset evaluates this anchor's translation rules."""
+        value = self.command(['/sbin/pfctl', '-sn'], check=False, limit=MAX_CONFIG)
+        if value.returncode:
+            return False
+        hook = 'rdr-anchor "%s" all' % self.ANCHOR
+        return any(line.strip() == hook
+                   for line in value.stdout.decode(errors='replace').splitlines())
+
     def anchor(self, content):
         self.check_anchor()
         fd, name = tempfile.mkstemp(prefix='.routing-pf-', dir=self.state)
@@ -433,12 +491,60 @@ class TunPolicyRouting:
             os.unlink(name)
 
     def check_anchor(self):
+        return self.anchor_rules()[0]
+
+    def anchor_rules(self):
+        """Return the anchor's filter and translation rules once both are owned."""
         current = self.command(
             ['/sbin/pfctl', '-a', self.ANCHOR, '-sr']).stdout.decode(errors='strict')
         if any(line.strip() and not self.owned_anchor_line(line)
                for line in current.splitlines()):
             raise RoutingError('The routing anchor contains rules owned elsewhere.')
-        return current
+        translation = ''
+        if self.TCP_REDIRECT:
+            # A load replaces the anchor's translation rules too, so a foreign
+            # one must stop it instead of being flushed without notice.
+            translation = self.command(
+                ['/sbin/pfctl', '-a', self.ANCHOR, '-sn']).stdout.decode(errors='strict')
+            if any(line.strip() and not self.owned_translation_line(line)
+                   for line in translation.splitlines()):
+                raise RoutingError('The routing anchor contains translation rules owned elsewhere.')
+        return current, translation
+
+    def owned_translation_line(self, line):
+        """Recognize only the TCP redirect rules this adapter can generate."""
+        line = re.sub(r'\s+', ' ', line.strip()).replace('to !<', 'to ! <')
+        prefix = re.escape(self.PF_PREFIX)
+        head = (r'on ' + IFNAME.pattern.rstrip('\\Z') + r' inet proto tcp from <'
+                + prefix + r'_sources_[0-9]+> ')
+        if re.fullmatch(r'no rdr ' + head + r'to any port = (?:53|domain)', line):
+            return True
+        found = re.fullmatch(r'rdr ' + head + r'to ! <' + prefix
+                             + r'_local> -> 127\.0\.0\.1 port ([0-9]{1,5})', line)
+        return found is not None and valid_redirect_port(int(found.group(1)))
+
+    def kill_redirect_states(self, port, text=None):
+        if text is None:
+            text = self.command(
+                ['/sbin/pfctl', '-ss', '-vv'], limit=MAX_STATES
+            ).stdout.decode(errors='strict')
+        for identifier in redirect_states(text, port):
+            self.command(['/sbin/pfctl', '-k', 'id', '-k', identifier])
+
+    def neutralize_sources(self):
+        """Empty the anchor's source tables when a foreign rule blocks clearing it.
+
+        Restoring the private FIB neutralizes the TUN match rules, but a
+        redirect keeps working without it; empty sources stop both without
+        touching the foreign rule.
+        """
+        with contextlib.suppress(RoutingError, OSError, UnicodeError):
+            tables = self.command(
+                ['/sbin/pfctl', '-a', self.ANCHOR, '-sT']).stdout.decode(errors='strict')
+            pattern = re.escape(self.PF_PREFIX) + r'_sources_[0-9]+'
+            for name in tables.split():
+                if re.fullmatch(pattern, name):
+                    self.command(['/sbin/pfctl', '-a', self.ANCHOR, '-t', name, '-T', 'flush'])
 
     def owned_anchor_line(self, line):
         """Recognize only rules this adapter can generate, not a shared label."""
@@ -728,7 +834,7 @@ class TunPolicyRouting:
                 snapshot[key] = inserted
                 self.save(record)
 
-    def policy(self, settings, context, native, families, fib):
+    def policy(self, settings, context, native, families, fib, redirect=None):
         interfaces, addresses = normalize_context(context, self.TUN)
         bypass = {
             str(ipaddress.ip_network(str(address) + (
@@ -749,6 +855,7 @@ class TunPolicyRouting:
                        '255.255.255.255/32', '::1/128', 'fe80::/10', 'ff00::/8'))
         local_table = self.PF_PREFIX + '_local'
         lines = ['table <%s> { %s }' % (local_table, ', '.join(sorted(bypass)))]
+        tables, translation, matches = [], [], []
         source_count, interface_count = 0, 0
         for index, (interface, lan) in enumerate(sorted(interfaces.items())):
             selected = [net for net in source_networks(lan, settings)
@@ -758,7 +865,16 @@ class TunPolicyRouting:
             interface_count += 1
             source_count += len(selected)
             table = self.PF_PREFIX + '_sources_' + str(index)
-            lines.append('table <%s> { %s }' % (table, ', '.join(map(str, selected))))
+            tables.append('table <%s> { %s }' % (table, ', '.join(map(str, selected))))
+            rules = []
+            if redirect is not None and 4 in families and any(net.version == 4 for net in selected):
+                # New IPv4 TCP reaches the core's loopback listener through the
+                # kernel stack. DNS stays on the TUN for its hijack, and the
+                # TUN match below still carries TCP whenever this is absent.
+                translation.append('no rdr on %s inet proto tcp from <%s> to any port 53'
+                                   % (interface, table))
+                translation.append('rdr on %s inet proto tcp from <%s> to !<%s> -> 127.0.0.1 port %d'
+                                   % (interface, table, local_table, redirect))
             for family in sorted(families):
                 if any(net.version == family for net in selected):
                     prefix = 'match in on %s %s ' % (
@@ -767,11 +883,18 @@ class TunPolicyRouting:
                     action = 'rtable %d label "%s"' % (fib, self.LABEL)
                     # An unmatched DNAT reply must not become a new captured
                     # LAN flow under an interface-bound state policy.
-                    lines.append(prefix + 'proto tcp ' + suffix
+                    rules.append(prefix + 'proto tcp ' + suffix
                                  + 'flags S/SA ' + action)
                     # ICMP forwarding in these cores is direct. Keep it on the
                     # native path, including diagnostics and PMTUD.
-                    lines.append(prefix + 'proto udp ' + suffix + action)
+                    rules.append(prefix + 'proto udp ' + suffix + action)
+            if redirect is None:
+                lines.extend(tables[-1:] + rules)
+            else:
+                matches.extend(rules)
+        if redirect is not None:
+            # PF parses translation rules only before any filter rule.
+            lines.extend(tables + translation + matches)
         return '\n'.join(lines) + '\n', interface_count, source_count
 
     def disable(self, record):
@@ -780,6 +903,7 @@ class TunPolicyRouting:
         record.update(active=False, pending=True, resume=False,
                       interface_count=0, source_count=0)
         self.save(record)
+        port = record.get('tcp_redirect_port')
         anchor_error = None
         try:
             self.anchor('')
@@ -787,9 +911,19 @@ class TunPolicyRouting:
             # Foreign anchor contents must remain intact. Restoring our FIB
             # default still removes capture without rewriting their rules.
             anchor_error = error
+            if port is not None:
+                # A redirect needs no private FIB, so restoring the FIB alone
+                # would leave it sending TCP to a listener about to stop.
+                self.neutralize_sources()
         if record['fib'] is None:
             if anchor_error is not None:
                 raise RoutingError('The routing anchor could not be cleared safely.') from None
+            if port is not None:
+                try:
+                    self.kill_redirect_states(port)
+                except (RoutingError, UnicodeError):
+                    raise RoutingError('Owned firewall state cleanup will be retried.') from None
+            record.pop('tcp_redirect_port', None)
             record.update(pending=False, fingerprint='')
             self.save(record)
             return self.status(record)
@@ -803,7 +937,10 @@ class TunPolicyRouting:
                 states = self.command(
                     ['/sbin/pfctl', '-ss', '-vv'], limit=MAX_STATES
                 ).stdout.decode(errors='strict')
-                for identifier in capture_states(states, record['fib'], self.TUN):
+                owned = capture_states(states, record['fib'], self.TUN)
+                if port is not None:
+                    owned += redirect_states(states, port)
+                for identifier in dict.fromkeys(owned):
                     self.command(['/sbin/pfctl', '-k', 'id', '-k', identifier])
             except (RoutingError, UnicodeError) as error:
                 state_error = error
@@ -828,6 +965,7 @@ class TunPolicyRouting:
         if (anchor_error is not None or state_error is not None
                 or collision_error is not None):
             raise RoutingError('Owned firewall state cleanup will be retried.') from None
+        record.pop('tcp_redirect_port', None)
         record.update(pending=False, fingerprint='')
         self.save(record)
         return self.status(record)
@@ -887,8 +1025,11 @@ class TunPolicyRouting:
         native = {key: route for key, route in system.items()
                   if route['interface'] != self.TUN}
         self.allocate(record)
+        redirect = self.redirect_target(settings) if 4 in families else None
         content, interface_count, source_count = self.policy(
-            settings, context, native, families, record['fib'])
+            settings, context, native, families, record['fib'], redirect)
+        if not any(line.startswith('rdr on ') for line in content.splitlines()):
+            redirect = None
         fingerprint = hashlib.sha256(
             json.dumps([content, native], sort_keys=True).encode()).hexdigest()
         desired = dict(native)
@@ -906,7 +1047,7 @@ class TunPolicyRouting:
             self.save(record)
             return result
         try:
-            current_anchor = self.check_anchor()
+            current_anchor, current_translation = self.anchor_rules()
             self.check_firewall_ownership(record)
         except RoutingError:
             # Do not trust a no-op refresh after another owner changed rules.
@@ -921,11 +1062,16 @@ class TunPolicyRouting:
             key in live and route_identity(route) == route_identity(live[key])
             for key, route in record['routes'].items())
         if (not refresh or fingerprint != record.get('fingerprint')
-                or not current_anchor.strip() or not intact):
+                or not current_anchor.strip() or not intact
+                or bool(current_translation.strip()) != (redirect is not None)):
             # A crash at any later instruction must leave enough durable state
             # for refresh to finish or withdraw capture safely.
+            previous = record.get('tcp_redirect_port')
             record.update(active=False, pending=True, resume=resume,
                           interface_count=0, source_count=0)
+            if redirect is not None:
+                # Journal the port first so recovery can find its states.
+                record['tcp_redirect_port'] = redirect
             self.save(record)
             try:
                 self.sync(record, desired, native=system)
@@ -934,6 +1080,12 @@ class TunPolicyRouting:
                 self.check_firewall_ownership(record)
                 if record.get('pending_route') is not None:
                     raise RoutingError('A private route mutation remains unsettled.')
+                if previous is not None and previous != redirect:
+                    # A translated state outlives its rule; drop connections
+                    # still bound to a listener this policy no longer uses.
+                    self.kill_redirect_states(previous)
+                if redirect is None:
+                    record.pop('tcp_redirect_port', None)
                 record.update(active=True, pending=False, resume=False,
                               fingerprint=fingerprint,
                               interface_count=interface_count,
@@ -950,10 +1102,13 @@ class TunPolicyRouting:
 
     @staticmethod
     def status(record):
-        return {key: record.get(key, 0)
-                for key in ('active', 'pending', 'fib',
-                            'interface_count', 'source_count',
-                            'route_recovery_ambiguous')}
+        result = {key: record.get(key, 0)
+                  for key in ('active', 'pending', 'fib',
+                              'interface_count', 'source_count',
+                              'route_recovery_ambiguous')}
+        if 'tcp_redirect_port' in record:
+            result['tcp_redirect_port'] = record['tcp_redirect_port']
+        return result
 
     def execute(self, action):
         self.state.mkdir(parents=True, exist_ok=True)

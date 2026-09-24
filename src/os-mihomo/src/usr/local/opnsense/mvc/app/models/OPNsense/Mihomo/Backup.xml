@@ -50,6 +50,7 @@
         <dns_fallback type="TextField"/>
         <router_dns type="TextField"/>
         <dns_override type="TextField"/>
+        <tcp_redirect type="TextField"/>
         <ipv6 type="TextField"/>
         <geo_source type="TextField"/>
         <dns_default type="TextField"/>

@@ -19,6 +19,8 @@ fi
 # Withdraw the unsafe 1.1.0 upgrade candidate while retaining 1.0.2 for rollback.
 find "$REPO_ROOT" -type f -name 'os-mihomo-1.1.0.pkg' -delete
 site_dir="$(dirname "$REPO_ROOT")"
+# Refuse to sign while a published version no longer matches its committed source.
+python3 "$SCRIPT_DIR/verify-repo.py" "$site_dir" --audit --source "$SCRIPT_DIR"
 # The signed report also records every superseded archive the catalogs no longer offer.
 python3 "$SCRIPT_DIR/verify-repo.py" "$site_dir" --prepare --source "$SCRIPT_DIR" --source-commit "$SOURCE_COMMIT" "$@"
 # Each catalog belongs to one ABI and, when dependencies differ, one series.

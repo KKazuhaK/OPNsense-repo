@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -670,6 +671,36 @@ class VersionAuditTests(SourceTree):
                 findings = verify.audit_versions(self.root, REPO)
             checked.assert_called_once_with(package, REPO, plugin='os-mihomo')
             self.assertEqual(state, next(state for name, state, _ in findings if name == 'os-mihomo'))
+
+    def test_audit_command_fails_on_drift_and_only_on_drift(self):
+        plugin = 'os-pftop'
+        site = self.root / 'site'
+        published = site / 'repo' / NATIVE / 'All'
+        published.mkdir(parents=True)
+        build_package(published, REPO, plugin)
+        # The same version, with one staged byte moved and no version bump.
+        drifted = self.source()
+        (drifted / 'src' / plugin).unlink()
+        shutil.copytree(REPO / 'src' / plugin, drifted / 'src' / plugin, symlinks=True)
+        view = drifted / 'src' / plugin / 'src/usr/local/opnsense/mvc/app/views/OPNsense/Pftop/index.volt'
+        view.write_text(view.read_text() + '\n')
+        for source, code, state in ((REPO, 0, 'unchanged'), (drifted, 1, verify.DRIFTED)):
+            with self.subTest(state=state):
+                result = subprocess.run([sys.executable, '-B', str(REPO / 'verify-repo.py'), str(site),
+                                         '--audit', '--source', str(source)], capture_output=True, text=True)
+                self.assertEqual(code, result.returncode, result.stderr)
+                self.assertIn(plugin + ': ' + state, result.stdout)
+                # Plugins with nothing published at their source version never fail the audit.
+                self.assertIn('os-mihomo: unpublished', result.stdout)
+        self.assertIn('Source changed without a version bump: ' + plugin + ' ' + build_version(plugin), result.stderr)
+
+    def test_build_repo_audits_the_published_tree_before_preparing_a_release(self):
+        script = (REPO / 'build-repo.sh').read_text()
+        self.assertRegex(script, r'(?m)^set -eu$')
+        audit = script.index('verify-repo.py" "$site_dir" --audit --source "$SCRIPT_DIR"')
+        self.assertLess(script.index('(cd "$LEGACY_REPO" && tar -cf - .)'), audit)
+        self.assertLess(audit, script.index('--prepare'))
+        self.assertLess(audit, script.index('pkg repo'))
 
     def test_failed_preupgrade_mirror_preserves_upgrade_progress(self):
         for plugin, script_name in (('os-easytier', 'easytier'), ('os-ttyd', 'ttyd')):

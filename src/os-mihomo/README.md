@@ -20,17 +20,19 @@ gVisor 协议栈每条 TCP 连接最多只有 20 KB 在途，单条连接的速�
 
 多 WAN 的 DNAT 回程仍由管理员维护，系统中的 WAN 回程路由需正确。插件不重写 NAT、WAN 网关或 `reply-to`；不会修复原本错误的回程配置。需要固定回程 WAN 的连接应有正确的有状态 WAN 规则及 `reply-to`。NAT 内联 **Pass** 跳过后续过滤规则；**Register rule** 的默认回程绑定要求正确的 WAN 网关，且未全局或单条禁用 `reply-to`。详见官方 [NAT 规则关联](https://docs.opnsense.org/manual/nat.html#filter-rule-association)、[WAN 回程规则](https://docs.opnsense.org/manual/firewall.html)和 [Disable reply-to](https://docs.opnsense.org/manual/firewall_settings.html#disable-reply-to)。排查时查看路由、有效 PF 规则和状态，并抓取 WAN、LAN、TUN 的新连接。策略变更后已有连接可继续使用旧状态；必要时仅清除受影响的旧状态，不清空整个状态表。命令与示例见 [DEPLOYMENT.md](../../DEPLOYMENT.md)。
 
-透明模式必须使用返回真实地址的 DNS。默认并推荐 `redir-host`，也支持 `normal`；绕过 TUN 的设备无法依赖 Mihomo 处理 fake-IP 占位地址。透明模式关闭时可以保留旧的 `fake-ip` 选择；启用透明模式或在透明模式下应用配置时，最终生效的 `fake-ip`（包括合并文件覆盖）会自动转换为 `redir-host`，并将该选择保存回设置。绕过设备继续使用原有 DNS 路径，共享解析器也必须返回真实地址；已有 fake-IP 缓存可能需要清除或等待过期。
+透明模式必须使用返回真实地址的 DNS。默认并推荐 `redir-host`，也支持 `normal`；绕过 TUN 的设备无法依赖 Mihomo 处理 fake-IP 占位地址。透明模式关闭时可以保留旧的 `fake-ip` 选择；启用透明模式或在透明模式下应用配置时，最终生效的 `fake-ip`（包括合并文件覆盖）会自动转换为 `redir-host`，并将该选择保存回设置。共享解析器也必须返回真实地址；已有 fake-IP 缓存可能需要清除或等待过期。
 
-合并文件不能改变 `tun_mihomo` 设备名、覆盖持久化 secret、让任何监听器占用 53，或绕过透明模式的启用守卫与真实 DNS 约束。DNS 集成支持 `127.0.0.1:1053`，自定义监听器由管理员管理。
+设备策略和“接管接口”只决定数据包的去向，不决定由谁应答路由器 DNS。使用完整预设、透明模式开启、“通过路由器 DNS 解析”关闭，且 Unbound 未开启 DNSSEC 验证时，Unbound 会把所有不在本地应答的查询转发给 Mihomo。此时所有使用路由器 DNS 的客户端都由 Mihomo 应答，包括被设备策略绕过的设备、未选中的接口、VPN 客户端、Pi-hole 等下游解析器，以及系统 DNS 使用 Unbound 时的路由器自身。要让这些客户端继续使用 Unbound 自己的上游，请开启路由器 DNS，或改用 TUN-only 预设。
 
-“通过路由器 DNS 解析”默认关闭。开关本身仅覆盖 nameserver、proxy-server-nameserver、default-nameserver、nameserver-policy 四项，不改变 DNS 劫持或 Unbound 的 AAAA 策略；透明模式另行强制真实 DNS。根据本机 DoT 配置为 IPv4/IPv6 上游地址和 853 端口注入优先 DIRECT 规则，上游改变时自动刷新，避免节点解析死锁。该模式不把 Unbound 再转发给 Mihomo；必须移除订阅的 DNS fallback，上游不可用时明确失败。
+合并文件不能改变 `tun_mihomo` 设备名、覆盖持久化 secret、让任何监听器占用 53，或绕过透明模式的启用守卫与真实 DNS 约束。DNS 集成支持 `127.0.0.1:1053`，自定义监听器由管理员管理。这项集成改动的是整个解析器，而不是某些客户端的路径：它关闭“使用系统 DNS 服务器”（Use System Nameservers），并为根域写入一个 drop-in 转发区，凡是 Unbound 不从本地数据或更具体的转发区应答的查询都交给 Mihomo。Unbound 开启 DNSSEC 验证时完全不应用这项集成，因为 Mihomo 的应答不带签名：Unbound 的配置和上游保持原样，状态显示 DNS 集成关闭并说明原因，Mihomo 只应答在隧道内劫持到的 DNS。集成生效期间开启 DNSSEC，看门狗会把 Unbound 交还给原有上游一次；关闭 DNSSEC 则在服务下次重启或应用配置时生效。
+
+“通过路由器 DNS 解析”默认关闭。开关本身仅覆盖 nameserver、proxy-server-nameserver、default-nameserver、nameserver-policy 四项，不改变 DNS 劫持或 Unbound 的 AAAA 策略；透明模式另行强制真实 DNS。根据本机 DoT 配置为 IPv4/IPv6 上游地址和 853 端口注入优先 DIRECT 规则，上游改变时自动刷新，避免节点解析死锁。该模式不把 Unbound 再转发给 Mihomo，路由器解析器的所有客户端都继续使用 Unbound 的上游；必须移除订阅的 DNS fallback，上游不可用时明确失败。
 
 手动 DNS 字段使用 Mihomo URL 语法。“覆盖订阅 DNS”开关明确控制非空手动字段是否替换运行配置中的对应项目；关闭后立即恢复订阅 DNS，同时保留手动值供以后启用。订阅 YAML 原文件始终不会被改写，启用路由器 DNS 时则以路由器 DNS 为优先。Mihomo 把 `#` 后的第一个值解释为代理或接口，而 Unbound 的 `IP@端口#主机名` 用它表示 TLS 校验名。为避免复制后直到运行时才出现 `interface not found`，插件会把 Nameservers 和节点 DNS 中的 `tls://IP#长主机名` 规范化为 `tls://长主机名`；`#vtnet1`、`#RULES` 等接口或规则选择保持原样。Bootstrap 仍必须是字面 IP，因此复制来的同类写法会在该字段保存为其中的 IP，由规范化后的主机名字段执行加密查询，避免形成解析依赖环。
 
-当前发布范围是 IPv4 客户端。选择“通过路由器 DNS 解析”时，若 RA/DHCPv6 已向客户端提供 IPv6，而 Mihomo IPv6 关闭，插件拒绝启用；运行中出现这种变化会提示。检测覆盖 OPNsense 26.7 的 radvd 条目与 track6 自动 RA、Dnsmasq 的 IPv6 地址池、Kea DHCPv6 和指向 IPv6 服务器的 DHCP 中继；仅开启 Dnsmasq 全局 RA 开关或使用 identity association 不算提供 IPv6。插件不抑制 AAAA 或修改 RA/DHCPv6；Mihomo IPv6 关闭时，原生 IPv6 流量绕过 TUN。未来启用客户端 IPv6 代理应完成独立端到端验证。
+当前发布范围是 IPv4 客户端。选择“通过路由器 DNS 解析”时，若 RA/DHCPv6 已向客户端提供 IPv6，而 Mihomo IPv6 关闭，插件拒绝启用；运行中出现这种变化会提示。检测覆盖 OPNsense 26.7 的 radvd 条目与 track6 自动 RA、Dnsmasq 的 IPv6 地址池、Kea DHCPv6 和指向 IPv6 服务器的 DHCP 中继；仅开启 Dnsmasq 全局 RA 开关或使用 identity association 不算提供 IPv6。选择“通过路由器 DNS 解析”时，插件不抑制 AAAA。路由器 DNS 关闭且 DNS 集成生效时，Mihomo 按其 IPv6 开关应答（默认关闭），所有使用路由器 DNS 的客户端都拿不到 Unbound 转发给 Mihomo 的域名的 AAAA 记录，未被接管的客户端也一样。插件从不修改 RA/DHCPv6；Mihomo IPv6 关闭时，原生 IPv6 流量绕过 TUN。未来启用客户端 IPv6 代理应完成独立端到端验证。
 
-核心异常退出后清除插件的透明接管策略和 TUN 路由；默认自动恢复原有直连 DNS，每台可配置。显式 Stop 即使 DNS 恢复失败也停止核心和透明接管，随后重试 DNS 恢复。WAN 事件不会重新启动手动停止的服务。除非被手动停止，服务会在开机时启动：OPNsense 从不直接运行 `rc.d/mihomo`，因此由启动钩子负责。只有 WAN 类接口的地址变化才会重启核心，Mihomo IPv6 关闭时忽略 IPv6 续约，DHCPv6 续约不再中断已代理的连接。关闭透明模式仅清除插件创建的接口、策略和路由，不清空防火墙状态表。
+核心异常退出后清除插件的透明接管策略和 TUN 路由；默认自动恢复原有直连 DNS，每台可配置。显式 Stop 即使 DNS 恢复失败也停止核心和透明接管，随后重试 DNS 恢复。WAN 事件不会重新启动手动停止的服务。除非被手动停止，服务会在开机时启动：OPNsense 从不直接运行 `rc.d/mihomo`，因此由启动钩子负责。关机不会停止核心，所以生效中的 DNS 集成会保留到重启之后，启动钩子运行前 Unbound 会转发到尚未监听的端口；开机启动在渲染和验证配置之前先恢复直连 DNS，剩下的是 Unbound 启动后几秒钟的窗口。在这段窗口内，若关闭了自动恢复直连 DNS，Unbound 转发的域名无法解析；若开启，Unbound 会改为自行解析。只有 WAN 类接口的地址变化才会重启核心，Mihomo IPv6 关闭时忽略 IPv6 续约，DHCPv6 续约不再中断已代理的连接。关闭透明模式仅清除插件创建的接口、策略和路由，不清空防火墙状态表。
 
 启动时在本机记录核心写入的系统 DNS 指纹。异常退出后通过 OPNsense 原生 DNS 重载恢复系统解析，失败会重试；用户后来修改的解析文件或显式配置的 DNS 不会被覆盖。这份临时恢复记录不进入 XML 备份。
 

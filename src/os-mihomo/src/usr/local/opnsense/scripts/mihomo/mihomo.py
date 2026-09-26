@@ -41,6 +41,9 @@ BACKUP_KEYS = ('subscription_url', 'secret', 'device', 'service_enabled', 'trans
 BACKUP_WARNING = 'The operation completed, but the Mihomo configuration backup could not be updated.'
 BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. The current local configuration is retained. '
                             'Stop the service and use Repair saved backup to validate and import the edited backup.')
+DNSSEC_NOTE = ('Unbound validates DNSSEC, so its upstreams are left unchanged; '
+               'Mihomo answers only DNS captured in the tunnel.')
+DNS_RESTART_NOTE = 'Unbound is not forwarding to Mihomo; restart the service to apply the DNS integration.'
 UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
 UNBOUND_CONFIG_ROOT = '/var/unbound'
 UNBOUND_TEMPLATE_ROOT = '/usr/local/opnsense/service/templates/OPNsense/Unbound'
@@ -1030,6 +1033,21 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
     return yaml.safe_dump(result, allow_unicode=True, sort_keys=False).encode()
 
 
+def dns_requested(settings, generated):
+    """Whether a generated configuration asks Unbound to forward to Mihomo.
+
+    Only the full preset's shape asks: the TUN on and Mihomo DNS listening where
+    the forward zone points. Router DNS keeps Unbound on its own upstreams
+    instead. Nothing here reads the device policy or the capture interfaces, so
+    the request covers every client of the router resolver. Whether Unbound
+    accepts it is the helper's answer, which a validating resolver declines.
+    """
+    tun = generated.get('tun') if isinstance(generated.get('tun'), dict) else {}
+    dns = generated.get('dns') if isinstance(generated.get('dns'), dict) else {}
+    return bool(tun.get('enable') and dns.get('enable') and dns.get('listen') == '127.0.0.1:1053'
+                and not settings.get('router_dns'))
+
+
 def atomic_write(path, content, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
@@ -1702,6 +1720,11 @@ class System:
             return None
 
     def dns(self, enabled, settings, recovery_only=False):
+        """Apply the integration and say whether Unbound now forwards to Mihomo.
+
+        The answer is the helper's, not the request: a validating resolver is
+        left on its own upstreams even when forwarding was asked for.
+        """
         pending = Path(STATE) / "dns-reload-pending"
         was_pending = pending.exists()
         atomic_write(pending, b"pending\n")
@@ -1719,7 +1742,7 @@ class System:
         if (not integration['integration_changed'] and not was_pending
                 and self.forwarded() == expected_forwarding):
             pending.unlink(missing_ok=True)
-            return
+            return expected_forwarding
         integration_only = bool(not integration['dns_changed']
             and integration['integration_changed'] and not was_pending
             and self.forwarded() == expected_forwarding)
@@ -1733,7 +1756,7 @@ class System:
             if integration['filter_changed']:
                 self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
             pending.unlink(missing_ok=True)
-            return
+            return expected_forwarding
         # Taken before the restart, because the restart is what can destroy it:
         # OPNsense's start script re-fetches the root anchor whenever
         # unbound-checkconf is unhappy, and a fetch made while DNS is being
@@ -1750,6 +1773,7 @@ class System:
             self.run(["/usr/local/sbin/configctl", *args], timeout=90)
         self.repair_resolver(anchor)
         pending.unlink(missing_ok=True)
+        return expected_forwarding
 
     def remove(self):
         filter_pending = Path(STATE) / 'filter-reload-pending.json'
@@ -1920,9 +1944,11 @@ class Manager:
         self.selections_file = self.state / 'proxy-selections.json'
         self.replay_file = self.state / 'proxy-replay-pending'
         self.proxy_warning_file = self.state / 'proxy-backup-warning'
+        self.tun_reassign_file = self.state / 'tun-reassign-pending'
         self.backup_transport = backup_transport or self._backup_transport
         self.proxy_api = proxy_api or self._proxy_api
         self._lock_depth = 0
+        self._applied_dns = None
 
     def path(self, path):
         return self.root / path.lstrip("/")
@@ -2479,9 +2505,50 @@ class Manager:
         self.check_settings(settings)
         atomic_write(self.settings_file, (json.dumps(settings, indent=2) + "\n").encode())
 
+    def unbound_validating(self):
+        """Whether Unbound validates DNSSEC, read where the integration helper reads it."""
+        # The watchdog asks this every tick and its loop survives only Error and
+        # OSError; an unknown or multi-byte encoding declaration raises
+        # LookupError or ValueError rather than ParseError.
+        try:
+            root = ElementTree.fromstring(self.path('/conf/config.xml').read_bytes())
+        except (OSError, ValueError, LookupError, ElementTree.ParseError):
+            return False
+        return (root.findtext('./OPNsense/unboundplus/general/dnssec') or '').strip() == '1'
+
+    def applied_dns_requested(self, settings):
+        """dns_requested() for the applied configuration.
+
+        Status is republished on every watchdog tick, and a subscription's
+        configuration can be large enough that parsing it that often costs a
+        small router real time, so only the three values the answer depends on
+        are kept, and the file is parsed again only when its content changes.
+        """
+        try:
+            content = self.config_file.read_bytes()
+        except OSError:
+            return False
+        digest = hashlib.sha256(content).digest()
+        if self._applied_dns is None or self._applied_dns[0] != digest:
+            try:
+                generated = parse_yaml(content)
+            except Error:
+                return False
+            tun = generated.get('tun') if isinstance(generated.get('tun'), dict) else {}
+            dns = generated.get('dns') if isinstance(generated.get('dns'), dict) else {}
+            self._applied_dns = (digest, {'tun': {'enable': tun.get('enable')},
+                                          'dns': {'enable': dns.get('enable'), 'listen': dns.get('listen')}})
+        return dns_requested(settings, self._applied_dns[1])
+
     def publish_status(self, settings=None, dns_active=False, error=""):
         settings = settings or self.settings()
         running = self.system.running()
+        # Derived here rather than passed in, so every caller that republishes
+        # only dns_active and error -- the backup mirror, the watchdog --
+        # keeps the explanation too.
+        dns_note = ''
+        if running and not dns_active and self.applied_dns_requested(settings):
+            dns_note = DNSSEC_NOTE if self.unbound_validating() else DNS_RESTART_NOTE
         routing_active = tcp_redirect = False
         with contextlib.suppress(OSError, ValueError, TypeError):
             routing = json.loads((self.state / 'routing-state.json').read_bytes())
@@ -2499,7 +2566,7 @@ class Manager:
         status = {"running": running, "transparent": settings["transparent"],
                   "routing_active": routing_active, "tcp_redirect": tcp_redirect,
                   "tcp_redirect_note": redirect_note,
-                  "dns_active": dns_active, "dns_fallback": settings["dns_fallback"],
+                  "dns_active": dns_active, "dns_note": dns_note, "dns_fallback": settings["dns_fallback"],
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
                   "error": bounded_routing_diagnostic(error), "backup_warning": self.backup_warning_file.read_text()
                       if self.backup_warning_file.exists() else BACKUP_WARNING
@@ -2676,36 +2743,54 @@ class Manager:
         if not settings["service_enabled"]:
             self.publish_status(settings)
             return {"running": False, "message": "The service is administratively stopped."}
-        data = parse_yaml(self.source_file.read_bytes()) if self.source_file.exists() else {'proxies': [], 'proxy-groups': [], 'rules': ['MATCH,DIRECT']}
-        overlay = parse_yaml(self.merge_file.read_bytes())
-        cleaned = copy.deepcopy(overlay)
-        dns = cleaned.get('dns')
-        if settings.get('transparent') and isinstance(dns, dict) and dns.get('enhanced-mode') == 'fake-ip':
-            dns.pop('enhanced-mode')
-            settings = dict(settings, dns_mode='redir-host')
-        candidate = self.candidate(data, settings, overlay=cleaned)
-        try:
-            self.system.validate(candidate)
-            generated = parse_yaml(candidate.read_bytes())
-            if settings != original:
-                self.write_settings(settings)
-            if cleaned != overlay:
-                atomic_write(self.merge_file, yaml.safe_dump(cleaned, sort_keys=False, allow_unicode=True).encode())
-            atomic_write(self.config_file, candidate.read_bytes())
-        finally:
-            candidate.unlink(missing_ok=True)
-        self.record_warnings(data)
-        tun = bool(generated.get('tun', {}).get('enable'))
-        dns_active = bool(tun and generated.get('dns', {}).get('enable') and generated['dns'].get('listen') == '127.0.0.1:1053' and not settings.get('router_dns'))
+        # Direct DNS comes back before anything here can fail. Shutdown does not
+        # stop the core, so at boot Unbound still forwards to a listener that is
+        # not up yet; a configuration that no longer renders or validates would
+        # otherwise leave it forwarding there for good.
         self.system.dns(False, settings)
-        if settings.get('router_dns'):
-            self.system.check_router_dns()
+        # Whatever TUN assignment a watchdog hand-back still owed, this start
+        # makes its own.
+        self.tun_reassign_file.unlink(missing_ok=True)
+        try:
+            data = parse_yaml(self.source_file.read_bytes()) if self.source_file.exists() else {'proxies': [], 'proxy-groups': [], 'rules': ['MATCH,DIRECT']}
+            overlay = parse_yaml(self.merge_file.read_bytes())
+            cleaned = copy.deepcopy(overlay)
+            dns = cleaned.get('dns')
+            if settings.get('transparent') and isinstance(dns, dict) and dns.get('enhanced-mode') == 'fake-ip':
+                dns.pop('enhanced-mode')
+                settings = dict(settings, dns_mode='redir-host')
+            candidate = self.candidate(data, settings, overlay=cleaned)
+            try:
+                self.system.validate(candidate)
+                generated = parse_yaml(candidate.read_bytes())
+                if settings != original:
+                    self.write_settings(settings)
+                if cleaned != overlay:
+                    atomic_write(self.merge_file, yaml.safe_dump(cleaned, sort_keys=False, allow_unicode=True).encode())
+                atomic_write(self.config_file, candidate.read_bytes())
+            finally:
+                candidate.unlink(missing_ok=True)
+            self.record_warnings(data)
+            tun = bool(generated.get('tun', {}).get('enable'))
+            requested = dns_requested(settings, generated)
+            dns_active = False
+            if settings.get('router_dns'):
+                self.system.check_router_dns()
+        except (Error, OSError) as error:
+            # Direct DNS is already back, so a status an earlier start published
+            # must not go on reporting the integration -- the watchdog would
+            # republish it indefinitely.
+            with contextlib.suppress(Error, OSError):
+                self.publish_status(settings, error=str(error))
+            raise
         try:
             self.system.start(self.config_file, tun)
             if tun:
                 self.system.tun()
-            if dns_active:
-                self.system.dns(True, settings)
+            if requested:
+                # The helper's answer, not the request: it leaves a validating
+                # resolver on its own upstreams.
+                dns_active = bool(self.system.dns(True, settings))
             if self.selections_file.exists():
                 atomic_write(self.replay_file, b'pending\n')
             self.proxy_tick()
@@ -2894,6 +2979,20 @@ class Manager:
                         active = False
                     except (Error, OSError):
                         rescue_error += 'Direct DNS recovery failed and will be retried. '
+            elif active and self.unbound_validating():
+                # The DNSSEC hand-back _watchdog_tick makes, done the way this
+                # branch's crash rescue is: pending XML cannot be paired with
+                # the local journals, so only the forward zone goes, which also
+                # leaves the TUN assignment alone. The rest waits for the next
+                # start, as it does after a crash here.
+                try:
+                    if hasattr(self.system, 'rescue'):
+                        self.system.rescue(settings)
+                    else:
+                        self.system.dns(False, settings)
+                    active = False
+                except (Error, OSError):
+                    rescue_error += 'Returning DNS to the validating resolver failed and will be retried. '
             if isinstance(error, BackupIntegrityError):
                 atomic_write(self.backup_warning_file, BACKUP_INTEGRITY_WARNING.encode())
             return self.publish_status(settings, active, error=rescue_error + str(error))
@@ -2927,12 +3026,40 @@ class Manager:
                 return self.publish_status(settings, error=routing_error or "Mihomo exited. Direct DNS and routing were restored automatically.")
             if routing_error:
                 return self.publish_status(settings, active, error=routing_error)
-        elif settings.get('transparent') and hasattr(self.system, 'routing'):
-            try:
-                self.system.routing('refresh')
-            except (Error, OSError) as error:
-                return self.publish_status(settings, active, error=routing_status_error(
-                    'Transparent routing recovery failed and will be retried.', error))
+        else:
+            if active and self.unbound_validating():
+                # DNSSEC was switched on after the forward zone was written.
+                # Unbound now validates what Mihomo answers, and every signed
+                # zone fails until the next start, so hand the resolver back
+                # once. Until that succeeds the integration still counts as
+                # active and the next tick retries it. Switching DNSSEC off
+                # again takes effect at the next restart or apply, and the
+                # status says so.
+                atomic_write(self.tun_reassign_file, b'pending\n')
+                try:
+                    self.system.dns(False, settings)
+                except (Error, OSError) as error:
+                    return self.publish_status(settings, active, error=routing_status_error(
+                        'Returning DNS to the validating resolver failed and will be retried.', error))
+                active = False
+            if self.tun_reassign_file.exists():
+                # Removing the integration also released the TUN assignment and
+                # its pass rule, which the running core still needs. The marker
+                # outlives a failure here, so the next tick retries this step
+                # alone while the status already reports the resolver handed back.
+                try:
+                    self.system.tun()
+                except (Error, OSError) as error:
+                    return self.publish_status(settings, active, error=routing_status_error(
+                        'DNS was returned to the validating resolver, but restoring the TUN assignment '
+                        'failed and will be retried.', error))
+                self.tun_reassign_file.unlink(missing_ok=True)
+            if settings.get('transparent') and hasattr(self.system, 'routing'):
+                try:
+                    self.system.routing('refresh')
+                except (Error, OSError) as error:
+                    return self.publish_status(settings, active, error=routing_status_error(
+                        'Transparent routing recovery failed and will be retried.', error))
         if settings.get('router_dns'):
             upstreams, ipv6 = self.router_context(settings)
             data = parse_yaml(self.config_file.read_bytes())
@@ -3080,10 +3207,17 @@ class Manager:
             if self.system.running():
                 self.system.watch()
                 generated = parse_yaml(self.config_file.read_bytes())
-                dns = generated.get('dns', {})
-                dns_active = bool(generated.get('tun', {}).get('enable') and dns.get('enable')
-                                  and dns.get('listen') == '127.0.0.1:1053' and not settings.get('router_dns'))
-                return self.publish_status(settings, dns_active)
+                # Nothing is applied here, so what the last start published
+                # stands; the request alone cannot say whether a validating
+                # resolver declined it. Without a published value the request
+                # is reported, because a false positive costs the crash rescue
+                # one harmless restoration and a false negative skips it.
+                stored = None
+                with contextlib.suppress(OSError, ValueError):
+                    published = json.loads(self.status_file.read_bytes())
+                    if isinstance(published, dict) and 'dns_active' in published:
+                        stored = bool(published['dns_active'])
+                return self.publish_status(settings, dns_requested(settings, generated) and stored is not False)
             return self.start(settings)
         if action == "status":
             try:

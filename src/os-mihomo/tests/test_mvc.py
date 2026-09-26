@@ -149,6 +149,44 @@ class FastTcpPathTests(unittest.TestCase):
         self.assertIn('127.0.0.1 port 7894', view)
 
 
+class DnsScopeWordingTests(unittest.TestCase):
+    """The documentation must describe the DNS integration the code performs."""
+
+    def test_no_text_claims_bypassed_devices_keep_their_dns(self):
+        # Full mode forwards Unbound's root to Mihomo, and the request reads
+        # neither the device policy nor the capture interfaces, so every client
+        # of the router resolver is answered by Mihomo, bypassed ones included.
+        # These sentences said the opposite.
+        stale = [(ROOT / 'README.US.md', 'Bypassed devices keep their existing DNS path'),
+                 (VIEW, 'Bypassed devices keep their existing DNS path'),
+                 (ROOT / 'README.md', '绕过设备继续使用原有 DNS 路径'),
+                 (ROOT.parents[1] / 'DEPLOYMENT.md', 'existing routes and DNS'),
+                 (ROOT / 'DESIGN.md', 'No global AAAA suppression'),
+                 # True only with router DNS on; with the integration active
+                 # Mihomo's IPv6 switch decides AAAA for every client.
+                 (ROOT / 'README.US.md', 'The plugin does not suppress AAAA or configure RA/DHCPv6'),
+                 (ROOT / 'README.md', '插件不抑制 AAAA 或修改 RA/DHCPv6')]
+        for path, sentence in stale:
+            with self.subTest(path=path.name, sentence=sentence):
+                self.assertNotIn(sentence, path.read_text())
+
+    def test_the_readmes_state_the_dnssec_exception_and_the_aaaa_effect(self):
+        # 'AAAA' alone would match the claim these sentences replaced.
+        for path, aaaa in ((ROOT / 'README.US.md', 'receives AAAA records for the names Unbound forwards to Mihomo'),
+                           (ROOT / 'README.md', '拿不到 Unbound 转发给 Mihomo 的域名的 AAAA 记录')):
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                self.assertIn('DNSSEC', text)
+                self.assertIn(aaaa, text)
+                self.assertIn('Pi-hole', text)
+
+    def test_the_status_explains_an_integration_that_is_not_active(self):
+        view = VIEW.read_text()
+        self.assertIn('id="mihomo-dns-note"', view)
+        self.assertIn("$('#mihomo-dns-note').text(state.dns_note || '');", view)
+        self.assertIn('"dns_note": dns_note', MANAGER.read_text())
+
+
 class CaptureInterfaceViewTests(unittest.TestCase):
     """The interface picker must never lose a stored selection or offer an uplink."""
 

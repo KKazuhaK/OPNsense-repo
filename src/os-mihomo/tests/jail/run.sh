@@ -1,7 +1,15 @@
 #!/bin/sh
 set -eu
 export LC_ALL=C
-[ "$#" -eq 2 ] || { echo 'usage: run.sh new.pkg legacy-1.0.2.pkg' >&2; exit 1; }
+[ "$#" -eq 2 ] || { echo 'usage: [MIHOMO_JAIL_DNSSEC=1] run.sh new.pkg legacy-1.0.2.pkg' >&2; exit 1; }
+# MIHOMO_JAIL_DNSSEC=1 runs the same lifecycle against a resolver that validates
+# DNSSEC, which the DNS integration has to leave untouched. Its report is kept
+# beside the package as test-report-dnssec.json, so the round signed for release
+# stays the base one.
+dnssec="${MIHOMO_JAIL_DNSSEC:-0}"
+case "$dnssec" in 0|1) ;; *) echo 'MIHOMO_JAIL_DNSSEC must be 0 or 1' >&2; exit 1 ;; esac
+report_name=test-report.json
+[ "$dnssec" = 0 ] || report_name=test-report-dnssec.json
 TEST_DIR="$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd)"
 JAIL_ROOT="${JAIL_ROOT:-/root/mihomo-refactor-build/jail}"
 export JAIL_ROOT
@@ -108,7 +116,7 @@ jexec "$jail_name" /sbin/ifconfig lo1 create inet 192.0.2.10/24 up
 jexec "$jail_name" /sbin/route -n add -net 192.0.2.0/24 -iface lo1
 jexec "$jail_name" /sbin/route -n get 192.0.2.1 | awk '/interface:/ {if ($2 != "lo1") exit 1; found=1} END {if (!found) exit 1}'
 jexec "$jail_name" /sbin/route add default 192.0.2.1
-jexec "$jail_name" "/usr/local/bin/$target_python" /root/case.py
+jexec "$jail_name" /usr/bin/env MIHOMO_JAIL_DNSSEC="$dnssec" "/usr/local/bin/$target_python" /root/case.py
 jexec "$jail_name" "/usr/local/bin/$target_python" -B - <<'PY'
 import json
 from pathlib import Path
@@ -123,8 +131,8 @@ report.update(native_release=release, native_abi='FreeBSD:' + release.split('.')
               package_version=manifest['version'], state_policy='floating', pf_share_forward=1)
 Path('/root/test-report.json').write_text(json.dumps(report, indent=2) + '\n')
 PY
-cp "$JAIL_ROOT/root/test-report.json" "$(dirname "$1")/test-report.json"
-python3 - "$(dirname "$1")/test-report.json" "$native_product_abi" <<'PY'
+cp "$JAIL_ROOT/root/test-report.json" "$(dirname "$1")/$report_name"
+python3 - "$(dirname "$1")/$report_name" "$native_product_abi" <<'PY'
 import json
 from pathlib import Path
 import sys

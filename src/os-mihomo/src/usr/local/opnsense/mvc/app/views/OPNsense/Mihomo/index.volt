@@ -355,6 +355,7 @@ $(function () {
                 .text(routed ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
             $('#mihomo-dns').attr('class', 'label label-' + (state.dns_active ? 'success' : 'default'))
                 .text(state.dns_active ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
+            $('#mihomo-dns-note').text(state.dns_note || '');
             $('#mihomo-tcp-redirect').attr('class', 'label label-' + (state.tcp_redirect ? 'success' : 'default'))
                 .text(state.tcp_redirect ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
             $('#mihomo-tcp-redirect-note').text(state.tcp_redirect_note || '');
@@ -474,7 +475,7 @@ $(function () {
             <tbody>
                 <tr><td>{{ lang._('Service') }}</td><td><span id="mihomo-service" class="label label-default">-</span></td></tr>
                 <tr><td>{{ lang._('Transparent routing') }}</td><td><span id="mihomo-transparent" class="label label-default">-</span></td></tr>
-                <tr><td>{{ lang._('DNS integration') }}</td><td><span id="mihomo-dns" class="label label-default">-</span></td></tr>
+                <tr><td>{{ lang._('DNS integration') }}</td><td><span id="mihomo-dns" class="label label-default">-</span> <small id="mihomo-dns-note" class="text-muted"></small></td></tr>
                 <tr><td>{{ lang._('Fast TCP path') }}</td><td><span id="mihomo-tcp-redirect" class="label label-default">-</span> <small id="mihomo-tcp-redirect-note" class="text-muted"></small></td></tr>
                 <tr>
                     <td><a id="help_for_service" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Service control') }}</td>
@@ -495,7 +496,7 @@ $(function () {
                         <button type="button" class="btn btn-primary mihomo-action" id="mihomo-enable" data-action="enableTransparent" data-done="{{ lang._('Transparent routing enabled. LAN traffic now follows the saved device policy.') }}">{{ lang._('Enable transparent routing') }}</button>
                         <button type="button" class="btn btn-default mihomo-action" id="mihomo-disable" style="display:none" data-action="disableTransparent" data-done="{{ lang._('Transparent routing disabled. Routing and DNS were returned to the router.') }}">{{ lang._('Disable transparent routing') }}</button>
                         <div class="hidden" data-for="help_for_transparent">
-                            {{ lang._('Sends eligible LAN traffic through Mihomo according to the saved device policy. Bypassed devices keep their existing routes. Firewall rules still apply. The router itself and incoming WAN connections, including port forwards, keep their existing routing. Transparent routing requires DNS answers with real addresses.') }}
+                            {{ lang._('Sends eligible LAN traffic through Mihomo according to the saved device policy. Bypassed devices keep their existing routes. Firewall rules still apply. The router itself and incoming WAN connections, including port forwards, keep their existing routing. Transparent routing requires DNS answers with real addresses. The device policy selects traffic only: with the full preset and router DNS off, bypassed devices that use the router DNS are answered by Mihomo too (see Capture client DNS).') }}
                         </div>
                     </td>
                 </tr>
@@ -791,7 +792,7 @@ $(function () {
                     <td><a id="help_for_ipv6" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('IPv6 support') }}</td>
                     <td><input type="checkbox" id="ipv6"> <span class="label label-warning mihomo-override" id="override_ipv6" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_ipv6">
-                            {{ lang._('Default off. Lets Mihomo answer AAAA queries and carry IPv6 traffic through the tunnel. Leave it off unless the upstream nodes are known to work over IPv6, otherwise clients may prefer a v6 path that never completes.') }}
+                            {{ lang._('Default off. Lets Mihomo answer AAAA queries and carry IPv6 traffic through the tunnel. Leave it off unless the upstream nodes are known to work over IPv6, otherwise clients may prefer a v6 path that never completes. While Unbound forwards to Mihomo, this switch also decides whether devices that use the router DNS receive AAAA records for forwarded names.') }}
                         </div>
                     </td>
                 </tr>
@@ -813,7 +814,7 @@ $(function () {
                     <td><a id="help_for_hijack" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Capture client DNS') }}</td>
                     <td><input type="checkbox" id="dns_hijack"> <span class="label label-warning mihomo-override" id="override_dns_hijack" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_hijack">
-                            {{ lang._('Default on. Redirects DNS queries that enter the tunnel to Mihomo. This switch only takes effect while transparent routing is enabled. Bypassed devices keep their existing DNS path; any resolver they share must return real addresses.') }}
+                            {{ lang._('Default on. Redirects DNS queries that enter the tunnel to Mihomo. This switch only takes effect while transparent routing is enabled. Queries addressed to the router DNS do not depend on this switch: while transparent routing uses the full preset and router DNS is off, Unbound forwards every name it does not answer from local data or a more specific forward zone to Mihomo, unless Unbound validates DNSSEC. Every device that uses the router DNS is then answered by Mihomo, including bypassed devices, interfaces outside capture and VPN clients. Any other resolver that bypassed devices use must return real addresses.') }}
                         </div>
                     </td>
                 </tr>
@@ -873,7 +874,7 @@ $(function () {
                     <td><a id="help_for_routerdns" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Resolve through the router DNS') }}</td>
                     <td><input type="checkbox" id="router_dns">
                         <div class="hidden" data-for="help_for_routerdns">
-                            {{ lang._('Default off. Uses the router resolver and pins its DNS transport DIRECT. Activation is refused if clients are offered IPv6 while Mihomo IPv6 is disabled.') }}
+                            {{ lang._('Default off. Uses the router resolver and pins its DNS transport DIRECT. Activation is refused if clients are offered IPv6 while Mihomo IPv6 is disabled. While transparent routing uses the full preset, this switch also decides who answers devices that use the router DNS: on, Unbound\'s own upstreams; off, Mihomo, unless Unbound validates DNSSEC.') }}
                         </div>
                     </td>
                 </tr>

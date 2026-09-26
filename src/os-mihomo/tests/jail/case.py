@@ -148,12 +148,15 @@ def erase_private_saved_backup(path):
     private_xml.write(path)
 
 
+# run.sh sets this for a second round against a resolver that validates DNSSEC,
+# which the integration has to leave exactly as the operator configured it.
+dnssec = os.environ.get('MIHOMO_JAIL_DNSSEC', '0') == '1'
 shutil.rmtree('/var/db/os-mihomo', ignore_errors=True)
 previous = command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=false', 'add', '-f', '-M', '/root/old.pkg'])
 print(previous.stdout.decode(errors='replace') + previous.stderr.decode(errors='replace'), flush=True)
 config = ET.fromstring('''<opnsense><system><secret>MASTER_SECRET_DO_NOT_COPY</secret></system>
 <interfaces><lan><if>lo1</if></lan></interfaces><filter/><radvd/><dhcpdv6/>
-<OPNsense><unboundplus><forwarding><enabled>1</enabled></forwarding>
+<OPNsense><unboundplus>''' + ('<general><dnssec>1</dnssec></general>' if dnssec else '') + '''<forwarding><enabled>1</enabled></forwarding>
 <advanced><privateaddress>10.0.0.0/8,198.18.0.0/15</privateaddress></advanced>
 <dots><dot uuid="owner-dot"><enabled>1</enabled><type>dot</type><domain/><server>192.0.2.53</server><port>853</port></dot></dots>
 </unboundplus></OPNsense><cron><item><command>mihomo sub-update</command><minutes>30</minutes><hours>*/12</hours></item></cron></opnsense>''')
@@ -238,9 +241,29 @@ assert_host_dns_restored()
 prepare_gateway_cycle()
 action('enable-transparent')
 assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
-assert action('status')['result']['dns_active']
+assert action('status')['result']['dns_active'] == (not dnssec)
 assert ET.parse('/conf/config.xml').find('./filter/rule') is not None
 passed('Explicit activation creates the actual TUN and owned DNS/interface/firewall configuration')
+
+
+def assert_validating_resolver_untouched():
+    """A validating resolver keeps its upstreams: no journal, zone or edit."""
+    unbound = ET.parse('/conf/config.xml').find('./OPNsense/unboundplus')
+    assert unbound.findtext('./general/dnssec') == '1'
+    assert unbound.findtext('./forwarding/enabled') == '1'
+    # Transparent routing forces a real-address DNS mode, which kept this range
+    # before as well, so here it only guards against a regression; the unit
+    # tests cover the fake-ip and unknown modes that used to remove it.
+    assert '198.18.0.0/15' in unbound.findtext('./advanced/privateaddress').split(',')
+    assert not Path('/var/db/os-mihomo/dns-state.json').exists()
+    assert not Path('/usr/local/etc/unbound.opnsense.d/zz-mihomo.conf').exists()
+    status = action('status')['result']
+    assert status['dns_active'] is False and 'DNSSEC' in status['dns_note'], status
+
+
+if dnssec:
+    assert_validating_resolver_untouched()
+    passed('A validating resolver keeps its upstreams, private addresses and configuration while transparent routing is active')
 assert_core_host_dns_marker()
 passed('The running no-auto-route core preserves native DNS without creating a host DNS ownership marker')
 # The forward zone is a drop-in file, not an entry in the operator's Unbound
@@ -251,6 +274,7 @@ passed('The running no-auto-route core preserves native DNS without creating a h
 zone = Path('/usr/local/etc/unbound.opnsense.d/zz-mihomo.conf')
 validating = ET.parse('/conf/config.xml').findtext(
     './OPNsense/unboundplus/general/dnssec') == '1'
+assert validating is dnssec
 if validating:
     # A validating resolver remains on its native DNS path.
     assert not zone.exists(), 'no forward zone belongs next to a validating resolver'
@@ -283,7 +307,8 @@ try:
     assert len(_reply) >= 12 and _reply[:2] == _query[:2], _reply[:32]
 finally:
     _sock.close()
-passed('An actual DNS query reaches the private resolver with transparent integration active')
+passed('An actual DNS query reaches the private resolver configured for DNSSEC with transparent routing active' if dnssec
+       else 'An actual DNS query reaches the private resolver with transparent integration active')
 # Reinstall through the native solver so upgrade suspension and hooks run again.
 before_settings = json.loads(Path('/var/db/os-mihomo/settings.json').read_text())
 assert before_settings['transparent_consent'] is True
@@ -291,7 +316,9 @@ reinstalled = command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', '-o', 'R
 Path('/root/same-version-reinstall.log').write_bytes(reinstalled.stdout + reinstalled.stderr)
 assert json.loads(Path('/var/db/os-mihomo/settings.json').read_text()) == before_settings
 assert running(), reinstalled.stdout.decode(errors='replace') + reinstalled.stderr.decode(errors='replace')
-assert action('status')['result']['dns_active']
+assert action('status')['result']['dns_active'] == (not dnssec)
+if dnssec:
+    assert_validating_resolver_untouched()
 assert_private_routing(True)
 assert_core_host_dns_marker()
 passed('Actual same-version reinstall preserves explicit TUN consent and restores its route/DNS policy')
@@ -405,6 +432,7 @@ passed('Actual fresh package installation starts proxy ports without TUN or DNS 
 assert_private_routing(False)
 report = {'ok': True, 'checks': checks, 'package_sha256': hashlib.sha256(Path('/root/new.pkg').read_bytes()).hexdigest(),
           'package_version': new_manifest['version'], 'crash_recovery_seconds': round(recovery_seconds, 3),
+          'unbound_dnssec': dnssec,
           'cold_numeric_gateway_cycle': {'routes': list(gateway_cycle.values()),
                                          'interface': 'lo2', 'active_and_stopped_copy_verified': True},
           'boundary': {'core_pf_private_fib_and_unbound': 'genuine native execution',

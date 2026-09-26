@@ -17,6 +17,15 @@ that the retained backup restores administrative Stop, then removes only the
 private XML's Mihomo backup node and erases the stores again to verify fresh
 proxy-port defaults. Other XML nodes remain in place.
 
+`MIHOMO_JAIL_DNSSEC=1 sh run.sh ...` repeats the same lifecycle with DNSSEC
+validation on in the private XML. Activation and same-version reinstall must
+then leave the Unbound model untouched -- system-nameserver forwarding on, the
+fake-ip range still private, no ownership journal and no forward zone -- and
+report DNS integration off with its DNSSEC note. The jail's resolver templates
+are synthetic, so this round covers what the helper writes and what the status
+says, not a validating Unbound answering through Mihomo. Its report is written
+as `test-report-dnssec.json`.
+
 These adapters mean a script that calls a function the real OPNsense tree defines
 elsewhere passes there and fails on a router. `setup_unbound.php` did exactly
 that: it required `config.inc` alone, and `config.inc` reaches for

@@ -77,7 +77,7 @@ function mihomoLockCurrent(OPNsense\Core\Config $config): void
     }
 }
 
-function mihomoForwardZone(bool $enabled, bool $fallback, bool $validating = false): bool
+function mihomoForwardZone(bool $enabled, bool $fallback): bool
 {
     $path = mihomoForwardFile();
     $changed = false;
@@ -86,15 +86,6 @@ function mihomoForwardZone(bool $enabled, bool $fallback, bool $validating = fal
     $legacy = mihomoForwardLegacyFile();
     if (file_exists($legacy) && unlink($legacy)) {
         $changed = true;
-    }
-    /* A validating resolver cannot accept what Mihomo answers: fake-ip records
-       carry no signature, so every signed zone fails validation. Telling
-       Unbound to skip validation for the root is the one thing that would make
-       it work and is exactly the configuration that stops the resolver
-       starting, so the forward zone is simply not written while validation is
-       on. Domain based routing still comes from the sniffer. */
-    if ($validating) {
-        $enabled = false;
     }
     /* The forward zone is a file rather than an entry in the operator's Unbound
        configuration. An entry carrying the root as its domain makes OPNsense
@@ -491,51 +482,67 @@ try {
         $forwarder = $xpath->query('./dot[@uuid="' . FORWARD_UUID . '"]', $dots)->item(0);
         if ($mode === 'enable') {
             mihomoEnsureTun($doc, $xpath, $tunStatePath);
-            /* Real DNS modes never manufacture fake addresses. Preserve the
-               operator's private networks and record whether we removed one;
-               older journals still require their historical restoration. */
-            $removeFakePrivate = !mihomoRealAddressDns($stateDir);
-            $hadFakePrivate = in_array(FAKE_IP_CIDR, array_map('trim', explode(',', $private->textContent)), true);
-            if ($snapshot === null) {
-                $roots = [];
-                foreach ($xpath->query('./dot', $dots) as $dot) {
-                    $domain = trim($xpath->evaluate('string(./domain)', $dot));
-                    if (in_array($domain, ['', '.'], true) && $dot->getAttribute('uuid') !== FORWARD_UUID) {
-                        if ($dot->getAttribute('uuid') === '') {
-                            throw new RuntimeException('Existing root DNS entries must have UUIDs.');
-                        }
-                        $roots[$dot->getAttribute('uuid')] = trim($xpath->evaluate('string(./enabled)', $dot));
-                    }
-                }
-                $snapshot = ['forwarding' => $forwarding->textContent, 'roots' => $roots,
-                             'had_fake_ip_private_address' => $hadFakePrivate,
-                             'removed_fake_ip_private_address' => $removeFakePrivate && $hadFakePrivate];
-                mihomoPersist($dnsStatePath, $snapshot);
-            } elseif ($removeFakePrivate && $hadFakePrivate
-                && ($snapshot['removed_fake_ip_private_address'] ?? true) === false) {
-                $snapshot['had_fake_ip_private_address'] = true;
-                $snapshot['removed_fake_ip_private_address'] = true;
-                mihomoPersist($dnsStatePath, $snapshot);
-            }
-            $forwarding->nodeValue = '0';
-            /* The operator's own root upstreams are left exactly as they are.
-               Unbound keeps the first forward zone it reads for a name and logs
-               the rest as duplicates, and the entry below is not served over
-               TLS, so the template writes it ahead of any DoT entry and queries
-               reach Mihomo either way. Disabling the operator's entries would
-               buy nothing and would edit configuration that is not ours. */
-            if ($removeFakePrivate) {
-                $addresses = array_filter(array_map('trim', explode(',', $private->textContent)), static fn($v) => $v !== '' && $v !== FAKE_IP_CIDR);
-                $private->nodeValue = implode(',', $addresses);
-            }
             /* Earlier versions kept the forward zone here. Drop it on the way
                past so an upgrade stops generating domain-insecure: "." too. */
             if ($forwarder instanceof DOMElement) {
                 $dots->removeChild($forwarder);
             }
-            $validating = trim($xpath->evaluate('string(./general/dnssec)', $unbound)) === '1';
-            $effectiveForwarding = !$validating;
-            $zoneChanged = mihomoForwardZone(true, $fallback, $validating);
+            if (trim($xpath->evaluate('string(./general/dnssec)', $unbound)) === '1') {
+                /* A validating resolver cannot accept what Mihomo answers:
+                   fake-ip records carry no signature, so every signed zone
+                   fails validation. Telling Unbound to skip validation for the
+                   root is the one thing that would make it work and is exactly
+                   the configuration that stops the resolver starting, so no
+                   forward zone is written while validation is on. Nothing else
+                   may change either: with forwarding off and no zone in its
+                   place, Unbound would recurse from the root instead of using
+                   the operator's upstreams. No journal is written either; one
+                   an earlier enable left behind is kept for disable to restore,
+                   and every start runs disable first. Domain based routing
+                   still comes from the sniffer, and DNS captured in the tunnel
+                   still reaches Mihomo. */
+                $zoneChanged = mihomoForwardZone(false, $fallback);
+            } else {
+                /* Real DNS modes never manufacture fake addresses. Preserve the
+                   operator's private networks and record whether we removed one;
+                   older journals still require their historical restoration. */
+                $removeFakePrivate = !mihomoRealAddressDns($stateDir);
+                $hadFakePrivate = in_array(FAKE_IP_CIDR, array_map('trim', explode(',', $private->textContent)), true);
+                if ($snapshot === null) {
+                    $roots = [];
+                    foreach ($xpath->query('./dot', $dots) as $dot) {
+                        $domain = trim($xpath->evaluate('string(./domain)', $dot));
+                        if (in_array($domain, ['', '.'], true) && $dot->getAttribute('uuid') !== FORWARD_UUID) {
+                            if ($dot->getAttribute('uuid') === '') {
+                                throw new RuntimeException('Existing root DNS entries must have UUIDs.');
+                            }
+                            $roots[$dot->getAttribute('uuid')] = trim($xpath->evaluate('string(./enabled)', $dot));
+                        }
+                    }
+                    $snapshot = ['forwarding' => $forwarding->textContent, 'roots' => $roots,
+                                 'had_fake_ip_private_address' => $hadFakePrivate,
+                                 'removed_fake_ip_private_address' => $removeFakePrivate && $hadFakePrivate];
+                    mihomoPersist($dnsStatePath, $snapshot);
+                } elseif ($removeFakePrivate && $hadFakePrivate
+                    && ($snapshot['removed_fake_ip_private_address'] ?? true) === false) {
+                    $snapshot['had_fake_ip_private_address'] = true;
+                    $snapshot['removed_fake_ip_private_address'] = true;
+                    mihomoPersist($dnsStatePath, $snapshot);
+                }
+                $forwarding->nodeValue = '0';
+                /* The operator's own root upstreams are left exactly as they
+                   are. The forward zone is a drop-in named to sort behind the
+                   generated dot.conf, and Unbound keeps the last forward zone
+                   it reads for a name, so queries reach Mihomo while those
+                   entries stay configured. Disabling them would buy nothing and
+                   would edit configuration that is not ours. */
+                if ($removeFakePrivate) {
+                    $addresses = array_filter(array_map('trim', explode(',', $private->textContent)), static fn($v) => $v !== '' && $v !== FAKE_IP_CIDR);
+                    $private->nodeValue = implode(',', $addresses);
+                }
+                $effectiveForwarding = true;
+                $zoneChanged = mihomoForwardZone(true, $fallback);
+            }
         } else {
             if ($forwarder instanceof DOMElement) {
                 $dots->removeChild($forwarder);

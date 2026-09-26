@@ -248,6 +248,70 @@ class RoutingLifecycleTests(unittest.TestCase):
         self.assertFalse(status['routing_active'])
         self.assertNotIn('dns-off', self.system.events)
 
+    def validate_dnssec(self):
+        config = self.manager.path('/conf/config.xml')
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('<opnsense><OPNsense><unboundplus><general><dnssec>1</dnssec></general>'
+                          '</unboundplus></OPNsense></opnsense>')
+        self.system.dnssec = True
+
+    def test_crash_with_a_validating_resolver_removes_capture_without_a_dns_restore(self):
+        # A validating resolver was never handed to Mihomo, so the crash rescue
+        # removes capture and has no DNS change to undo.
+        self.validate_dnssec()
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.assertTrue(self.system.routing_active)
+        self.assertFalse(self.system.forwarded)
+        self.assertEqual(m.DNSSEC_NOTE, json.loads(self.manager.status_file.read_bytes())['dns_note'])
+        self.system.events.clear()
+        self.system.alive = False
+
+        status = self.manager.watchdog_tick()
+
+        self.assertFalse(self.system.routing_active)
+        self.assertFalse(status['routing_active'])
+        self.assertFalse(status['dns_active'])
+        self.assertEqual('', status['dns_note'])
+        self.assertIn('destroy-tun', self.system.events)
+        self.assertNotIn('dns-off', self.system.events)
+
+    def test_a_runtime_dnssec_hand_back_keeps_transparent_routing_armed(self):
+        self.activate()
+        self.validate_dnssec()
+
+        status = self.manager.watchdog_tick()
+
+        self.assertFalse(self.system.forwarded)
+        self.assertFalse(status['dns_active'])
+        self.assertTrue(self.system.alive)
+        self.assertTrue(self.system.routing_active)
+        self.assertTrue(status['routing_active'])
+        self.assertLess(self.system.events.index('dns-off'), self.system.events.index('assign-tun'))
+        self.assertLess(self.system.events.index('assign-tun'), self.system.events.index('routing-enable'))
+
+    def test_a_backup_guard_failure_still_hands_a_validating_resolver_back(self):
+        # Restoring an OPNsense backup can both switch DNSSEC on and leave the
+        # Mihomo backup pending, which fails the guard on every tick.
+        self.activate()
+        self.validate_dnssec()
+
+        with mock.patch.object(self.manager, '_guard_backup',
+                               side_effect=m.Error('A restored Mihomo configuration is pending.')):
+            status = self.manager.watchdog_tick()
+            again = self.manager.watchdog_tick()
+
+        self.assertFalse(self.system.forwarded)
+        self.assertFalse(status['dns_active'])
+        self.assertFalse(again['dns_active'])
+        self.assertEqual(m.DNSSEC_NOTE, status['dns_note'])
+        self.assertIn('A restored Mihomo configuration is pending.', status['error'])
+        # Pending XML is not paired with the journals: the rescue removes only
+        # the forward zone, once, and leaves the TUN assignment and routing be.
+        self.assertEqual(['rescue-dns', 'dns-off'], self.system.events)
+        self.assertTrue(self.system.alive)
+        self.assertTrue(status['routing_active'])
+
     def test_runtime_status_requires_boolean_routing_marker_and_live_core(self):
         self.activate()
         marker = self.manager.state / 'routing-state.json'

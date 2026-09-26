@@ -37,6 +37,7 @@ class FakeSystem:
         self.events = []
         self.fail_start = 0
         self.reject = False
+        self.dnssec = False
 
     def running(self): return self.alive
     def validate(self, candidate):
@@ -54,7 +55,9 @@ class FakeSystem:
         self.alive = False
     def dns(self, enabled, settings):
         self.events.append('dns-on' if enabled else 'dns-off')
-        self.forwarded = enabled
+        # The helper leaves a validating resolver alone and says so.
+        self.forwarded = enabled and not self.dnssec
+        return self.forwarded
     def watch(self): pass
     def stop_watch(self): pass
     def destroy_tun(self): self.events.append('destroy-tun')
@@ -370,26 +373,236 @@ class StateTests(unittest.TestCase):
                 self.assertEqual(events, self.system.events)
                 self.assertTrue(self.system.alive)
 
-    def test_repeated_start_preserves_generated_dns_mode(self):
+    def unbound(self, dnssec):
+        """Give the router a resolver that does or does not validate DNSSEC."""
         config = self.manager.path('/conf/config.xml')
         config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text('<opnsense><OPNsense><unboundplus><dots/></unboundplus></OPNsense></opnsense>')
+        general = '<general><dnssec>1</dnssec></general>' if dnssec else ''
+        config.write_text('<opnsense><OPNsense><unboundplus>' + general
+                          + '<dots/></unboundplus></OPNsense></opnsense>')
+        self.system.dnssec = dnssec
+
+    def status_file(self):
+        return json.loads(self.manager.status_file.read_bytes())
+
+    def test_repeated_start_preserves_generated_dns_mode(self):
         dot = self.manager.path('/var/unbound/etc/dot.conf')
         dot.parent.mkdir(parents=True, exist_ok=True)
         dot.write_text('forward-addr: 1.1.1.1@853\n')
+        self.unbound(False)
         self.manager.apply(SUBSCRIPTION)
-        for router_dns, dns_enabled in ((True, True), (False, False), (False, True)):
-            with self.subTest(router_dns=router_dns, dns_enabled=dns_enabled):
-                settings = self.manager.settings()
-                settings['router_dns'] = router_dns
-                overlay = {'tun': {'enable': True, 'auto-route': True},
-                           'dns': {'enable': dns_enabled, 'listen': '127.0.0.1:1053'}}
-                self.manager.apply(SUBSCRIPTION, settings, overlay=overlay)
-                result = self.manager.dispatch('enable-transparent')
-                expected = dns_enabled and not router_dns
-                self.assertEqual(expected, self.manager.dispatch('status')['dns_active'])
-                for action in ('boot', 'start'):
-                    self.assertEqual(expected, self.manager.dispatch(action)['dns_active'])
+        for dnssec in (False, True):
+            for router_dns, dns_enabled in ((True, True), (False, False), (False, True)):
+                with self.subTest(router_dns=router_dns, dns_enabled=dns_enabled, dnssec=dnssec):
+                    self.unbound(dnssec)
+                    settings = self.manager.settings()
+                    settings['router_dns'] = router_dns
+                    overlay = {'tun': {'enable': True, 'auto-route': True},
+                               'dns': {'enable': dns_enabled, 'listen': '127.0.0.1:1053'}}
+                    self.manager.apply(SUBSCRIPTION, settings, overlay=overlay)
+                    self.manager.dispatch('enable-transparent')
+                    # A validating resolver declines the forward zone, and
+                    # every path that reports it has to say so, not only start.
+                    expected = dns_enabled and not router_dns and not dnssec
+                    note = m.DNSSEC_NOTE if dns_enabled and not router_dns and dnssec else ''
+                    status = self.manager.dispatch('status')
+                    self.assertEqual(expected, status['dns_active'])
+                    self.assertEqual(note, status['dns_note'])
+                    self.assertEqual(expected, self.system.forwarded)
+                    # boot and start find the core running and only republish.
+                    for action in ('boot', 'start'):
+                        result = self.manager.dispatch(action)
+                        self.assertEqual(expected, result['dns_active'], action)
+                        self.assertEqual(note, result['dns_note'], action)
+                        self.assertEqual(note, self.status_file()['dns_note'], action)
+
+    def test_the_dnssec_note_survives_the_backup_mirror_and_the_watchdog(self):
+        self.unbound(True)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.assertIn('dns-on', self.system.events)
+        self.assertFalse(self.system.forwarded)
+        # dispatch('start') republishes through _mirrored_result, which passes
+        # on only dns_active and error; the note must be derived again there.
+        self.manager.dispatch('start')
+        self.assertFalse(self.status_file()['dns_active'])
+        self.assertEqual(m.DNSSEC_NOTE, self.status_file()['dns_note'])
+        status = self.manager.watchdog_tick()
+        self.assertFalse(status['dns_active'])
+        self.assertEqual(m.DNSSEC_NOTE, status['dns_note'])
+        self.assertEqual(m.DNSSEC_NOTE, self.status_file()['dns_note'])
+        # Once validation is off again, the next restart applies the zone.
+        self.unbound(False)
+        self.assertEqual(m.DNS_RESTART_NOTE, self.manager.watchdog_tick()['dns_note'])
+        self.assertFalse(self.manager.dispatch('start')['dns_active'])
+        result = self.manager.dispatch('restart')
+        self.assertTrue(result['dns_active'])
+        self.assertEqual('', result['dns_note'])
+        self.assertTrue(self.system.forwarded)
+        # A stopped service has nothing to explain.
+        self.unbound(True)
+        self.manager.dispatch('stop')
+        self.assertEqual('', self.status_file()['dns_note'])
+
+    def test_the_watchdog_hands_a_resolver_that_starts_validating_back_once(self):
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.assertTrue(self.status_file()['dns_active'])
+        self.assertTrue(self.system.forwarded)
+        # DNSSEC switched on while Unbound forwards to Mihomo: every signed
+        # zone would fail validation until the next start.
+        self.unbound(True)
+        self.system.events.clear()
+        status = self.manager.watchdog_tick()
+        self.assertFalse(status['dns_active'])
+        self.assertEqual(m.DNSSEC_NOTE, status['dns_note'])
+        self.assertFalse(self.system.forwarded)
+        self.assertTrue(self.system.alive)
+        # Removing the integration releases the TUN assignment the running
+        # core still needs, so it is put back in the same tick.
+        self.assertEqual(['dns-off', 'assign-tun'], self.system.events)
+        for _ in range(2):
+            self.assertFalse(self.manager.watchdog_tick()['dns_active'])
+        self.assertEqual(1, self.system.events.count('dns-off'))
+
+    def test_a_failed_dns_hand_back_stays_reported_active_and_is_retried(self):
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.unbound(True)
+        original = self.system.dns
+        self.system.dns = lambda enabled, settings: (_ for _ in ()).throw(m.Error('Injected Unbound restart failure.'))
+        status = self.manager.watchdog_tick()
+        self.assertTrue(status['dns_active'], 'the crash rescue must still see the integration')
+        self.assertIn('Returning DNS to the validating resolver failed and will be retried', status['error'])
+        self.system.dns = original
+        self.system.events.clear()
+        status = self.manager.watchdog_tick()
+        self.assertFalse(status['dns_active'])
+        self.assertEqual(['dns-off', 'assign-tun'], self.system.events)
+        self.assertFalse(self.manager.tun_reassign_file.exists())
+
+    def test_a_failed_tun_reassignment_is_retried_alone_once_dns_is_handed_back(self):
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.unbound(True)
+        original = self.system.tun
+        self.system.tun = lambda: (_ for _ in ()).throw(m.Error('Injected TUN assignment failure.'))
+        self.system.events.clear()
+        status = self.manager.watchdog_tick()
+        # Unbound is back on its own upstreams, so the status says so and names
+        # the step that is still owed.
+        self.assertEqual(['dns-off'], self.system.events)
+        self.assertFalse(self.system.forwarded)
+        self.assertFalse(status['dns_active'])
+        self.assertEqual(m.DNSSEC_NOTE, status['dns_note'])
+        self.assertIn('restoring the TUN assignment failed and will be retried', status['error'])
+        self.assertIn('Injected TUN assignment failure', status['error'])
+        self.assertFalse(self.manager.watchdog_tick()['dns_active'])
+        self.system.tun = original
+        self.system.events.clear()
+        status = self.manager.watchdog_tick()
+        self.assertEqual(['assign-tun'], self.system.events)
+        self.assertEqual('', status['error'])
+        self.assertFalse(self.manager.tun_reassign_file.exists())
+        self.manager.watchdog_tick()
+        self.assertEqual(['assign-tun'], self.system.events)
+
+    def test_a_restart_takes_over_a_tun_reassignment_the_watchdog_still_owes(self):
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.unbound(True)
+        original = self.system.tun
+        self.system.tun = lambda: (_ for _ in ()).throw(m.Error('Injected TUN assignment failure.'))
+        self.manager.watchdog_tick()
+        self.assertTrue(self.manager.tun_reassign_file.exists())
+        self.system.tun = original
+        self.manager.dispatch('restart')
+        self.assertFalse(self.manager.tun_reassign_file.exists())
+        self.system.events.clear()
+        self.manager.watchdog_tick()
+        self.assertNotIn('assign-tun', self.system.events)
+
+    def test_a_start_rejected_after_restoring_direct_dns_stops_reporting_it(self):
+        # With DNS recovery off a crash leaves Unbound forwarding, and the
+        # status keeps saying so. A start that restores direct DNS and then
+        # fails must not leave that claim behind for the watchdog to repeat.
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.write_settings(dict(self.manager.settings(), dns_fallback=False))
+        self.manager.dispatch('enable-transparent')
+        self.system.alive = False
+        self.assertTrue(self.manager.watchdog_tick()['dns_active'])
+        self.assertTrue(self.system.forwarded)
+        self.system.reject = True
+        with self.assertRaises(m.Error):
+            self.manager.dispatch('start')
+        self.assertFalse(self.system.forwarded)
+        self.assertFalse(self.status_file()['dns_active'])
+        self.assertIn('Rejected test config.', self.status_file()['error'])
+        self.assertFalse(self.manager.watchdog_tick()['dns_active'])
+
+    def test_an_unreadable_resolver_configuration_never_counts_as_validating(self):
+        # The watchdog loop survives only Error and OSError.
+        config = self.manager.path('/conf/config.xml')
+        config.parent.mkdir(parents=True, exist_ok=True)
+        for content in (b"<?xml version='1.0' encoding='x-unknown'?><opnsense/>",
+                        b"<?xml version='1.0' encoding='shift_jis'?><opnsense/>", b'<opnsense>', b''):
+            with self.subTest(content=content):
+                config.write_bytes(content)
+                self.assertFalse(self.manager.unbound_validating())
+
+    def test_an_already_running_boot_reports_the_request_without_a_published_answer(self):
+        # A false positive costs the crash rescue one harmless restoration; a
+        # false negative would skip it.
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.manager.status_file.unlink()
+        self.assertTrue(self.manager.dispatch('boot')['dns_active'])
+
+    def test_an_already_running_boot_keeps_a_published_answer_only_while_requested(self):
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.assertTrue(self.status_file()['dns_active'])
+        settings = json.loads(self.manager.settings_file.read_bytes())
+        settings['router_dns'] = True
+        self.manager.settings_file.write_text(json.dumps(settings))
+        self.assertFalse(self.manager.dispatch('boot')['dns_active'])
+
+    def test_boot_restores_direct_dns_before_a_rejected_configuration(self):
+        self.unbound(False)
+        self.manager.apply(SUBSCRIPTION)
+        self.manager.dispatch('enable-transparent')
+        self.assertTrue(self.system.forwarded)
+        # An unclean shutdown leaves Unbound forwarding to a core that is gone,
+        # and the configuration no longer validates when the router comes up.
+        self.system.alive = False
+        self.system.reject = True
+        self.system.events.clear()
+        with self.assertRaises(m.Error):
+            self.manager.dispatch('boot')
+        self.assertIn('dns-off', self.system.events)
+        self.assertIn('validate', self.system.events)
+        self.assertLess(self.system.events.index('dns-off'), self.system.events.index('validate'))
+        self.assertFalse(self.system.forwarded)
+        self.assertNotIn('dns-on', self.system.events)
+
+    def test_the_request_ignores_capture_selection_and_follows_router_dns(self):
+        generated = {'tun': {'enable': True}, 'dns': {'enable': True, 'listen': '127.0.0.1:1053'}}
+        self.assertTrue(m.dns_requested({'router_dns': False}, generated))
+        self.assertTrue(m.dns_requested({'router_dns': False, 'device_mode': 'whitelist',
+                                         'device_list': ['192.0.2.10'], 'capture_interfaces': ['opt5']},
+                                        generated))
+        self.assertFalse(m.dns_requested({'router_dns': True}, generated))
+        for changed in ({'tun': {'enable': False}}, {'dns': {'enable': False}},
+                        {'dns': {'enable': True, 'listen': '127.0.0.1:1054'}}, {'dns': None}, {'tun': 'on'}):
+            with self.subTest(changed=changed):
+                self.assertFalse(m.dns_requested({}, dict(generated, **changed)))
 
     def test_transparent_migration_saves_real_dns_instead_of_using_legacy_fake_pool(self):
         self.manager.apply(SUBSCRIPTION.replace(b'198.18.0.1/16', b'28.0.0.1/8'))
@@ -698,15 +911,29 @@ class IntegrationHelperTests(unittest.TestCase):
         self.assertEqual(1, len(lines))
         return json.loads(lines[0].split(': ', 1)[1])
 
-    def real_dns_mode(self, mode):
-        self.config.write_text(self.original.replace(
-            '<forwarding><enabled>1</enabled>', '<general><dnssec>1</dnssec></general><forwarding><enabled>0</enabled>'))
+    def real_dns_mode(self, mode, dnssec=False):
+        """A resolver in the given Mihomo DNS mode.
+
+        The non-validating group starts with forwarding already off, so the
+        journal and private-address semantics are what changes. The DNSSEC
+        control group keeps forwarding on, so that any change to it shows.
+        """
+        if dnssec:
+            self.config.write_text(self.original.replace(
+                '<forwarding>', '<general><dnssec>1</dnssec></general><forwarding>'))
+        else:
+            self.config.write_text(self.original.replace(
+                '<forwarding><enabled>1</enabled>', '<forwarding><enabled>0</enabled>'))
         state = self.root / 'var/db/os-mihomo'
         state.mkdir(parents=True, exist_ok=True)
         settings = state / 'settings.json'
         settings.write_text(json.dumps({'dns_mode': mode}))
         settings.chmod(0o600)
         return state
+
+    def unbound_subtree(self):
+        import xml.etree.ElementTree as ET
+        return ET.tostring(ET.parse(self.config).getroot().find('./OPNsense/unboundplus'))
 
     def test_disable_removes_the_forward_zone_even_when_the_rest_fails(self):
         # Everything after this point can throw -- a restored configuration
@@ -725,16 +952,77 @@ class IntegrationHelperTests(unittest.TestCase):
         # Unbound accept them is the one that stops it starting.
         self.config.write_text(self.config.read_text().replace(
             '<forwarding>', '<general><dnssec>1</dnssec></general><forwarding>'))
+        before = self.unbound_subtree()
         result = self.helper('enable')
         self.assertEqual(0, result.returncode)
         self.assertFalse(self.zone().exists())
         self.assertFalse(self.helper_state(result)['effective_forwarding'])
+        self.assertFalse(self.helper_state(result)['dns_changed'])
+        # Nothing else changes either: turning forwarding off with no zone in
+        # its place would leave Unbound recursing from the root instead of
+        # using the operator's upstreams. Only the TUN assignment is added.
+        self.assertEqual(before, self.unbound_subtree())
+        self.assertFalse((self.root / 'var/db/os-mihomo/dns-state.json').exists())
         repeated = self.helper('enable')
         self.assertEqual(0, repeated.returncode)
         self.assertIn('unchanged', repeated.stdout)
         self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
                           'integration_changed': False, 'filter_changed': False,
                           'cron_changed': False}, self.helper_state(repeated))
+        self.assertEqual(before, self.unbound_subtree())
+        self.assertFalse(self.zone().exists())
+
+    def test_a_validating_resolver_keeps_journal_private_address_and_forwarding(self):
+        import xml.etree.ElementTree as ET
+        for mode in ('redir-host', 'normal', 'fake-ip', 'unknown'):
+            with self.subTest(mode=mode):
+                state = self.real_dns_mode(mode, dnssec=True)
+                expected = self.xml()
+                before = self.unbound_subtree()
+                enabled = self.helper('enable')
+                self.assertEqual(0, enabled.returncode)
+                self.assertFalse(self.helper_state(enabled)['effective_forwarding'])
+                self.assertFalse(self.helper_state(enabled)['dns_changed'])
+                self.assertFalse((state / 'dns-state.json').exists())
+                self.assertEqual(before, self.unbound_subtree())
+                root = ET.parse(self.config).getroot()
+                self.assertEqual('1', root.findtext('./OPNsense/unboundplus/forwarding/enabled'))
+                self.assertIn('198.18.0.0/15', root.findtext(
+                    './OPNsense/unboundplus/advanced/privateaddress').split(','))
+                self.assertFalse(self.zone().exists())
+                self.assertEqual(0, self.helper('disable').returncode)
+                self.assertEqual(expected, self.xml())
+
+    def test_a_journal_left_before_validation_is_kept_for_disable_to_restore(self):
+        # The state an earlier release left on a validating resolver: forwarding
+        # off and the fake-ip range removed, with no forward zone behind them.
+        # enable must not touch it, and the disable every start runs first puts
+        # the operator's configuration back.
+        import xml.etree.ElementTree as ET
+        state = self.real_dns_mode('fake-ip', dnssec=True)
+        self.config.write_text(self.config.read_text().replace(
+            '<forwarding><enabled>1</enabled>', '<forwarding><enabled>0</enabled>'
+        ).replace('10.0.0.0/8,198.18.0.0/15', '10.0.0.0/8'))
+        journal = state / 'dns-state.json'
+        journal.write_text(json.dumps({'forwarding': '1', 'roots': {'owner-dot': '1'},
+                                      'had_fake_ip_private_address': True,
+                                      'removed_fake_ip_private_address': True}))
+        saved = journal.read_bytes()
+        before = self.unbound_subtree()
+        enabled = self.helper('enable')
+        self.assertEqual(0, enabled.returncode)
+        self.assertFalse(self.helper_state(enabled)['effective_forwarding'])
+        self.assertEqual(saved, journal.read_bytes())
+        self.assertEqual(before, self.unbound_subtree())
+        self.assertFalse(self.zone().exists())
+        disabled = self.helper('disable')
+        self.assertEqual(0, disabled.returncode)
+        self.assertTrue(self.helper_state(disabled)['dns_changed'])
+        root = ET.parse(self.config).getroot()
+        self.assertEqual('1', root.findtext('./OPNsense/unboundplus/forwarding/enabled'))
+        self.assertIn('198.18.0.0/15', root.findtext(
+            './OPNsense/unboundplus/advanced/privateaddress').split(','))
+        self.assertFalse(journal.exists())
 
     def test_forwarding_metadata_follows_enable_and_disable(self):
         enabled = self.helper('enable')
@@ -765,9 +1053,15 @@ class IntegrationHelperTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 state = self.real_dns_mode(mode)
                 expected = self.xml()
+                before = self.unbound_subtree()
                 enabled = self.helper('enable')
                 self.assertEqual(0, enabled.returncode)
-                self.assertFalse(self.helper_state(enabled)['dns_changed'])
+                # Forwarding was already off and the private address stays, so
+                # the forward zone is the only DNS change.
+                self.assertTrue(self.helper_state(enabled)['dns_changed'])
+                self.assertTrue(self.helper_state(enabled)['effective_forwarding'])
+                self.assertEqual(before, self.unbound_subtree())
+                self.assertTrue(self.zone().exists())
                 journal = state / 'dns-state.json'
                 saved = journal.read_bytes()
                 self.assertTrue(json.loads(saved)['had_fake_ip_private_address'])
@@ -775,12 +1069,14 @@ class IntegrationHelperTests(unittest.TestCase):
                 repeated = self.helper('enable')
                 self.assertEqual(0, repeated.returncode)
                 self.assertEqual(saved, journal.read_bytes())
-                self.assertEqual({'effective_forwarding': False, 'dns_changed': False,
+                self.assertEqual({'effective_forwarding': True, 'dns_changed': False,
                                   'integration_changed': False, 'filter_changed': False,
                                   'cron_changed': False}, self.helper_state(repeated))
                 disabled = self.helper('disable')
                 self.assertEqual(0, disabled.returncode)
-                self.assertFalse(self.helper_state(disabled)['dns_changed'])
+                self.assertTrue(self.helper_state(disabled)['dns_changed'])
+                self.assertFalse(self.zone().exists())
+                self.assertEqual(before, self.unbound_subtree())
                 self.assertEqual(expected, self.xml())
                 self.assertFalse(journal.exists())
 
@@ -792,9 +1088,14 @@ class IntegrationHelperTests(unittest.TestCase):
         private = xml.find('./OPNsense/unboundplus/advanced/privateaddress')
         private.text = '10.0.0.0/8,172.16.0.0/12'
         xml.write(self.config)
+        before = self.unbound_subtree()
         disabled = self.helper('disable')
         self.assertEqual(0, disabled.returncode)
-        self.assertFalse(self.helper_state(disabled)['dns_changed'])
+        # Removing the forward zone is the whole DNS change; the resolver's
+        # configuration is left as the operator last saved it.
+        self.assertTrue(self.helper_state(disabled)['dns_changed'])
+        self.assertFalse(self.zone().exists())
+        self.assertEqual(before, self.unbound_subtree())
         self.assertEqual('10.0.0.0/8,172.16.0.0/12', ET.parse(self.config).findtext(
             './OPNsense/unboundplus/advanced/privateaddress'))
 
@@ -806,9 +1107,12 @@ class IntegrationHelperTests(unittest.TestCase):
         journal.write_text(json.dumps({'forwarding': '0', 'roots': {},
                                       'had_fake_ip_private_address': True}))
         saved = journal.read_bytes()
+        before = self.unbound_subtree()
         enabled = self.helper('enable')
         self.assertEqual(0, enabled.returncode)
-        self.assertFalse(self.helper_state(enabled)['dns_changed'])
+        # Only the forward zone changes; the legacy journal waits for disable.
+        self.assertTrue(self.helper_state(enabled)['dns_changed'])
+        self.assertEqual(before, self.unbound_subtree())
         self.assertEqual(saved, journal.read_bytes())
         disabled = self.helper('disable')
         self.assertEqual(0, disabled.returncode)

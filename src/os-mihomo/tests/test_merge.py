@@ -1029,28 +1029,35 @@ class StaleForwarderTests(unittest.TestCase):
 
     def test_dnssec_effective_disabled_skips_an_unchanged_enable_restart(self):
         with patch.object(self.system, 'run', side_effect=self.effective_record(False)):
-            self.system.dns(True, {'dns_fallback': True})
+            # The caller publishes this answer, not what it asked for.
+            self.assertIs(False, self.system.dns(True, {'dns_fallback': True}))
         self.assertFalse(self.reloaded())
         self.assertFalse(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
 
     def test_dnssec_effective_disabled_still_repairs_stale_generated_forwarding(self):
         self.generated.write_text('forward-addr: %s\n' % m.FORWARDER)
         with patch.object(self.system, 'run', side_effect=self.effective_record(False)):
-            self.system.dns(True, {'dns_fallback': True})
+            self.assertIs(False, self.system.dns(True, {'dns_fallback': True}))
         self.assertTrue(self.reloaded())
         self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
 
     def test_effective_enabled_still_repairs_a_missing_generated_forwarder(self):
         with patch.object(self.system, 'run', side_effect=self.effective_record(True)):
-            self.system.dns(True, {'dns_fallback': True})
+            self.assertIs(True, self.system.dns(True, {'dns_fallback': True}))
         self.assertTrue(self.reloaded())
         self.assertTrue(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))
 
     def test_pending_dns_reload_is_not_skipped_when_dnssec_forwarding_agrees(self):
         (Path(m.STATE) / 'dns-reload-pending').write_text('pending\n')
         with patch.object(self.system, 'run', side_effect=self.effective_record(False)):
-            self.system.dns(True, {'dns_fallback': True})
+            self.assertIs(False, self.system.dns(True, {'dns_fallback': True}))
         self.assertTrue(self.reloaded())
+
+    def test_an_unchanged_active_forwarder_reports_forwarding_without_a_reload(self):
+        self.generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        with patch.object(self.system, 'run', side_effect=self.effective_record(True)):
+            self.assertIs(True, self.system.dns(True, {'dns_fallback': True}))
+        self.assertFalse(self.reloaded())
 
     def test_invalid_effective_forwarding_metadata_fails_closed_and_keeps_receipt(self):
         for invalid in ('false', 0, None):
@@ -1079,7 +1086,7 @@ class StaleForwarderTests(unittest.TestCase):
     def test_tun_only_change_reloads_filter_without_restarting_unchanged_resolver(self):
         with patch.object(self.system, 'run', side_effect=self.integration_record()), \
                 patch.object(self.system, 'resolver_running', return_value=True):
-            self.system.dns(False, {'dns_fallback': True})
+            self.assertIs(False, self.system.dns(False, {'dns_fallback': True}))
         self.assertTrue(self.reloaded())
         self.assertTrue(any(args[1:3] == ['filter', 'reload'] for args in self.ran))
         self.assertFalse(any(args[1:3] == ['unbound', 'restart'] for args in self.ran))

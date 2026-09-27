@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+# Package upgrades keep the service setting and the rate-limit state.
+[ -n "${PKG_UPGRADE+x}" ] && exit 0
+
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php remove os-wanguard >/dev/null 2>&1 || true
+fi
+
+# The settings stay in config.xml, as OPNsense does for every plugin, so a
+# reinstall finds them again. Runtime state and discarded leases go.
+rm -f /etc/rc.conf.d/wanguard /var/run/wanguard.pid
+rm -rf /var/run/wanguard /var/db/os-wanguard
+
+# -B on every invocation keeps this from growing back; this only cleans up
+# what an older, unfixed version left behind (not tracked by the package, so
+# pkg delete does not remove it on its own).
+rm -rf /usr/local/opnsense/scripts/wanguard/__pycache__
+
+if configctl template reload OPNsense/Syslog >/dev/null 2>&1; then
+    configctl syslog restart >/dev/null 2>&1 || true
+fi
+rm -f \
+	/var/lib/php/tmp/opnsense_menu_cache.xml \
+	/var/lib/php/tmp/opnsense_acl_cache.json
+service configd restart >/dev/null 2>&1 || true
+exit 0

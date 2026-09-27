@@ -26,7 +26,25 @@ PLUGINS = {
     'os-speedtest': ('Speedtest', 'speedtest'),
     'os-sing-box': ('SingBox', 'singbox'),
     'os-frp': ('Frp', 'frp'),
+    'os-wanguard': ('Wanguard', 'wanguard'),
 }
+# A plugin whose settings live in config.xml uses the framework's model and
+# service controllers; the actions they inherit are real routes too.
+INHERITED = {
+    'ApiControllerBase': set(),
+    'ApiMutableModelControllerBase': {'get', 'set'},
+    'ApiMutableServiceControllerBase': {'start', 'stop', 'restart', 'reconfigure', 'status'},
+}
+BASE = re.compile(r'extends\s+(?:\\OPNsense\\Base\\)?(' + '|'.join(INHERITED) + r')\b')
+
+
+def serves(source, action):
+    """Whether a controller's source declares or inherits an API action."""
+    base = BASE.search(source)
+    return bool(re.search(r'public\s+function\s+' + re.escape(action) + r'Action\s*\(', source)) or (
+        base is not None and action in INHERITED[base.group(1)])
+
+
 # Public methods verified against the real OPNsense 26.7 Request.php. Phalcon
 # methods such as getHttpHost are absent, even though its examples use them.
 REQUEST_METHODS = {
@@ -129,10 +147,13 @@ class MvcMigrationTests(unittest.TestCase):
                 with self.subTest(controller=str(path.relative_to(ROOT))):
                     source = path.read_text()
                     self.assertIn('namespace OPNsense\\' + module + '\\Api;', source)
-                    self.assertRegex(source, r'extends\s+(?:\\OPNsense\\Base\\)?ApiControllerBase')
+                    base = BASE.search(source)
+                    self.assertIsNotNone(base, 'The controller extends no supported API base class')
                     methods = set(re.findall(r'\$this->request->([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', source))
                     self.assertEqual(set(), methods - REQUEST_METHODS, 'Unsupported Request methods')
-                    self.assertRegex(source, r'configd(?:p)?Run\s*\(')
+                    if base.group(1) != 'ApiMutableModelControllerBase':
+                        # A model controller saves through config.xml; every other one reaches configd.
+                        self.assertRegex(source, r'configd(?:p)?Run\s*\(')
                     for command in re.findall(r'configd(?:p)?Run\s*\(\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]', source):
                         parts = command.split()
                         self.assertIn(parts[0], commands, 'Unknown configd action group')
@@ -174,9 +195,9 @@ class MvcMigrationTests(unittest.TestCase):
                 self.assertTrue(endpoints, 'The view does not reference a registered API')
                 for controller, action in endpoints:
                     self.assertIn(controller.lower(), controllers, 'Missing API controller')
-                    self.assertRegex(controllers[controller.lower()], r'public\s+function\s+' + re.escape(action) + r'Action\s*\(', 'Missing API action: ' + action)
+                    self.assertTrue(serves(controllers[controller.lower()], action), 'Missing API action: ' + action)
                 for action in markup.actions:
-                    self.assertRegex(controllers.get('service', ''), r'public\s+function\s+' + re.escape(action) + r'Action\s*\(', 'Missing button API action: ' + action)
+                    self.assertTrue(serves(controllers.get('service', ''), action), 'Missing button API action: ' + action)
 
     def test_configd_commands_reference_packaged_helpers(self):
         for package, _, _ in self.packages():

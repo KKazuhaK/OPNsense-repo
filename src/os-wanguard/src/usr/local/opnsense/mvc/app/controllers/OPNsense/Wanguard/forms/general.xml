@@ -1,0 +1,28 @@
+<form>
+    <field>
+        <id>general.enabled</id>
+        <label>Enable</label>
+        <type>checkbox</type>
+        <help>Watch the selected interfaces and re-request their IPv4 DHCP lease while they hold an unwanted address.</help>
+    </field>
+    <field>
+        <id>general.interfaces</id>
+        <label>Interfaces</label>
+        <type>select_multiple</type>
+        <help>Only enabled interfaces whose IPv4 configuration type is DHCP can be watched, and never the LAN. DHCPv6 and prefix delegation on the same interface are left alone.</help>
+    </field>
+    <field>
+        <id>general.networks</id>
+        <label>Unwanted networks</label>
+        <type>select_multiple</type>
+        <style>tokenize</style>
+        <allownew>true</allownew>
+        <help>An address inside one of these IPv4 networks is unwanted, for example the private LAN of an ISP gateway in passthrough mode such as 172.31.254.0/24. Enter networks with a prefix of /8 or longer, at most 32 of them.</help>
+    </field>
+    <field>
+        <id>general.private_ranges</id>
+        <label>Private ranges are unwanted</label>
+        <type>checkbox</type>
+        <help>Also treat every private (RFC 1918), shared (100.64.0.0/10) and link-local address as unwanted. Enable only if the ISP normally hands this router a public address. With CGNAT (100.64.0.0/10) this would retry forever.</help>
+    </field>
+</form>

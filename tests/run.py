@@ -25,6 +25,8 @@ PORTABLE_PHP = {
                   ('src/os-mihomo/tests/native/test-newwanip-scope.php',),
                   ('src/os-mihomo/tests/native/test-tun-rule-ownership.php',)],
     'os-frp': [('src/os-frp/tests/native/test-backup-fields.php',)],
+    'os-wanguard': [('src/os-wanguard/tests/native/test-newwanip.php',),
+                    ('src/os-wanguard/tests/native/test-controller.php',)],
 }
 NATIVE_PHP = {
     'common': [('src/common/tests/native/test-backup-cas.php',),
@@ -36,6 +38,10 @@ NATIVE_PHP = {
                     ('src/os-sing-box/tests/native/test-settings.php',
                      'src/os-sing-box/src/usr/local/opnsense/scripts/singbox/singbox.php')],
     'os-kazuha-repo': [('src/os-kazuha-repo/tests/native/test-manifest-lock.php',)],
+    'os-wanguard': [('src/os-wanguard/tests/native/test-model.php',),
+                    ('src/os-wanguard/tests/native/test-private-parity.php',),
+                    ('src/os-wanguard/tests/native/check-undefined.php',),
+                    ('src/os-wanguard/tests/native/test-core-contract.php',)],
 }
 NATIVE_PYTHON = {
     'shared': ['tests/native/test-utility-upgrade.py'],

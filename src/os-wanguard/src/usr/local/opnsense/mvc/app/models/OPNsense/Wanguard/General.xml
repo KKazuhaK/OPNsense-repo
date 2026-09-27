@@ -1,0 +1,33 @@
+<model>
+    <mount>//OPNsense/wanguard/general</mount>
+    <description>WAN Guard</description>
+    <version>1.0.0</version>
+    <items>
+        <enabled type="BooleanField">
+            <Default>0</Default>
+            <Required>Y</Required>
+        </enabled>
+        <interfaces type="InterfaceField">
+            <Multiple>Y</Multiple>
+            <Default>wan</Default>
+            <filters>
+                <enable>/^(?!0).*$/</enable>
+                <ipaddr>/^dhcp$/</ipaddr>
+            </filters>
+            <ValidationMessage>Only enabled interfaces whose IPv4 type is DHCP can be watched.</ValidationMessage>
+        </interfaces>
+        <networks type="NetworkField">
+            <AsList>Y</AsList>
+            <FieldSeparator>,</FieldSeparator>
+            <NetMaskRequired>Y</NetMaskRequired>
+            <AddressFamily>ipv4</AddressFamily>
+            <WildcardEnabled>N</WildcardEnabled>
+            <Strict>Y</Strict>
+            <ValidationMessage>Enter IPv4 networks such as 172.31.254.0/24, without host bits.</ValidationMessage>
+        </networks>
+        <private_ranges type="BooleanField">
+            <Default>0</Default>
+            <Required>Y</Required>
+        </private_ranges>
+    </items>
+</model>

@@ -1,0 +1,10 @@
+<menu>
+    <Services>
+        <Wanguard VisibleName="WAN Guard" order="92" cssClass="fa fa-shield fa-fw">
+            <Settings order="10" VisibleName="Settings" url="/ui/wanguard">
+                <item url="/ui/wanguard/*" visibility="hidden"/>
+            </Settings>
+            <Log order="100" VisibleName="Log File" url="/ui/diagnostics/log/core/wanguard"/>
+        </Wanguard>
+    </Services>
+</menu>

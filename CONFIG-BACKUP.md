@@ -18,6 +18,7 @@
 | Speedtest | 测速偏好，不包含测速历史 | `OPNsense/Speedtest/backup` |
 | DDClient-opnwall | 直接使用原生 MVC 模型，包括 DNS 提供商凭据 | `OPNsense/DynDNS` |
 | Unboundcustom | 直接使用原生 MVC 模型，包括自定义选项 | `OPNsense/unboundcustom` |
+| Wanguard | 直接使用原生 MVC 模型，包括监视接口、不想要的网络和私网开关；速率限制状态与移开的租约属于运行状态，不备份 | `OPNsense/wanguard` |
 | 汉化工具 | 系统语言选择已经在系统配置内；下载的翻译文件属于可重新安装的软件内容 | `system/language` |
 | Pftop | 没有持久配置；页面筛选参数和连接快照属于临时状态 | 无需配置镜像 |
 | KazuhaRepo | 已安装软件包的恢复清单，保留有效的软件包名和版本 | `OPNsense/KazuhaRepo/backup` |

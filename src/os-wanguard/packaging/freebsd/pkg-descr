@@ -1,0 +1,5 @@
+WAN Guard for OPNsense watches selected DHCP interfaces and re-requests their
+IPv4 lease while they hold an unwanted address, such as the private address an
+ISP gateway in passthrough mode hands out before the public one. Only the IPv4
+DHCP client of the affected interface is restarted; DHCPv6 and prefix
+delegation are left alone. Retries back off and every action is logged.

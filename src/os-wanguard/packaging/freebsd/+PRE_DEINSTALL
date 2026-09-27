@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+# Stop on upgrades as well, so old code never runs against new files. The DHCP
+# clients are left exactly as they are: the WAN keeps its lease.
+service wanguard onestop >/dev/null 2>&1 || true
+exit 0

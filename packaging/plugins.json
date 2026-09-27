@@ -165,6 +165,14 @@
       },
       "version_file": {"path": "/usr/local/opnsense/version/unboundcustom", "format": "json"}
     },
+    "os-wanguard": {
+      "staging": "tree",
+      "abi": "independent",
+      "version": "1.0.0",
+      "stage": {"src": "/"},
+      "deps": {"python313": "lang/python313"},
+      "version_file": {"path": "/usr/local/opnsense/version/wanguard", "format": "json"}
+    },
     "os-ddclient-opnwall": {
       "staging": "tree",
       "abi": "independent",

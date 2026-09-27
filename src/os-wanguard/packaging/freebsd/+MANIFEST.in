@@ -1,0 +1,14 @@
+name: "@PKG_NAME@"
+origin: "@ORIGIN@"
+version: "@VERSION@"
+comment: "@COMMENT@"
+maintainer: "@MAINTAINER@"
+www: "@WWW@"
+abi: "@ABI@"
+arch: "@ARCH@"
+prefix: "@PREFIX@"
+flatsize: @FLATSIZE@
+deps: { python313: { origin: "lang/python313", version: ">=0" } }
+desc: <<EOD
+@DESC@
+EOD

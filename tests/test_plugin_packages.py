@@ -93,6 +93,8 @@ BUILDS = {
                             'generate': {'/usr/local/opnsense/version/ddclient-opnwall': DDCLIENT_VERSION}},
     'os-kazuha-repo': {'abi': WILDCARD, 'copy': [('src', '/')], 'version_rewrite': True,
                        'annotations': 'version-file'},
+    'os-wanguard': {'abi': WILDCARD, 'copy': [('src', '/')],
+                    'deps': {'python313': {'origin': 'lang/python313', 'version': '>=0'}}},
     'os-ttyd': {'abi': NATIVE, 'copy': [('src', '/')],
                 'shared_copy': [('src/common/config_backup.py', '/usr/local/opnsense/scripts/ttyd/config_backup.py'),
                                 ('src/common/config_backup.php', '/usr/local/opnsense/scripts/ttyd/config_backup.php')],

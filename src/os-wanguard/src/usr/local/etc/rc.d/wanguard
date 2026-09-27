@@ -1,0 +1,85 @@
+#!/bin/sh
+
+# PROVIDE: wanguard
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="wanguard"
+rcvar="wanguard_enable"
+desc="WAN Guard for OPNsense"
+extra_commands="reload"
+start_cmd="wanguard_start"
+stop_cmd="wanguard_stop"
+status_cmd="wanguard_status"
+reload_cmd="wanguard_reload"
+
+# Not called pidfile: rc.subr would then try to match the process itself.
+wanguard_pidfile="/var/run/wanguard.pid"
+wanguard_python="/usr/local/bin/python3"
+wanguard_control="/usr/local/opnsense/scripts/wanguard/wanguard.py"
+
+wanguard_running()
+{
+    [ -f "$wanguard_pidfile" ] && /bin/pgrep -F "$wanguard_pidfile" >/dev/null 2>&1
+}
+
+wanguard_start()
+{
+    install -d -m 0700 /var/run/wanguard /var/db/os-wanguard
+    if wanguard_running; then
+        echo "wanguard is already running."
+        return 0
+    fi
+    # The supervisor restarts a crashed daemon after 30 seconds; the rate
+    # limits it persisted still apply. Tracebacks go to the plugin log.
+    # -B keeps Python from leaving a __pycache__ behind under the package's
+    # own script directory (pkg does not track it, so pkg delete cannot clean
+    # it up).
+    /usr/sbin/daemon -f -r -R 30 -P "$wanguard_pidfile" -S -T wanguard \
+        "$wanguard_python" -B "$wanguard_control" run
+}
+
+wanguard_stop()
+{
+    if ! wanguard_running; then
+        echo "wanguard is not running."
+        return 0
+    fi
+    # The supervisor forwards TERM to the daemon, which starts no helper call
+    # after that and stops within a second, or once a call already under way
+    # returns (bounded by its 60 s timeout). Waiting for it lets a restart,
+    # such as the one after a package upgrade, start a fresh daemon.
+    /bin/pkill -F "$wanguard_pidfile"
+    count=0
+    while wanguard_running; do
+        if [ "$count" -ge 75 ]; then
+            echo "wanguard is still finishing an action and will stop when it is done."
+            return 1
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+}
+
+wanguard_status()
+{
+    if wanguard_running; then
+        echo "wanguard is running as pid $(cat "$wanguard_pidfile")."
+        return 0
+    fi
+    echo "wanguard is not running."
+    return 1
+}
+
+wanguard_reload()
+{
+    # New settings apply at the next observation, which this asks for now.
+    "$wanguard_python" -B "$wanguard_control" wake
+}
+
+load_rc_config "$name"
+: "${wanguard_enable:=NO}"
+
+run_rc_command "$1"

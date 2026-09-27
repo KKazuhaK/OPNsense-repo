@@ -1,0 +1,11 @@
+<acl>
+    <page-services-wanguard>
+        <name>Services: WAN Guard</name>
+        <patterns>
+            <pattern>ui/wanguard/*</pattern>
+            <pattern>api/wanguard/*</pattern>
+            <pattern>ui/diagnostics/log/core/wanguard/*</pattern>
+            <pattern>api/diagnostics/log/core/wanguard/*</pattern>
+        </patterns>
+    </page-services-wanguard>
+</acl>

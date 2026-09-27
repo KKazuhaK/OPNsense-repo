@@ -1,0 +1,50 @@
+#!/bin/sh
+set -eu
+
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-wanguard >/dev/null 2>&1 || true
+fi
+if [ -f /usr/local/opnsense/scripts/firmware/repos/kazuha.sh ]; then
+    /bin/sh /usr/local/opnsense/scripts/firmware/repos/kazuha.sh mirror >/dev/null 2>&1 \
+        || echo 'Warning: Kazuha plugin restore manifest could not be updated.' >&2
+fi
+
+echo "===> Preparing WAN Guard"
+# Rate-limit state lives here, outside the package, so upgrades keep it.
+install -d -m 0700 /var/db/os-wanguard
+chmod 0755 /usr/local/etc/rc.d/wanguard /usr/local/opnsense/scripts/wanguard/wanguard.py
+chmod 0644 \
+	/usr/local/etc/inc/plugins.inc.d/wanguard.inc \
+	/usr/local/opnsense/scripts/wanguard/guard.py \
+	/usr/local/opnsense/scripts/wanguard/helper.php \
+	/usr/local/opnsense/service/conf/actions.d/actions_wanguard.conf \
+	/usr/local/opnsense/service/templates/OPNsense/Syslog/local/wanguard.conf
+find /usr/local/opnsense/mvc/app/controllers/OPNsense/Wanguard /usr/local/opnsense/mvc/app/models/OPNsense/Wanguard \
+	/usr/local/opnsense/mvc/app/views/OPNsense/Wanguard /usr/local/opnsense/service/templates/OPNsense/Wanguard \
+	-type f -exec chmod 0644 {} +
+
+echo "===> Clearing OPNsense menu and ACL cache"
+rm -f \
+	/var/lib/php/tmp/opnsense_menu_cache.xml \
+	/var/lib/php/tmp/opnsense_acl_cache.json
+
+echo "===> Reloading configd actions, templates and the log target"
+service configd restart >/dev/null 2>&1 || true
+configctl template reload OPNsense/Wanguard >/dev/null 2>&1 \
+    || echo 'Warning: the WAN Guard service setting could not be generated.' >&2
+if configctl template reload OPNsense/Syslog >/dev/null 2>&1; then
+    configctl syslog restart >/dev/null 2>&1 \
+        || echo 'Warning: syslog could not be restarted; the WAN Guard log starts after the next restart.' >&2
+else
+    echo 'Warning: the WAN Guard log target could not be generated.' >&2
+fi
+
+# An upgrade, or a reinstall that found its settings in config.xml, resumes;
+# a fresh installation stays stopped until the plugin is enabled.
+if grep -qs '^wanguard_enable="YES"' /etc/rc.conf.d/wanguard; then
+    service wanguard restart >/dev/null 2>&1 \
+        || echo 'Warning: WAN Guard could not be restarted.' >&2
+fi
+
+echo "===> WAN Guard installed. Refresh the browser and open Services > WAN Guard."
+exit 0

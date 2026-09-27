@@ -1,10 +1,12 @@
 """Exercise private-FIB routing, firewall policy, and ownership transitions."""
 import copy
+import hashlib
 import importlib.util
 import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,6 +21,7 @@ sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location('mihomo_routing', SCRIPT)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+import dns_probe  # noqa: E402  (found beside routing.py)
 
 
 def route(destination, gateway, interface, flags='US'):
@@ -65,6 +68,8 @@ class Kernel:
         # sockstat reports it, and translation rules the plugin does not own.
         self.hooked = False
         self.listener_rows = []
+        # The core's DNS listeners on 127.0.0.1:1053, per transport.
+        self.dns_rows = {'udp': [], 'tcp': []}
         self.foreign_translation = ''
         self.translation_flushed = False
         self.flushed_tables = []
@@ -118,6 +123,7 @@ class Kernel:
             # The printed forms pfctl 15.1 uses for the generated rules.
             printed = [] if self.translation_flushed else [
                 line.replace(' to !<', ' to ! <').replace(' to any port 53', ' to any port = domain')
+                .replace(' port 53 -> ', ' port = domain -> ')
                 for line in self.anchor.splitlines() if line.startswith(('rdr ', 'no rdr '))]
             output = '\n'.join(printed + [line for line in [self.foreign_translation] if line]).encode()
         elif args == ['/sbin/pfctl', '-a', m.ANCHOR, '-sT']:
@@ -126,8 +132,14 @@ class Kernel:
         elif args[:4] == ['/sbin/pfctl', '-a', m.ANCHOR, '-t'] and args[5:] == ['-T', 'flush']:
             self.flushed_tables.append(args[4])
         elif args[0] == '/usr/bin/sockstat':
-            assert args == ['/usr/bin/sockstat', '-4', '-l', '-q', '-P', 'tcp', '-p', str(m.REDIRECT_PORT)], args
-            output = ''.join('root mihomo %s 5 tcp4 %s *:*\n' % row for row in self.listener_rows).encode()
+            assert args[:5] == ['/usr/bin/sockstat', '-4', '-l', '-q', '-P'] and args[6] == '-p', args
+            protocol, port = args[5], int(args[7])
+            if port == m.DNS_PORT:
+                rows = self.dns_rows[protocol]
+            else:
+                assert (protocol, port) == ('tcp', m.REDIRECT_PORT), args
+                rows = self.listener_rows
+            output = ''.join('root mihomo %s 5 %s4 %s *:*\n' % (row[0], protocol, row[1]) for row in rows).encode()
         elif args[:3] == ['/sbin/pfctl', '-a', m.ANCHOR]:
             if '-f' in args:
                 self.anchor = Path(args[-1]).read_text()
@@ -774,6 +786,448 @@ class RoutingTests(unittest.TestCase):
         self.assertIn('00000000000000aa/11223344', self.kernel.killed)
         self.assertNotIn('tcp_redirect_port', self.routing.load())
         self.assertEqual('', self.kernel.anchor)
+
+    # Translated and untranslated DNS states in the form pfctl -ss -vv printed
+    # them on OPNsense 26.7 for queries redirected to 127.0.0.1:1053.
+    DNS_STATES = ('all udp 127.0.0.1:%d (10.0.0.1:53) <- 10.0.0.5:45302       SINGLE:MULTIPLE\n'
+                  '   age 00:00:04, expires in 00:00:26, 1:1 pkts, 62:78 bytes, rule 115\n'
+                  '   id: %016x creatorid: 2f5db096\n'
+                  '   origif: vtnet1\n'
+                  'all tcp 127.0.0.1:%d (192.0.2.2:53) <- 10.0.0.5:40381       FIN_WAIT_2:FIN_WAIT_2\n'
+                  '   id: %016x creatorid: 2f5db096\n'
+                  '   origif: vtnet1\n')
+    UNTRANSLATED = ('all udp 10.0.0.1:53 <- 10.0.0.5:45300       SINGLE:MULTIPLE\n'
+                    '   id: 00000000000000ee creatorid: 2f5db096\n')
+
+    BIRTH = '1700000000:123456'
+
+    def ready_dns(self, pid=4242):
+        """Everything captured DNS needs: the scope, both listeners, the hook, the owning core and its verdict."""
+        self.settings['dns_scope'] = 'captured'
+        self.config['dns'].update(enable=True, listen='127.0.0.1:1053')
+        self.write_inputs()
+        self.observe(ipv6_reaching=False, changed=4000.0)
+        self.kernel.hooked = True
+        self.kernel.dns_rows = {protocol: [(str(pid), '127.0.0.1:1053')] for protocol in ('udp', 'tcp')}
+        group = MagicMock()
+        group.discover.return_value = {'child': {'pid': pid, 'ppid': 1, 'birth': self.BIRTH}}
+        group.same.return_value = True
+        patcher = patch.object(m, 'core_group', return_value=group)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = 5000.0
+        self.routing.clock = lambda: self.now
+        self.verdict(pid)
+        return group
+
+    def verdict(self, pid=4242, **changes):
+        """The manager's verdict that the core with pid answers DNS, as its latest probe recorded it."""
+        record = dict(dns_probe.fresh({'pid': pid, 'birth': self.BIRTH}, self.now),
+                      healthy=True, reason='', passes=1)
+        record.update(changes)
+        path = self.routing.path(dns_probe.HEALTH_FILE)
+        path.write_text(json.dumps(record))
+        path.chmod(0o600)
+
+    def observe(self, **observation):
+        path = self.routing.state / 'dns-scope.json'
+        path.write_text(json.dumps(observation))
+        path.chmod(0o600)
+
+    def dns_rules(self):
+        return [line for line in self.translation() if ' to <mihomo_self> port 53 -> ' in line]
+
+    def test_dns_redirect_arms_only_for_a_captured_scope_the_core_answers(self):
+        self.ready_dns()
+        result = self.routing.execute('enable')
+        self.assertTrue(result['active'])
+        self.assertEqual(1053, result['dns_redirect_port'])
+        self.assertNotIn('tcp_redirect_port', result)
+        self.assertEqual([
+            'rdr on vtnet1 inet proto udp from <mihomo_sources_0> to <mihomo_self> port 53 -> 127.0.0.1 port 1053',
+            'rdr on vtnet1 inet proto tcp from <mihomo_sources_0> to <mihomo_self> port 53 -> 127.0.0.1 port 1053'],
+            self.translation())
+        self.assertIn('table <mihomo_self> { 10.0.0.1/32, 192.0.2.2/32 }', self.kernel.anchor.splitlines())
+        # The printed rules are owned, so a refresh is quiet.
+        self.kernel.calls.clear()
+        self.assertEqual(1053, self.routing.execute('refresh')['dns_redirect_port'])
+        self.assertFalse(any(args[0] == '/sbin/pfctl' and '-f' in args for args in self.kernel.calls))
+        cases = [
+            ('scope all', lambda group: self.settings.update(dns_scope='all')),
+            ('scope off', lambda group: self.settings.update(dns_scope='off')),
+            ('no stored scope', lambda group: self.settings.pop('dns_scope')),
+            ('Mihomo DNS off', lambda group: self.config['dns'].update(enable=False)),
+            ('listener moved', lambda group: self.config['dns'].update(listen='127.0.0.1:1054')),
+            ('UDP listener only', lambda group: self.kernel.dns_rows.update(tcp=[])),
+            ('TCP listener only', lambda group: self.kernel.dns_rows.update(udp=[])),
+            ('wildcard listener beside the core', lambda group: self.kernel.dns_rows['udp'].append(('999', '*:1053'))),
+            ('port held by another process', lambda group: self.kernel.dns_rows.update(tcp=[('999', '127.0.0.1:1053')])),
+            ('core not recorded', lambda group: setattr(group.discover, 'return_value', None)),
+            ('core replaced', lambda group: setattr(group.same, 'return_value', False)),
+            ('filter never reloaded', lambda group: setattr(self.kernel, 'hooked', False)),
+            # Captured devices given IPv6 Mihomo does not carry: the scope is 'all'.
+            ('IPv6 reaching captured devices', lambda group: self.observe(ipv6_reaching=True)),
+            ('reach never observed', lambda group: (self.routing.state / 'dns-scope.json').unlink()),
+            # A record in the format of an earlier build decides nothing.
+            ('earlier record', lambda group: self.observe(ipv6_advertised=False)),
+            ('observation unreadable', lambda group: (self.routing.state / 'dns-scope.json').chmod(0o644)),
+            # The manager's probes found the core not answering, or never
+            # probed this core, or stopped probing.
+            ('verdict unhealthy', lambda group: self.verdict(healthy=False, reason='liveness')),
+            ('core never probed', lambda group: self.verdict(healthy=False, reason='starting')),
+            ('verdict about another core', lambda group: self.verdict(4243)),
+            ('verdict about an earlier life of the pid', lambda group: self.verdict(
+                core={'pid': 4242, 'birth': '1700000000:123457'})),
+            ('no verdict', lambda group: (self.routing.path(dns_probe.HEALTH_FILE)).unlink()),
+            ('verdict not private', lambda group: (self.routing.path(dns_probe.HEALTH_FILE)).chmod(0o644)),
+            ('verdict unreadable', lambda group: (self.routing.path(dns_probe.HEALTH_FILE)).write_text('{')),
+            ('verdict malformed', lambda group: self.verdict(passes=-1)),
+            ('verdict stale', lambda group: setattr(self, 'now', self.now + dns_probe.HEALTH_FRESH + 0.1)),
+            ('verdict from the future', lambda group: setattr(self, 'now', self.now - 1)),
+        ]
+        for name, change in cases:
+            with self.subTest(name):
+                group = self.ready_dns()
+                self.assertEqual(1053, self.routing.execute('refresh').get('dns_redirect_port'))
+                change(group)
+                self.write_inputs()
+                result = self.routing.execute('refresh')
+                self.assertTrue(result['active'])
+                self.assertNotIn('dns_redirect_port', result)
+                self.assertEqual([], self.dns_rules())
+                self.assertNotIn('<mihomo_self>', self.kernel.anchor)
+                self.assertIn('match in on vtnet1 inet proto udp from <mihomo_sources_0>', self.kernel.anchor)
+        # Mihomo carrying IPv6 lifts the fallback, and fake-ip is never offered.
+        self.ready_dns()
+        self.observe(ipv6_reaching=True)
+        self.config.update(ipv6=True)
+        self.config['dns']['ipv6'] = True
+        self.write_inputs()
+        self.assertEqual(1053, self.routing.execute('refresh')['dns_redirect_port'])
+        self.routing.config = dict(self.config, dns=dict(self.config['dns'], **{'enhanced-mode': 'fake-ip'}))
+        self.assertIsNone(self.routing.dns_redirect_port(self.settings))
+
+    def test_the_ipv6_declaration_keeps_the_redirect_whatever_the_record_says(self):
+        # The administrator declared that captured devices get no IPv6, so the
+        # scope never falls back to every device, as the manager decides it.
+        for name, record in (('reaching', {'ipv6_reaching': True}), ('never observed', None)):
+            with self.subTest(name):
+                self.ready_dns()
+                self.assertEqual(1053, self.routing.execute('enable')['dns_redirect_port'])
+                if record is None:
+                    (self.routing.state / 'dns-scope.json').unlink()
+                else:
+                    self.observe(**record)
+                self.settings.pop('ipv6_clients_restricted', None)
+                self.write_inputs()
+                self.assertNotIn('dns_redirect_port', self.routing.execute('refresh'))
+                # Only a stored true declares it.
+                for value in ('true', 1, False):
+                    self.settings['ipv6_clients_restricted'] = value
+                    self.write_inputs()
+                    self.assertNotIn('dns_redirect_port', self.routing.execute('refresh'))
+                self.settings['ipv6_clients_restricted'] = True
+                self.write_inputs()
+                self.assertEqual(1053, self.routing.execute('refresh')['dns_redirect_port'])
+                self.settings.pop('ipv6_clients_restricted')
+
+    def test_the_router_table_never_holds_the_tun_address_whatever_the_capture_selection(self):
+        self.context['local_addresses'].append('198.18.0.1')
+        for selection in ([], ['lan']):
+            with self.subTest(capture_interfaces=selection):
+                self.ready_dns()
+                self.settings['capture_interfaces'] = selection
+                self.write_inputs()
+                self.assertEqual(1053, self.routing.execute('enable')['dns_redirect_port'])
+                self.assertIn('table <mihomo_self> { 10.0.0.1/32, 192.0.2.2/32 }', self.kernel.anchor.splitlines())
+        # The TUN's entry only informs the policy; it is never captured.
+        self.settings['capture_interfaces'] = ['opt1']
+        self.write_inputs()
+        self.assertEqual(0, self.routing.execute('enable')['interface_count'])
+        self.assertTrue(self.routing.load()['awaiting_sources'])
+
+    def test_losing_a_dns_listener_hands_captured_sources_back_to_the_router_at_once(self):
+        self.ready_dns()
+        fib = self.routing.execute('enable')['fib']
+        self.kernel.states = (self.DNS_STATES % (1053, 0xd1, 1053, 0xd2) + self.UNTRANSLATED
+                              + self.REDIRECTED % (m.REDIRECT_PORT, 0xaa) + state(1, fib))
+        self.kernel.dns_rows['tcp'] = []
+        result = self.routing.execute('refresh')
+        self.assertTrue(result['active'])
+        self.assertNotIn('dns_redirect_port', self.routing.load())
+        # Translated queries are dropped on both transports; the untranslated
+        # one, the TCP listener's and the captured flows are not ours to drop.
+        self.assertEqual(['00000000000000d1/2f5db096', '00000000000000d2/2f5db096'], self.kernel.killed)
+        self.assertEqual([], self.dns_rules())
+
+    # A query a captured source sent to the router before the redirect armed,
+    # and one from outside capture, as pfctl -ss -vv prints them.
+    EARLIER = ('all udp 10.0.0.1:53 <- 10.0.0.5:5300       SINGLE:MULTIPLE\n'
+               '   id: 00000000000000e1 creatorid: 2f5db096\n'
+               '   origif: vtnet1\n'
+               'all tcp 192.0.2.2:53 <- 10.0.0.6:40000       ESTABLISHED:ESTABLISHED\n'
+               '   id: 00000000000000e2 creatorid: 2f5db096\n'
+               '   origif: vtnet1\n'
+               'all udp 10.0.0.1:53 <- 192.0.2.77:5300       SINGLE:MULTIPLE\n'
+               '   id: 00000000000000e3 creatorid: 2f5db096\n'
+               '   origif: vtnet0\n')
+
+    def test_arming_hands_earlier_router_dns_states_of_captured_sources_to_mihomo(self):
+        self.ready_dns()
+        self.kernel.states = self.EARLIER + self.UNTRANSLATED
+        self.assertEqual(1053, self.routing.execute('enable')['dns_redirect_port'])
+        self.assertEqual(['00000000000000e1/2f5db096', '00000000000000e2/2f5db096'], self.kernel.killed)
+        # The kills follow the load that makes the next packet translated.
+        calls = [args for args in self.kernel.calls if args[0] == '/sbin/pfctl']
+        load = max(index for index, args in enumerate(calls) if '-f' in args)
+        self.assertLess(load, min(index for index, args in enumerate(calls) if args[:3] == ['/sbin/pfctl', '-k', 'id']))
+        # A refresh with nothing to change reads no state table.
+        self.kernel.calls.clear()
+        self.routing.execute('refresh')
+        self.assertNotIn(['/sbin/pfctl', '-ss', '-vv'], self.kernel.calls)
+
+    def test_a_failed_handover_never_withdraws_the_redirect(self):
+        self.ready_dns()
+        self.kernel.states = self.EARLIER
+        self.kernel.fail_kill = True
+        result = self.routing.execute('enable')
+        self.assertTrue(result['active'])
+        self.assertEqual(1053, result['dns_redirect_port'])
+        self.assertEqual(2, len(self.dns_rules()))
+
+    def test_the_verdict_withdraws_and_rearms_through_refresh_alone(self):
+        self.ready_dns()
+        fib = self.routing.execute('enable')['fib']
+        for cycle in range(2):
+            with self.subTest(cycle=cycle):
+                # The core stops answering: the next refresh withdraws, and
+                # drops the queries already translated, on both transports.
+                self.kernel.states = self.DNS_STATES % (1053, 0xd1, 1053, 0xd2) + state(1, fib)
+                self.kernel.killed.clear()
+                self.verdict(healthy=False, reason='liveness')
+                result = self.routing.execute('refresh')
+                self.assertTrue(result['active'])
+                self.assertNotIn('dns_redirect_port', result)
+                self.assertEqual([], self.dns_rules())
+                self.assertEqual(['00000000000000d1/2f5db096', '00000000000000d2/2f5db096'], self.kernel.killed)
+                # Meanwhile captured sources asked the router DNS directly;
+                # re-arming takes those queries over too.
+                self.kernel.states = self.EARLIER + state(1, fib)
+                self.kernel.killed.clear()
+                self.verdict()
+                result = self.routing.execute('refresh')
+                self.assertEqual(1053, result['dns_redirect_port'])
+                self.assertEqual(2, len(self.dns_rules()))
+                self.assertEqual(['00000000000000e1/2f5db096', '00000000000000e2/2f5db096'], self.kernel.killed)
+                # Captured flows through the TUN were never touched.
+                self.assertEqual(fib, result['fib'])
+                self.assertIn('match in on vtnet1 inet proto udp from <mihomo_sources_0>', self.kernel.anchor)
+
+    def test_a_stale_verdict_withdraws_at_the_next_refresh(self):
+        # A watchdog that stopped probing leaves a verdict that ages out.
+        self.ready_dns()
+        self.routing.execute('enable')
+        self.now += dns_probe.HEALTH_FRESH
+        self.assertEqual(1053, self.routing.execute('refresh')['dns_redirect_port'])
+        self.now += 1
+        self.assertNotIn('dns_redirect_port', self.routing.execute('refresh'))
+
+    def test_a_refresh_failing_before_its_reload_still_withdraws_the_dns_redirect(self):
+        # The refresh is what withdraws the redirect from a core that stopped
+        # answering; failing before it reloads the anchor must not leave
+        # captured sources asking that core until the failure clears.
+        self.ready_dns()
+        fib = self.routing.execute('enable')['fib']
+        self.verdict(healthy=False, reason='liveness')
+        self.kernel.states = self.DNS_STATES % (1053, 0xd1, 1053, 0xd2) + state(1, fib)
+        with patch.object(self.routing, 'routes', side_effect=m.RoutingError('netstat failed')):
+            with self.assertRaisesRegex(m.RoutingError, 'netstat failed'):
+                self.routing.execute('refresh')
+        self.assertEqual(['mihomo_self'], self.kernel.flushed_tables)
+        self.assertEqual(['00000000000000d1/2f5db096', '00000000000000d2/2f5db096'], self.kernel.killed)
+        record = self.routing.load()
+        self.assertNotIn('dns_redirect_port', record)
+        self.assertEqual('', record['fingerprint'])
+        # Capture itself is left as it was.
+        self.assertTrue(record['active'])
+        self.assertIn('match in on vtnet1 inet proto udp from <mihomo_sources_0>', self.kernel.anchor)
+        # The next refresh reloads the anchor in full, and refills the table
+        # once the core answers again.
+        self.verdict()
+        self.kernel.calls.clear()
+        self.assertEqual(1053, self.routing.execute('refresh')['dns_redirect_port'])
+        self.assertTrue(any(args[0] == '/sbin/pfctl' and '-f' in args for args in self.kernel.calls))
+        # Nothing is withdrawn on a failure while no DNS redirect is armed.
+        self.verdict(healthy=False, reason='liveness')
+        self.routing.execute('refresh')
+        self.kernel.flushed_tables.clear()
+        with patch.object(self.routing, 'routes', side_effect=m.RoutingError('netstat failed')):
+            with self.assertRaises(m.RoutingError):
+                self.routing.execute('refresh')
+        self.assertEqual([], self.kernel.flushed_tables)
+
+    def test_a_flushed_dns_translation_is_restored_by_the_next_refresh(self):
+        self.ready_dns()
+        self.routing.execute('enable')
+        self.kernel.translation_flushed = True
+        self.kernel.calls.clear()
+        self.assertEqual(1053, self.routing.execute('refresh')['dns_redirect_port'])
+        self.assertTrue(any(args[0] == '/sbin/pfctl' and '-f' in args for args in self.kernel.calls))
+        self.assertEqual(2, len(self.dns_rules()))
+        self.assertFalse(self.kernel.translation_flushed)
+
+    def test_the_fast_path_and_captured_dns_share_one_owned_anchor(self):
+        self.ready_redirect()
+        self.ready_dns()
+        result = self.routing.execute('enable')
+        self.assertEqual((m.REDIRECT_PORT, 1053), (result['tcp_redirect_port'], result['dns_redirect_port']))
+        self.assertEqual([
+            'rdr on vtnet1 inet proto udp from <mihomo_sources_0> to <mihomo_self> port 53 -> 127.0.0.1 port 1053',
+            'rdr on vtnet1 inet proto tcp from <mihomo_sources_0> to <mihomo_self> port 53 -> 127.0.0.1 port 1053',
+            'no rdr on vtnet1 inet proto tcp from <mihomo_sources_0> to any port 53',
+            'rdr on vtnet1 inet proto tcp from <mihomo_sources_0> to !<mihomo_local> -> 127.0.0.1 port %d'
+            % m.REDIRECT_PORT], self.translation())
+        lines = self.kernel.anchor.splitlines()
+        self.assertLess(max(index for index, line in enumerate(lines) if line.startswith('table ')),
+                        min(index for index, line in enumerate(lines) if line.startswith(('rdr ', 'no rdr '))))
+        self.assertLess(max(index for index, line in enumerate(lines) if line.startswith(('rdr ', 'no rdr '))),
+                        min(index for index, line in enumerate(lines) if line.startswith('match ')))
+        self.kernel.calls.clear()
+        self.routing.execute('refresh')
+        self.assertFalse(any(args[0] == '/sbin/pfctl' and '-f' in args for args in self.kernel.calls))
+        # Losing one listener withdraws only its own redirect and states.
+        fib = result['fib']
+        self.kernel.states = (self.DNS_STATES % (1053, 0xd1, 1053, 0xd2)
+                              + self.REDIRECTED % (m.REDIRECT_PORT, 0xaa) + state(1, fib))
+        self.kernel.listener_rows = []
+        result = self.routing.execute('refresh')
+        self.assertEqual((None, 1053), (result.get('tcp_redirect_port'), result['dns_redirect_port']))
+        self.assertEqual(['00000000000000aa/11223344'], self.kernel.killed)
+        self.assertEqual(2, len(self.dns_rules()))
+        self.kernel.listener_rows = [('4242', '127.0.0.1:%d' % m.REDIRECT_PORT)]
+        self.routing.execute('refresh')
+        self.kernel.killed.clear()
+        result = self.routing.execute('disable')
+        self.assertFalse(result['active'])
+        self.assertEqual('', self.kernel.anchor)
+        self.assertEqual(['0000000000000001/11223344', '00000000000000aa/11223344',
+                          '00000000000000d1/2f5db096', '00000000000000d2/2f5db096'], sorted(self.kernel.killed))
+        record = self.routing.load()
+        self.assertNotIn('dns_redirect_port', record)
+        self.assertNotIn('tcp_redirect_port', record)
+
+    def test_a_dns_port_journaled_by_another_policy_has_its_states_dropped(self):
+        self.ready_dns()
+        self.routing.execute('enable')
+        record = self.routing.load()
+        record.update(dns_redirect_port=1054, fingerprint='')
+        self.routing.save(record)
+        self.kernel.states = self.DNS_STATES % (1054, 0xc1, 1054, 0xc2) + self.DNS_STATES % (1053, 0xd1, 1053, 0xd2)
+        self.assertEqual(1053, self.routing.execute('refresh')['dns_redirect_port'])
+        self.assertEqual(['00000000000000c1/2f5db096', '00000000000000c2/2f5db096'], self.kernel.killed)
+
+    def test_foreign_translation_beside_the_dns_redirect_fails_closed_and_empties_its_tables(self):
+        self.ready_dns()
+        fib = self.routing.execute('enable')['fib']
+        foreign = 'rdr on vtnet1 inet proto udp from any to any port = domain -> 10.0.0.9 port 53'
+        self.kernel.foreign_translation = foreign
+        with self.assertRaises(m.RoutingError):
+            self.routing.execute('refresh')
+        self.assertEqual(foreign, self.kernel.foreign_translation)
+        self.assertEqual(['mihomo_self', 'mihomo_sources_0'], sorted(self.kernel.flushed_tables))
+        record = self.routing.load()
+        self.assertFalse(record['active'])
+        self.assertTrue(record['pending'])
+        self.assertEqual(1053, record['dns_redirect_port'])
+        self.assertEqual(self.kernel.tables[fib]['4:0.0.0.0/0%']['gateway'], '192.0.2.1')
+
+    def test_first_dns_enable_journals_the_port_before_loading_the_anchor(self):
+        self.ready_dns()
+        self.kernel.states = self.DNS_STATES % (1053, 0xd1, 1053, 0xd2)
+        saved = []
+        original_save, original_anchor = self.routing.save, self.routing.anchor
+
+        def save(record):
+            saved.append(dict(record))
+            return original_save(record)
+
+        def anchor(content):
+            if content:
+                self.assertEqual(1053, saved[-1].get('dns_redirect_port'))
+                self.assertTrue(saved[-1]['pending'])
+            original_anchor(content)
+            if content:
+                raise m.RoutingError('injected failure after the load')
+
+        with patch.object(self.routing, 'save', side_effect=save), \
+                patch.object(self.routing, 'anchor', side_effect=anchor), \
+                self.assertRaises(m.RoutingError):
+            self.routing.execute('enable')
+        self.assertEqual(['00000000000000d1/2f5db096', '00000000000000d2/2f5db096'], sorted(self.kernel.killed))
+        self.assertEqual('', self.kernel.anchor)
+        self.assertNotIn('dns_redirect_port', self.routing.load())
+
+    def test_journaled_dns_port_lets_recovery_drop_redirected_queries_after_a_crash(self):
+        self.ready_dns()
+        self.routing.execute('enable')
+        record = self.routing.load()
+        record.update(active=False, pending=True)
+        self.routing.save(record)
+        self.kernel.alive = False
+        self.kernel.states = self.DNS_STATES % (1053, 0xd1, 1053, 0xd2) + self.UNTRANSLATED
+        result = self.routing.execute('refresh')
+        self.assertFalse(result['active'])
+        self.assertEqual(['00000000000000d1/2f5db096', '00000000000000d2/2f5db096'], sorted(self.kernel.killed))
+        self.assertNotIn('dns_redirect_port', self.routing.load())
+        self.assertEqual('', self.kernel.anchor)
+
+    def test_a_released_table_still_drops_journaled_dns_states(self):
+        # After a reboot the journaled table can be gone while the port is
+        # still recorded; the states it names must be dropped all the same.
+        self.routing.save({'schema': 1, 'fib': None, 'active': False, 'pending': True, 'routes': {},
+                           'dns_redirect_port': 1053, 'tcp_redirect_port': m.REDIRECT_PORT})
+        self.kernel.states = self.DNS_STATES % (1053, 0xd1, 1053, 0xd2) + self.REDIRECTED % (m.REDIRECT_PORT, 0xaa)
+        self.kernel.alive = False
+        self.assertFalse(self.routing.execute('disable')['pending'])
+        self.assertEqual(['00000000000000aa/11223344', '00000000000000d1/2f5db096', '00000000000000d2/2f5db096'],
+                         self.kernel.killed)
+        self.assertEqual(1, sum(args == ['/sbin/pfctl', '-ss', '-vv'] for args in self.kernel.calls))
+        record = self.routing.load()
+        self.assertNotIn('dns_redirect_port', record)
+        self.assertNotIn('tcp_redirect_port', record)
+
+    # The full transcript of the lifecycle below as os-mihomo 1.4.1 ran it,
+    # before the DNS redirect existed. Without a captured scope nothing of it
+    # may change.
+    FAST_PATH_TRANSCRIPT = '58f023e32017ed090d47b49ce45926a2a3080695e95c3318d7279d183249d1da'
+
+    def test_the_fast_path_without_captured_dns_is_byte_identical_to_the_previous_release(self):
+        for scope in (None, 'all', 'off'):
+            with self.subTest(scope=scope):
+                self.setUp()
+                if scope is not None:
+                    self.settings['dns_scope'] = scope
+                    self.config['dns'].update(listen='127.0.0.1:1053')
+                self.ready_redirect()
+                results = [self.routing.execute(action) for action in ('enable', 'refresh')]
+                anchor = self.kernel.anchor
+                fib = results[0]['fib']
+                self.kernel.states = (state(1, fib) + state(2, 0) + self.REDIRECTED % (m.REDIRECT_PORT, 0xaa)
+                                      + 'all udp 127.0.0.1:1053 (10.0.0.1:53) <- 10.0.0.2:45302       SINGLE:MULTIPLE\n'
+                                        '   id: a861b76a00000000 creatorid: 2f5db096\n')
+                results += [self.routing.execute(action) for action in ('disable', 'enable', 'refresh', 'disable')]
+                calls = [[re.sub(r'\.routing-pf-[^/]+$', '<anchor>', value.replace(str(self.root), '<root>'))
+                          for value in args] for args in self.kernel.calls]
+                transcript = json.dumps({'calls': calls, 'results': results, 'record': self.routing.load(),
+                                         'anchor': anchor, 'killed': self.kernel.killed}, sort_keys=True)
+                self.assertEqual(self.FAST_PATH_TRANSCRIPT, hashlib.sha256(transcript.encode()).hexdigest(),
+                                 '\n'.join(' '.join(args) for args in calls))
+                if scope is not None:
+                    self.assertNotIn('<mihomo_self>', anchor)
+                    self.assertFalse(any(args[:6] == ['/usr/bin/sockstat', '-4', '-l', '-q', '-P', 'udp']
+                                         for args in self.kernel.calls))
+                    self.assertEqual(['0000000000000001/11223344', '00000000000000aa/11223344'] * 2,
+                                     self.kernel.killed)
 
     def test_marker_requires_private_regular_file(self):
         self.routing.execute('enable')

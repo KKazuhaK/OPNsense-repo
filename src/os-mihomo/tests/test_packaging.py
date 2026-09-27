@@ -188,6 +188,22 @@ runpy.run_path(args[0],run_name='__main__')
             self.assertIn(b'/usr/local/bin/python3.13', archive.extractfile(hook).read())
         self.assertIn('/usr/local/bin/python3.13', manifest['scripts']['pre-install'])
 
+    def test_every_module_the_manager_imports_is_staged_beside_it(self):
+        # The DNS probe and scope modules are imported by name from the
+        # scripts directory, by the manager and by the routing adapter alike.
+        scripts = REPO / 'src/os-mihomo/src/usr/local/opnsense/scripts/mihomo'
+        staged_dir = self.project / 'src/usr/local/opnsense/scripts/mihomo'
+        for source in scripts.iterdir():
+            if source.is_file():
+                shutil.copyfile(source, staged_dir / source.name)
+        target = target_helper.target_values('FreeBSD:15:amd64', '26.7', '3.13')
+        staged = target_helper.staged_files(self.project, target, BUILD_VERSION)
+        for name in ('dns_probe.py', 'dns_scope.py', 'routing.py', 'mihomo.py', 'process_owner.py'):
+            with self.subTest(name=name):
+                data = staged['/usr/local/opnsense/scripts/mihomo/' + name]
+                self.assertEqual(target_helper.transform_content((scripts / name).read_bytes(), target), data)
+        self.assertIn('/usr/local/opnsense/scripts/mihomo/tun_policy_routing.py', staged)
+
     def test_dependency_patch_mismatch_prevents_package_creation(self):
         self.interpreter()
         self.env['FAKE_PKG_PYTHON_VERSION'] = '3.13.99_1'

@@ -110,7 +110,10 @@ def assert_private_routing(active):
         assert 'match in on lo1 inet proto tcp' in anchor and 'flags S/SA' in anchor
         assert 'match in on lo1 inet proto udp' in anchor
         assert 'rtable ' + str(saved['fib']) in anchor
-        sources = command(['/sbin/pfctl', '-a', 'mihomo', '-t', 'mihomo_sources_0', '-T', 'show']).stdout
+        # Tables are numbered in device order, and the client LAN's epair sorts first.
+        table = re.search(r'match in on lo1 inet proto tcp from <(mihomo_sources_[0-9]+)>', anchor)
+        assert table, anchor
+        sources = command(['/sbin/pfctl', '-a', 'mihomo', '-t', table.group(1), '-T', 'show']).stdout
         assert b'192.0.2.0/24' in sources
         assert action('status')['result']['routing_active'] is True
     else:
@@ -138,6 +141,68 @@ def passed(name):
     print('PASS:', name, flush=True)
 
 
+# run.sh wires an epair between this router and a client jail: 10.60.0.1 here,
+# 10.60.0.2 and 10.60.0.3 there. Only Mihomo's hosts know mihomo-only.test;
+# the router's Unbound answers it with NXDOMAIN.
+client_if = os.environ['MIHOMO_JAIL_CLIENT_IF']
+ROUTER_LAN, LISTED, UNLISTED = '10.60.0.1', '10.60.0.2', '10.60.0.3'
+MIHOMO_ANSWER = {'rcode': 0, 'addresses': ['192.0.2.30']}
+UNBOUND_ANSWER = {'rcode': 3, 'addresses': []}
+client_directory = Path('/root/dns-client')
+
+
+def client_query(source, name, transport='udp', timeout=2.0):
+    """Ask the router's LAN address from the client jail, through the helper running there."""
+    identifier = '%d-%d' % (os.getpid(), time.monotonic_ns())
+    requests, answers = client_directory / 'requests', client_directory / 'answers'
+    requests.mkdir(parents=True, exist_ok=True)
+    answers.mkdir(parents=True, exist_ok=True)
+    temporary = requests / ('.' + identifier)
+    temporary.write_text(json.dumps({'source': source, 'server': ROUTER_LAN, 'name': name,
+                                     'transport': transport, 'timeout': timeout}))
+    os.replace(temporary, requests / (identifier + '.json'))
+    answer = answers / (identifier + '.json')
+    deadline = time.monotonic() + timeout + 10
+    while time.monotonic() < deadline:
+        if answer.exists():
+            value = json.loads(answer.read_text())
+            answer.unlink()
+            return value
+        time.sleep(.05)
+    log = Path('/root/dns-client.log')
+    raise AssertionError('The LAN client jail ran no query: ' + (log.read_text()[-2000:] if log.exists() else ''))
+
+
+def local_rcode(server, name):
+    """The response code this router's own lookup of name gets from server port 53."""
+    query = (b'\x4d\x4a\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+             + b''.join(bytes([len(label)]) + label.encode() for label in name.split('.')) + b'\x00\x00\x01\x00\x01')
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        client.settimeout(5)
+        client.connect((server, 53))
+        client.send(query)
+        reply = client.recv(512)
+    assert len(reply) >= 12 and reply[:2] == query[:2], reply[:32]
+    return reply[3] & 0x0F
+
+
+# What one poll of wait_for() with a one-second client query can add to a
+# measured time: the query that timed out, the pause, and the one that answered.
+POLL_ALLOWANCE = 2.0
+# The acceptance bounds on withdrawing the DNS redirect from a core.
+CRASH_WITHDRAWAL, STALL_WITHDRAWAL = 10.0, 20.0
+
+
+def wait_for(check, seconds, message):
+    """Seconds until check() holds, polled twice a second."""
+    started = time.monotonic()
+    while time.monotonic() - started < seconds:
+        if check():
+            return time.monotonic() - started
+        time.sleep(.5)
+    raise AssertionError(message)
+
+
 def erase_private_saved_backup(path):
     """Remove only the tested plugin's snapshot from generated private XML."""
     private_xml = ET.parse(path)
@@ -152,12 +217,15 @@ def erase_private_saved_backup(path):
 # which the integration has to leave exactly as the operator configured it.
 dnssec = os.environ.get('MIHOMO_JAIL_DNSSEC', '0') == '1'
 shutil.rmtree('/var/db/os-mihomo', ignore_errors=True)
+shutil.rmtree(client_directory, ignore_errors=True)
 previous = command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=false', 'add', '-f', '-M', '/root/old.pkg'])
 print(previous.stdout.decode(errors='replace') + previous.stderr.decode(errors='replace'), flush=True)
 config = ET.fromstring('''<opnsense><system><secret>MASTER_SECRET_DO_NOT_COPY</secret></system>
-<interfaces><lan><if>lo1</if></lan></interfaces><filter/><radvd/><dhcpdv6/>
+<interfaces><lan><if>lo1</if></lan><guest><if>''' + client_if + '''</if><enable>1</enable><descr>Client LAN</descr></guest></interfaces>
+<filter/><radvd/><dhcpdv6/>
 <OPNsense><unboundplus>''' + ('<general><dnssec>1</dnssec></general>' if dnssec else '') + '''<forwarding><enabled>1</enabled></forwarding>
 <advanced><privateaddress>10.0.0.0/8,198.18.0.0/15</privateaddress></advanced>
+<hosts><host uuid="jail-host"><enabled>1</enabled><hostname>policy</hostname><domain>test</domain><rr>A</rr><server>192.0.2.20</server></host></hosts>
 <dots><dot uuid="owner-dot"><enabled>1</enabled><type>dot</type><domain/><server>192.0.2.53</server><port>853</port></dot></dots>
 </unboundplus></OPNsense><cron><item><command>mihomo sub-update</command><minutes>30</minutes><hours>*/12</hours></item></cron></opnsense>''')
 ET.indent(config)
@@ -170,6 +238,7 @@ secret: legacy-secret
 external-controller: 127.0.0.1:9090
 tun: {enable: true, device: tun_mihomo}
 dns: {enable: true, listen: '127.0.0.1:1053', ipv6: false, nameserver: [127.0.0.1], default-nameserver: [127.0.0.1]}
+hosts: {mihomo-only.test: 192.0.2.30}
 '''
 Path('/usr/local/etc/mihomo/config.yaml').write_bytes(source)
 Path('/usr/local/etc/mihomo/sub/env').write_text("mihomo_URL='https://example.invalid/private/SENTINEL_TOKEN'\nmihomo_secret='legacy-secret'\n")
@@ -203,6 +272,8 @@ assert settings['transparent'] is False
 assert settings['state_schema'] == 1
 assert settings['transparent_consent'] is False
 assert settings['secret'] == 'legacy-secret'
+# An upgrade keeps answering every client through Mihomo, as before.
+assert settings['dns_scope'] == 'all'
 assert Path('/var/db/os-mihomo/subscription.yaml').read_bytes() == source
 assert running()
 assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode != 0
@@ -242,6 +313,7 @@ prepare_gateway_cycle()
 action('enable-transparent')
 assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode == 0
 assert action('status')['result']['dns_active'] == (not dnssec)
+assert action('status')['result']['dns_scope'] == ('off' if dnssec else 'all')
 assert ET.parse('/conf/config.xml').find('./filter/rule') is not None
 passed('Explicit activation creates the actual TUN and owned DNS/interface/firewall configuration')
 
@@ -367,16 +439,303 @@ assert ET.parse('/conf/config.xml').find('./interfaces/opt0') is None
 assert not zone.exists(), 'the forward zone drop-in must be removed'
 assert_private_routing(False)
 passed('Disabling removes owned interface/firewall entries and keeps proxy ports running')
+Path('/root/settings.json').write_text(json.dumps({'dns_scope': 'off'}))
+action('set-settings', '/root/settings.json')
+action('enable-transparent')
+status = action('status')['result']
+assert status['dns_active'] is False and status['dns_scope'] == 'off', status
+assert not zone.exists(), 'a DNS scope of off must not write the forward zone'
+assert ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/forwarding/enabled') == '1'
+assert_private_routing(True)
+passed('A DNS scope of off leaves Unbound on its own upstreams while transparent routing is active')
+Path('/root/settings.json').write_text(json.dumps({'dns_scope': 'all'}))
+action('set-settings', '/root/settings.json')
+status = action('status')['result']
+assert status['dns_active'] == (not dnssec) and status['dns_scope'] == ('off' if dnssec else 'all'), status
+assert zone.exists() == (not dnssec)
+action('disable-transparent')
+assert not zone.exists()
+passed('Returning the DNS scope to all devices restores the resolver-wide integration')
+# Captured devices only: a whitelist of one client address on the client LAN.
+Path('/root/settings.json').write_text(json.dumps(
+    {'dns_scope': 'captured', 'device_mode': 'whitelist', 'device_list': [LISTED + '/32']}))
+action('set-settings', '/root/settings.json')
+action('enable-transparent')
+status = action('status')['result']
+assert status['dns_active'] is False and status['dns_scope'] == 'captured', status
+assert not zone.exists(), 'a captured scope must not write the forward zone'
+assert ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/forwarding/enabled') == '1'
+# The start probed the real core over its loopback listener and armed the
+# redirect with the first routing enable; failing that, the watchdog arms it.
+wait_for(lambda: action('status')['result']['dns_redirect'] is True, 20, 'The DNS redirect was never armed')
+health = Path('/var/run/mihomo-dns-health.json')
+assert health.stat().st_mode & 0o777 == 0o600
+verdict = json.loads(health.read_text())
+assert verdict['healthy'] is True, verdict
+assert verdict['core']['pid'] == int(Path('/var/run/mihomo-child.pid').read_text().strip()), verdict
+status = action('status')['result']
+# A validating resolver still allows the redirect; the note says what is not validated.
+assert ('DNSSEC' in status['dns_note']) if dnssec else status['dns_note'] == '', status
+translation = command(['/sbin/pfctl', '-a', 'mihomo', '-sn']).stdout.decode()
+for protocol in ('udp', 'tcp'):
+    assert re.search(r'(?m)^rdr on %s inet proto %s from <mihomo_sources_[0-9]+> to <mihomo_self> '
+                     r'port = (?:53|domain) -> 127\.0\.0\.1 port 1053$' % (re.escape(client_if), protocol),
+                     translation), translation
+assert ' on lo1 ' not in translation, 'the whitelist leaves lo1 without captured sources'
+own = command(['/sbin/pfctl', '-a', 'mihomo', '-t', 'mihomo_self', '-T', 'show']).stdout.decode().split()
+assert ROUTER_LAN in own and '192.0.2.10' in own and not any(value.startswith('127.') for value in own), own
+passed('A captured scope arms the router-bound DNS redirect for the listed source only and leaves Unbound alone')
+for transport in ('udp', 'tcp'):
+    answer = client_query(LISTED, 'mihomo-only.test', transport)
+    assert answer == MIHOMO_ANSWER, (transport, answer)
+    answer = client_query(UNLISTED, 'mihomo-only.test', transport)
+    assert answer == UNBOUND_ANSWER, (transport, answer)
+states = command(['/sbin/pfctl', '-ss', '-vv']).stdout.decode()
+for protocol in ('udp', 'tcp'):
+    assert re.search(r'%s 127\.0\.0\.1:1053 \(10\.60\.0\.1:53\) <- 10\.60\.0\.2:' % protocol, states), states
+assert not re.search(r'127\.0\.0\.1:1053 \(\S+\) <- 10\.60\.0\.3:', states), states
+# The router itself keeps its own resolver.
+assert local_rcode('127.0.0.1', 'mihomo-only.test') == UNBOUND_ANSWER['rcode']
+assert local_rcode(ROUTER_LAN, 'mihomo-only.test') == UNBOUND_ANSWER['rcode']
+passed('The listed client asking the router is answered by Mihomo over UDP and TCP; the unlisted client and the router itself by Unbound')
+# Local names reach the router DNS through Mihomo: the Unbound host override
+# policy.test and the private reverse zones lead Mihomo's policy.
+generated = Path('/var/db/os-mihomo/config.yaml').read_text()
+assert re.search(r"(?m)^    \+\.policy\.test:\n    - 127\.0\.0\.1$", generated), generated
+assert '+.168.192.in-addr.arpa' in generated and '+.in-addr.arpa' not in generated
+assert client_query(LISTED, 'policy.test') == {'rcode': 0, 'addresses': ['192.0.2.20']}
+passed('Local names of a captured client reach the router DNS through the generated policy')
+# A crash withdraws the redirect whatever the DNS recovery policy says.
+pid = int(Path('/var/run/mihomo-child.pid').read_text())
+os.kill(pid, signal.SIGKILL)
+killed_seconds = wait_for(lambda: client_query(LISTED, 'mihomo-only.test', timeout=1) == UNBOUND_ANSWER, 30,
+                          'The watchdog did not hand the listed client back to the router DNS after SIGKILL')
+assert killed_seconds <= CRASH_WITHDRAWAL + POLL_ALLOWANCE, killed_seconds
+assert not command(['/sbin/pfctl', '-a', 'mihomo', '-sn']).stdout.strip()
+assert '127.0.0.1:1053 (' not in command(['/sbin/pfctl', '-ss', '-vv']).stdout.decode()
+status = action('status')['result']
+assert status['running'] is False and status['dns_redirect'] is False, status
+assert not health.exists()
+assert not zone.exists() and ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/forwarding/enabled') == '1'
+passed('Actual SIGKILL withdraws the DNS redirect and its states; the listed client is answered by Unbound again')
+action('start')
+started_seconds = wait_for(lambda: client_query(LISTED, 'mihomo-only.test', timeout=1) == MIHOMO_ANSWER, 30,
+                           'Starting the service again did not re-arm the DNS redirect')
+passed('Starting the service again re-arms the DNS redirect for the new core')
+# A core that stops answering is withdrawn by the watchdog alone, and re-armed
+# once it answers again, without a restart.
+pid = int(Path('/var/run/mihomo-child.pid').read_text())
+os.kill(pid, signal.SIGSTOP)
+try:
+    stalled_seconds = wait_for(lambda: client_query(LISTED, 'mihomo-only.test', timeout=1) == UNBOUND_ANSWER, 60,
+                               'The watchdog did not withdraw the DNS redirect from a stalled core')
+    assert stalled_seconds <= STALL_WITHDRAWAL + POLL_ALLOWANCE, stalled_seconds
+    status = action('status')['result']
+    assert status['running'] is True and status['dns_redirect'] is False, status
+    assert status['dns_note'].startswith('Paused: Mihomo DNS stopped answering'), status
+finally:
+    os.kill(pid, signal.SIGCONT)
+resumed_seconds = wait_for(lambda: client_query(LISTED, 'mihomo-only.test', timeout=1) == MIHOMO_ANSWER, 90,
+                           'The watchdog did not re-arm the DNS redirect once the core answered again')
+assert int(Path('/var/run/mihomo-child.pid').read_text()) == pid
+assert action('status')['result']['dns_redirect'] is True
+log = Path('/var/log/mihomo.log').read_text()
+assert 'DNS redirect withdrawn (Mihomo DNS stopped answering)' in log and 'DNS redirect armed' in log
+passed('A stalled core is withdrawn by the watchdog and re-armed once it answers, without a restart')
+# IPv6 reaching captured devices. The router offers DHCPv6 on the client LAN,
+# and a global address appears on it later, as a delegated prefix does after
+# boot. The listed client keeps asking the router DNS throughout each change.
+GLOBAL_LAN = '2001:470:ffff:60::1'
+scope_record = Path('/var/db/os-mihomo/dns-scope.json')
+mihomo_log = Path('/var/log/mihomo.log')
+
+
+def asking(done, seconds, message):
+    """Seconds until done() holds while the listed client asks the router DNS, and which asks went unanswered."""
+    started = time.monotonic()
+    unanswered = []
+    while time.monotonic() - started < seconds:
+        answer = client_query(LISTED, 'mihomo-only.test', timeout=1)
+        if 'rcode' not in answer:
+            unanswered.append(round(time.monotonic() - started, 1))
+        if done():
+            return time.monotonic() - started, unanswered
+        time.sleep(.5)
+    raise AssertionError(message + ': ' + json.dumps(action('status')['result']))
+
+
+def scope_now():
+    status = action('status')['result']
+    return status['dns_scope'], status['dns_active'], status['dns_redirect']
+
+
+def log_since(offset):
+    with mihomo_log.open('rb') as stream:
+        stream.seek(offset)
+        return stream.read().decode(errors='replace')
+
+
+def core_pid():
+    return int(Path('/var/run/mihomo-child.pid').read_text())
+
+
+def set_offer(offered):
+    xml = ET.parse('/conf/config.xml')
+    table = xml.find('dhcpdv6')
+    for entry in list(table):
+        table.remove(entry)
+    if offered:
+        ET.SubElement(ET.SubElement(table, 'guest'), 'enable').text = '1'
+    xml.write('/conf/config.xml')
+
+
+def rdr_1053():
+    return 'port 1053' in command(['/sbin/pfctl', '-a', 'mihomo', '-sn']).stdout.decode()
+
+
+log_offset = mihomo_log.stat().st_size
+pid = core_pid()
+set_offer(True)
+time.sleep(12)
+assert scope_now() == ('captured', False, True), action('status')['result']
+assert core_pid() == pid, 'an IPv6 offer alone must not restart the service'
+passed('An IPv6 offer without a global address on a captured interface leaves the captured scope running')
+command(['/sbin/ifconfig', client_if, 'inet6', GLOBAL_LAN, 'prefixlen', '64', 'alias'])
+ipv6_seconds = {}
+if not dnssec:
+    ipv6_seconds['to_all'], unanswered = asking(lambda: scope_now() == ('all', True, False), 90,
+                                                'The watchdog did not move to every device once IPv6 reached captured devices')
+    # Two looks five seconds apart, a restart, and the zone's Unbound restart.
+    assert ipv6_seconds['to_all'] <= 40 + POLL_ALLOWANCE, ipv6_seconds
+    assert len(unanswered) <= 2, unanswered
+    ipv6_seconds['unanswered_to_all'] = unanswered
+    status = action('status')['result']
+    assert status['dns_note'].startswith('"Only devices captured by transparent routing" is running as "All devices"'), status
+    assert zone.exists() and not rdr_1053()
+    assert json.loads(scope_record.read_text())['ipv6_reaching'] is True
+    log = log_since(log_offset)
+    assert 'DNS scope: this router is now giving captured devices IPv6 addresses' in log, log
+    assert 'DNS scope: Mihomo now answers every device.' in log, log
+    passed('A global address on a captured interface moves the scope to every device within about 40 seconds, '
+           'answering the listed client throughout')
+    # A WAN reconnect restarts before the prefix is back: the start keeps every device.
+    command(['/sbin/ifconfig', client_if, 'inet6', GLOBAL_LAN, '-alias'])
+    action('wan-restart')
+    assert scope_now() == ('all', True, False), action('status')['result']
+    assert json.loads(scope_record.read_text())['ipv6_reaching'] is True
+    passed('A restart that finds the prefix gone keeps every device instead of deciding from one look')
+    # Gone for good: confirmed, then held with one note; no restart meanwhile.
+    pid = core_pid()
+    wait_for(lambda: action('status')['result']['dns_note'].startswith(
+        '"Only devices captured by transparent routing" is still running as "All devices"'), 60,
+        'The wait back to captured devices was never reported')
+    time.sleep(60)
+    assert scope_now() == ('all', True, False) and core_pid() == pid, action('status')['result']
+    passed('The way back to captured devices is held with a note, without restarting the service')
+    # The wait itself is the unit tests'; here the change it ends in is real.
+    record = json.loads(scope_record.read_text())
+    record['changed'] = time.monotonic() - 700
+    temporary = scope_record.with_name('.dns-scope-test')
+    temporary.write_text(json.dumps(record) + '\n')
+    temporary.chmod(0o600)
+    os.replace(temporary, scope_record)
+    log_offset = mihomo_log.stat().st_size
+    ipv6_seconds['to_captured'], unanswered = asking(lambda: scope_now() == ('captured', False, True), 90,
+                                                     'The watchdog did not return to captured devices')
+    assert len(unanswered) <= 2, unanswered
+    ipv6_seconds['unanswered_to_captured'] = unanswered
+    assert not zone.exists() and rdr_1053()
+    assert client_query(LISTED, 'mihomo-only.test') == MIHOMO_ANSWER
+    log = log_since(log_offset)
+    assert 'DNS scope: Mihomo now answers captured devices.' in log, log
+    passed('Once the wait is over the scope returns to captured devices, re-arming the redirect once the new core answers')
+else:
+    # A validating resolver would decline every device: nothing restarts, and
+    # the status says what reaches captured devices.
+    time.sleep(45)
+    status = action('status')['result']
+    assert scope_now() == ('captured', False, True) and core_pid() == pid, status
+    assert 'Answering every device instead is not possible while Unbound validates DNSSEC' in status['dns_note'], status
+    assert json.loads(scope_record.read_text()).get('ipv6_dnssec') is True
+    assert client_query(LISTED, 'mihomo-only.test') == MIHOMO_ANSWER
+    command(['/sbin/ifconfig', client_if, 'inet6', GLOBAL_LAN, '-alias'])
+    wait_for(lambda: 'validates DNSSEC, so captured' not in action('status')['result']['dns_note'], 60,
+             'The IPv6 note outlived the address')
+    passed('With a validating resolver a captured scope stays captured when IPv6 reaches its devices, and says so')
+# A watchdog that died half way through a change leaves its journal; the next
+# one, started by a GUI start, settles it with a restart.
+move = Path('/var/db/os-mihomo/dns-scope-move')
+move.write_text('{"ipv6_reaching": false}\n')
+move.chmod(0o600)
+pid = core_pid()
+log_offset = mihomo_log.stat().st_size
+command(['/usr/bin/pkill', '-F', '/var/run/mihomo-watch.pid'])
+wait_for(lambda: command(['/bin/pgrep', '-F', '/var/run/mihomo-watch.pid'], check=False).returncode != 0, 20,
+         'The watchdog did not exit')
+action('start')
+ipv6_seconds['settled'], unanswered = asking(lambda: not move.exists() and core_pid() != pid
+                                             and scope_now() == ('captured', False, True), 90,
+                                             'The next watchdog did not settle the unfinished change')
+assert len(unanswered) <= 2, unanswered
+assert 'a scope change the previous watchdog did not finish' in log_since(log_offset)
+# With the core gone instead, the next tick restores direct DNS and settles it.
+move.write_text('{"ipv6_reaching": true}\n')
+os.kill(core_pid(), signal.SIGKILL)
+wait_for(lambda: not move.exists() and action('status')['result']['running'] is False, 30,
+         'The watchdog did not settle an unfinished change of a stopped core')
+assert not zone.exists() and ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/forwarding/enabled') == '1'
+assert client_query(LISTED, 'mihomo-only.test') == UNBOUND_ANSWER
+action('start')
+wait_for(lambda: scope_now() == ('captured', False, True), 60, 'The captured scope did not come back')
+passed('An unfinished scope change is settled by the next watchdog: a restart for a running core, '
+       'direct DNS for a stopped one')
+set_offer(False)
+action('disable-transparent')
+assert not health.exists(), 'stopping the core must forget its DNS verdict'
+assert not command(['/sbin/pfctl', '-a', 'mihomo', '-sn']).stdout.strip()
+assert client_query(LISTED, 'mihomo-only.test') == UNBOUND_ANSWER
+Path('/root/settings.json').write_text(json.dumps({'dns_scope': 'all', 'device_mode': 'off', 'device_list': []}))
+action('set-settings', '/root/settings.json')
+dns_redirect_seconds = {'withdrawn_after_sigkill': round(killed_seconds, 3),
+                        'rearmed_after_start': round(started_seconds, 3),
+                        'withdrawn_after_sigstop': round(stalled_seconds, 3),
+                        'rearmed_after_sigcont': round(resumed_seconds, 3)}
+passed('Disabling transparent routing withdraws the DNS redirect with it')
 Path('/root/settings.json').write_text(json.dumps({'router_dns': True}))
 action('set-settings', '/root/settings.json')
 action('enable-transparent')
-assert not action('status')['result']['dns_active']
+status = action('status')['result']
+assert not status['dns_active']
+# All devices with router DNS would loop; it counts as off, stored unchanged.
+assert status['dns_scope'] == 'off' and 'loop' in status['dns_note'], status
+assert json.loads(Path('/var/db/os-mihomo/settings.json').read_text())['dns_scope'] == 'all'
 generated = Path('/var/db/os-mihomo/config.yaml').read_text()
 assert 'IP-CIDR,192.0.2.53/32,DIRECT,no-resolve' in generated
 assert 'IP-CIDR6,2001:db8::53/128,DIRECT,no-resolve' in generated
 assert 'DST-PORT,853,DIRECT' in generated
 assert ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/dots/dot[@uuid="owner-dot"]/enabled') == '1'
 passed('Router DNS uses the actual resolver without forwarding it back to Mihomo')
+# Router DNS refuses an IPv6 offer while Mihomo IPv6 is off, unless the
+# administrator declares that captured devices get no IPv6: then transparent
+# routing activates, and the status notes the offer instead of an error.
+action('disable-transparent')
+set_offer(True)
+refused = action('enable-transparent', ok=False)
+assert 'offered IPv6 while Mihomo IPv6 is disabled' in refused['error'], refused
+assert action('status')['result']['routing_active'] is False
+Path('/root/settings.json').write_text(json.dumps({'ipv6_clients_restricted': True}))
+action('set-settings', '/root/settings.json')
+action('enable-transparent')
+# Two watchdog ticks, and neither turns the declared offer back into an error.
+time.sleep(12)
+status = action('status')['result']
+assert status['running'] and status['routing_active'] and status['error'] == '', status
+assert status['dns_scope'] == 'off' and not status['dns_active'], status
+assert 'declares that captured devices get no IPv6' in status['dns_note'], status
+set_offer(False)
+Path('/root/settings.json').write_text(json.dumps({'ipv6_clients_restricted': False}))
+action('set-settings', '/root/settings.json')
+passed('Router DNS activates with an IPv6 offer only while captured devices are declared to get no IPv6, and notes it')
 # An explicit stop still kills the real core and removes routes if configd fails.
 Path('/root/fail-configctl').touch()
 action('stop', ok=False)
@@ -423,6 +782,8 @@ shutil.rmtree('/usr/local/etc/mihomo', ignore_errors=True)
 command(['/usr/local/sbin/pkg', '-o', 'RUN_SCRIPTS=true', 'add', '-M', '/root/new.pkg'])
 assert running()
 assert not json.loads(Path('/var/db/os-mihomo/settings.json').read_text())['transparent']
+# Only a fresh installation starts with the captured scope.
+assert json.loads(Path('/var/db/os-mihomo/settings.json').read_text())['dns_scope'] == 'captured'
 assert not action('status')['result']['dns_active']
 assert command(['/sbin/ifconfig', 'tun_mihomo'], check=False).returncode != 0
 assert not Path('/var/db/os-mihomo/subscription.yaml').exists()
@@ -432,10 +793,11 @@ passed('Actual fresh package installation starts proxy ports without TUN or DNS 
 assert_private_routing(False)
 report = {'ok': True, 'checks': checks, 'package_sha256': hashlib.sha256(Path('/root/new.pkg').read_bytes()).hexdigest(),
           'package_version': new_manifest['version'], 'crash_recovery_seconds': round(recovery_seconds, 3),
-          'unbound_dnssec': dnssec,
+          'unbound_dnssec': dnssec, 'dns_redirect_seconds': dns_redirect_seconds, 'ipv6_scope_seconds': ipv6_seconds,
           'cold_numeric_gateway_cycle': {'routes': list(gateway_cycle.values()),
                                          'interface': 'lo2', 'active_and_stopped_copy_verified': True},
           'boundary': {'core_pf_private_fib_and_unbound': 'genuine native execution',
                        'configd_filter_context_dns_templates_revision_service': 'synthetic private fixture adapters',
-                       'lan_packet_flows': 'not exercised; covered separately by selective TUN packet and host integration tests'}}
+                       'router_bound_dns': 'genuine PF redirect from an epair client jail, listed and unlisted',
+                       'lan_packet_flows': 'otherwise not exercised; covered separately by selective TUN packet and host integration tests'}}
 Path('/root/test-report.json').write_text(json.dumps(report, indent=2) + '\n')

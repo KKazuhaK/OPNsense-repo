@@ -27,6 +27,12 @@ import zlib
 from urllib import parse as urlparse, request as urlrequest
 
 import yaml
+import dns_probe
+from dns_scope import (DNS_LISTEN, DNS_PORT, DNS_SCOPE_DEFAULT, DNS_SCOPE_FRESH, DNS_SCOPES, IPV6_CONFIRM,
+                       IPV6_DNSSEC_NOTE, IPV6_NOTE, IPV6_POLL, IPV6_RESTRICTED_ALL_NOTE, IPV6_RESTRICTED_NOTE,
+                       IPV6_ROUTER_DNS_NOTE, PRESET_NOTE, ROUTER_DNS_NOTE, SCOPE_CHANGE_INTERVAL, carries_ipv6,
+                       effective_dns_scope, global_ipv6, interface_ipv6, ipv6_matters, ipv6_restricted,
+                       reach_verdict, retry_delay)
 from process_owner import (OwnershipError, REDIRECT_LISTENER, REDIRECT_PORT, core_group,
                            valid_identity, watch_group)
 
@@ -35,18 +41,76 @@ MAX_BACKUP = 24 * 1024 * 1024
 BACKUP_KEYS = ('subscription_url', 'secret', 'device', 'service_enabled', 'transparent',
                'transparent_consent', 'mixed_port', 'socks_port', 'bind_address', 'allow_lan',
                'tun_stack', 'tun_mtu', 'dns_mode', 'dns_hijack', 'dns_fallback', 'router_dns',
-               'dns_override', 'ipv6', 'geo_source', 'dns_default', 'dns_nameserver',
+               'dns_scope', 'dns_override', 'ipv6', 'geo_source', 'dns_default', 'dns_nameserver',
                'dns_proxy_nameserver',
-               'device_mode', 'device_list', 'capture_interfaces', 'controller', 'tcp_redirect')
+               'device_mode', 'device_list', 'capture_interfaces', 'controller', 'tcp_redirect',
+               'ipv6_clients_restricted')
 BACKUP_WARNING = 'The operation completed, but the Mihomo configuration backup could not be updated.'
 BACKUP_INTEGRITY_WARNING = ('The saved Mihomo backup checksum does not match. The current local configuration is retained. '
                             'Stop the service and use Repair saved backup to validate and import the edited backup.')
 DNSSEC_NOTE = ('Unbound validates DNSSEC, so its upstreams are left unchanged; '
                'Mihomo answers only DNS captured in the tunnel.')
 DNS_RESTART_NOTE = 'Unbound is not forwarding to Mihomo; restart the service to apply the DNS integration.'
+CAPTURED_DNSSEC_NOTE = ('Unbound validates DNSSEC for the other devices; captured devices asking the router '
+                        'DNS are answered by Mihomo without validation.')
+CAPTURED_WAIT_NOTE = ('Captured devices use the router DNS until the Mihomo DNS listener and the '
+                      'firewall redirect hook are ready.')
+# Why the watchdog withdrew the captured-device redirect, by the reason its
+# DNS probes recorded.
+PAUSED_NOTES = {
+    'liveness': 'Paused: Mihomo DNS stopped answering, so captured devices use the router DNS until it '
+                'answers again.',
+    'upstream': 'Paused: Mihomo could not resolve public names while the router DNS could, so captured '
+                'devices use the router DNS until Mihomo resolves again.',
+}
+RULE_HINT_NOTE = ('Captured devices are active, but none of their DNS to this router has reached Mihomo for '
+                  'five minutes. If they use this router for DNS, a firewall rule, a rule with a gateway or a '
+                  'port forward on a captured interface may be taking it: the rules must pass DNS to 127.0.0.1 '
+                  'port 1053 without a gateway.')
+DNS_ARMED_LOG = 'DNS redirect armed: captured devices asking this router for DNS are answered by Mihomo.'
+DNS_WITHDRAWN_LOG = 'DNS redirect withdrawn (%s): captured devices use the router DNS.'
+DNS_WITHDRAW_REASONS = {'liveness': 'Mihomo DNS stopped answering',
+                        'upstream': 'Mihomo could not resolve public names while the router DNS could'}
+DNS_NOT_READY = 'the Mihomo DNS listener or the firewall redirect hook is not ready'
+LOCAL_NAMES_NOTE = ('The router DNS on 127.0.0.1 port 53 did not answer, so captured devices cannot resolve '
+                    'the local names Mihomo sends there until it does.')
+# A captured scope follows IPv6 reaching its devices by restarting the service:
+# only a start renders the local names a captured scope has and every device
+# must not have. Each change, and each one that fails, is logged.
+IPV6_MOVE_LOGS = {
+    True: ('DNS scope: this router is now giving captured devices IPv6 addresses while Mihomo IPv6 is off; '
+           'restarting the service to answer every device through Mihomo.'),
+    False: ('DNS scope: captured devices no longer get IPv6 addresses; restarting the service to answer '
+            'only captured devices through Mihomo.'),
+}
+IPV6_MOVED_LOG = 'DNS scope: Mihomo now answers %s.'
+IPV6_FINISH_LOG = ('DNS scope: a scope change the previous watchdog did not finish is settled by restarting '
+                   'the service.')
+IPV6_MOVE_FAILED_LOG = 'DNS scope change failed (%s); %s'
+IPV6_RETRY_LOG = '%s; the change will be retried in %d seconds.'
+IPV6_SCOPE_NAMES = {'all': 'every device', 'captured': 'captured devices', 'off': 'no device'}
+# Shown instead of IPV6_NOTE while the change back waits out its interval.
+IPV6_WAIT_NOTE = ('"Only devices captured by transparent routing" is still running as "All devices": captured '
+                  'devices no longer get IPv6 addresses, and it switches back on its own about ten minutes '
+                  'after the last scope change.')
+IPV6_FAILED_NOTE = ('Switching the DNS scope after an IPv6 change failed (%s); the current scope stays and the '
+                    'switch will be retried.')
+# Why a scope change left the service stopped, which the status keeps saying
+# until a start or a stop replaces it.
+IPV6_STOPPED_ERROR = ('Switching the DNS scope after an IPv6 change failed, and the service could not restart: '
+                      '%s')
+# A firewall state table this large is not read for a status hint.
+STATE_TABLE_LIMIT = 64 * 1024 * 1024
 UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
 UNBOUND_CONFIG_ROOT = '/var/unbound'
 UNBOUND_TEMPLATE_ROOT = '/usr/local/opnsense/service/templates/OPNsense/Unbound'
+# OPNsense's Unbound start script runs in the background under this lock,
+# including the load of the cache its stop dumped; see drop_resolver_cache().
+UNBOUND_START_LOCK = '/tmp/unbound_start.lock'
+UNBOUND_START_WAIT = 60
+RESOLVER_CACHE_KEPT_LOG = ("Unbound's cache could not be emptied after the DNS change; answers it cached before "
+                           "the change are served until they expire.")
+UNBOUND_CONTROL = ['/usr/local/sbin/unbound-control', '-c', '/var/unbound/unbound.conf']
 FORWARDER = '127.0.0.1@1053'
 ROOT_ANCHOR = '/var/unbound/root.key'
 STATE_SCHEMA = 1
@@ -248,7 +312,10 @@ def advertises_ipv6(content):
     import xml.etree.ElementTree as ET
     try:
         root = ET.fromstring(content)
-    except ET.ParseError:
+    except (ET.ParseError, ValueError, LookupError):
+        # An unknown or multi-byte encoding declaration raises LookupError or
+        # ValueError rather than ParseError, and the watchdog loop survives
+        # only Error and OSError.
         raise Error("Unable to inspect the router IPv6 configuration.") from None
 
     def switched_on(node, tag):
@@ -309,6 +376,114 @@ def advertises_ipv6(content):
             if not start or ':' in start:
                 return True
     return False
+
+
+# Where a captured scope without router DNS sends the router's local names:
+# the router's own resolver, in the form the router DNS overlay uses.
+LOCAL_RESOLVER = '127.0.0.1'
+# Reverse zones of the ranges that never leave a site -- RFC 1918, IPv4 and
+# IPv6 link-local, unique local IPv6 -- and the special-use home.arpa. The rest
+# of in-addr.arpa and ip6.arpa is public and stays with Mihomo.
+PRIVATE_REVERSE_ZONES = (('10.in-addr.arpa',) + tuple('%d.172.in-addr.arpa' % octet for octet in range(16, 32))
+                         + ('168.192.in-addr.arpa', '254.169.in-addr.arpa', 'c.f.ip6.arpa', 'd.f.ip6.arpa',
+                            '8.e.f.ip6.arpa', '9.e.f.ip6.arpa', 'a.e.f.ip6.arpa', 'b.e.f.ip6.arpa',
+                            'home.arpa'))
+DOMAIN_LABEL = re.compile(r'[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?')
+
+
+def local_domains(content):
+    """The names the router's own DNS answers itself, as suffixes, read from OPNsense 26.7.
+
+    They are the system domain; the exact names of Unbound host overrides and
+    their aliases, because Unbound answers those alone from local data and
+    resolves the rest of their domains like any other name; the domains
+    Unbound and Dnsmasq forward to other servers; the domains the Dnsmasq, Kea
+    and ISC DHCP servers hand out or register; and the private reverse zones.
+    A switched-off service or entry adds nothing, a value that is not a plain
+    domain name is skipped, and a suffix another one covers is dropped. A
+    configuration that cannot be read leaves the reverse zones alone.
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(content)
+    except (ET.ParseError, ValueError, LookupError):
+        root = ET.Element('opnsense')
+
+    def text(node, path):
+        return (node.findtext(path) or '').strip() if node is not None else ''
+
+    def enabled(node, tag, default):
+        # MVC BooleanFields: absent means the model default, set means '1'.
+        value = node.find(tag) if node is not None else None
+        return default if value is None else (value.text or '').strip() == '1'
+
+    found = [text(root, './system/domain')]
+    unbound = root.find('./OPNsense/unboundplus')
+    if unbound is not None and enabled(unbound.find('general'), 'enabled', True):
+        hosts = unbound.findall('./hosts/host')
+        # An alias names its host by UUID and may inherit its domain.
+        owners = {host.get('uuid'): host for host in hosts if host.get('uuid')}
+        for entry, parent in ([(host, host) for host in hosts]
+                              + [(alias, owners.get(text(alias, 'host'))) for alias in unbound.findall('./aliases/alias')]):
+            if not enabled(entry, 'enabled', True) or not enabled(parent, 'enabled', True):
+                continue
+            name, domain = text(entry, 'hostname'), text(entry, 'domain') or text(parent, 'domain')
+            if domain:
+                # A wildcard or empty host name stands for the domain itself.
+                found.append(domain if name in ('', '*') else name + '.' + domain)
+        found += [text(dot, 'domain') for dot in unbound.findall('./dots/dot') if enabled(dot, 'enabled', True)]
+        if enabled(unbound.find('general'), 'regdhcp', False):
+            found.append(text(unbound, './general/regdhcpdomain'))
+    dnsmasq = root.find('./dnsmasq')
+    if enabled(dnsmasq, 'enable', False):
+        found += [text(dnsmasq, 'regdhcpdomain'), text(dnsmasq, './dhcp/domain')]
+        found += [text(entry, 'domain') for entry in dnsmasq.findall('./dhcp_ranges')]
+        found += [text(entry, 'domain') for entry in dnsmasq.findall('./domainoverrides')]
+        for host in dnsmasq.findall('./hosts'):
+            name, domain = text(host, 'host'), text(host, 'domain')
+            if domain:
+                found.append(domain if name in ('', '*') else name + '.' + domain)
+    kea = root.find('./OPNsense/Kea/dhcp4')
+    if kea is not None and enabled(kea.find('general'), 'enabled', False):
+        for subnet in kea.findall('./subnets/subnet4'):
+            found += [text(subnet, './option_data/domain_name'), text(subnet, 'ddns_forward_zone')]
+        found += [text(entry, './option_data/domain_name') for entry in kea.findall('./reservations/reservation')]
+    # The legacy DHCP server marks an enabled interface with a presence tag.
+    for interface in root.findall('./dhcpd/*'):
+        if interface.find('enable') is not None and text(interface, 'enable') != '0':
+            found.append(text(interface, 'domain'))
+    names = set(PRIVATE_REVERSE_ZONES)
+    for value in found:
+        name = value.lower().rstrip('.')
+        if name and len(name) <= 253 and all(DOMAIN_LABEL.fullmatch(label) for label in name.split('.')):
+            names.add(name)
+
+    def covered(name):
+        labels = name.split('.')
+        return any('.'.join(labels[index:]) in names for index in range(1, len(labels)))
+    return sorted(name for name in names if not covered(name))
+
+
+def local_name_policy(dns, overlay, names):
+    """Send the router's local names to its own DNS, ahead of every other policy entry.
+
+    Mihomo evaluates nameserver-policy in order, a run of domain keys as one
+    tree and every rule-set or geosite key on its own, so these lead as one
+    block: anywhere later, geosite:private or a provider rule-set could claim
+    a local name first. A key the merge YAML states itself keeps its value.
+    """
+    policy = dns.get('nameserver-policy')
+    policy = {} if policy is None else policy
+    if not isinstance(policy, dict):
+        return
+    stated = overlay.get('dns') if isinstance(overlay, dict) and isinstance(overlay.get('dns'), dict) else {}
+    stated = stated.get('nameserver-policy') if isinstance(stated.get('nameserver-policy'), dict) else {}
+    ordered = {}
+    for name in names:
+        key = '+.' + name
+        ordered[key] = copy.deepcopy(policy.get(key, stated[key])) if key in stated else [LOCAL_RESOLVER]
+    ordered.update((key, value) for key, value in policy.items() if key not in ordered)
+    dns['nameserver-policy'] = ordered
 
 
 DNS_MODES = ('fake-ip', 'redir-host', 'normal')
@@ -573,11 +748,21 @@ def device_routing_policy(settings, candidates=None):
     networks = device_networks(settings.get('device_list'))
     if mode == 'off' or not networks:
         return scope + ['Internal devices may enter TUN.',
-                        'Router traffic and WAN connections bypass TUN.']
+                        'Router traffic and WAN connections bypass TUN.', dns_scope_summary(settings)]
     action = 'Enter TUN' if mode == 'whitelist' else 'Bypass TUN'
     other = 'Other devices bypass TUN.' if mode == 'whitelist' else 'Other internal devices may enter TUN.'
     return scope + [action + ': ' + str(net) for net in networks] + [other,
-            'Router traffic and WAN connections bypass TUN.']
+            'Router traffic and WAN connections bypass TUN.', dns_scope_summary(settings)]
+
+
+def dns_scope_summary(settings):
+    """Who the chosen DNS scope answers through Mihomo, in the policy summary's words."""
+    chosen = settings.get('dns_scope', DNS_SCOPE_DEFAULT)
+    if chosen == 'captured':
+        return 'DNS: Mihomo answers the router DNS for devices captured above; other devices and this router use the router DNS.'
+    if chosen == 'all' and not settings.get('router_dns'):
+        return 'DNS: with the full preset, Mihomo answers every device that uses the router DNS, bypassed devices included.'
+    return 'DNS: every device that uses the router DNS is answered by it.'
 
 
 # What a subscription that ships no DNS policy gets instead of nothing. It sits
@@ -706,11 +891,16 @@ def check_dns_servers(field, values):
 # UNDER the merge YAML, so a hand-written override always wins. When an overlay
 # states one of these keys in its canonical form, absorb_switches() lifts it into
 # the switch instead, so the UI never shows a value the config contradicts.
+# dns_scope is not a YAML switch, but it shares the fill-in: an installation
+# from before it existed reads as the scope it always had.
 SWITCH_DEFAULTS = {'router_dns': False, 'dns_override': False, 'ipv6': False, 'dns_hijack': True,
                    'dns_mode': DNS_MODE_DEFAULT, 'geo_source': GEO_SOURCE_DEFAULT,
                    'mixed_port': 7890, 'socks_port': 7891, 'allow_lan': False,
-                   'bind_address': '127.0.0.1', 'tun_stack': 'gvisor', 'tun_mtu': 1420}
+                   'bind_address': '127.0.0.1', 'tun_stack': 'gvisor', 'tun_mtu': 1420,
+                   'dns_scope': DNS_SCOPE_DEFAULT}
 # Bumped only to re-seed the switches from an installation that predates them.
+# A new key that SWITCH_DEFAULTS fills in needs no bump: re-seeding would also
+# turn dns_override back on for every router with a manual DNS field.
 SWITCH_SCHEMA = 4
 # gVisor needs no kernel support and is what the presets ship; system is faster
 # where the host can carry it; mixed uses system for TCP and gVisor for UDP.
@@ -947,7 +1137,9 @@ def redirect_conflict(result):
     return None
 
 
-def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_advertised=False):
+def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_advertised=False, local_names=()):
+    # ipv6_advertised is the IPv6 offer under router DNS, and otherwise the
+    # answer a captured scope is decided with (Manager.start_context()).
     result = merge_yaml(baseline(data), data)
     router_dns = settings.get('router_dns', False)
     if router_dns:
@@ -1021,11 +1213,21 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
                           'port': REDIRECT_PORT, 'listen': '127.0.0.1'})
     if listeners or 'listeners' in result:
         result['listeners'] = listeners
+    # Captured devices ask Mihomo for everything, the router's local names
+    # included, which only the router DNS can answer. Never with any other
+    # effective scope: under 'all' the router DNS forwards to Mihomo, and
+    # sending names back to it would loop. Router DNS already sends it all.
+    if (local_names and not router_dns
+            and effective_dns_scope(settings, result, ipv6_advertised)[0] == 'captured'):
+        local_name_policy(dns, overlay, local_names)
     # Device selection belongs to native source routing before the TUN. It must
     # never rewrite provider rules or restrict clients using an explicit proxy.
     result['rules'] = result.get('rules', [])
     if router_dns:
-        if ipv6_advertised and not (result.get('ipv6') is True and dns.get('ipv6') is True):
+        # An administrator who declared that captured devices get no IPv6 is
+        # taken at their word: the status notes the offer instead.
+        if (ipv6_advertised and not ipv6_restricted(settings)
+                and not (result.get('ipv6') is True and dns.get('ipv6') is True)):
             raise Error("Clients are being offered IPv6 while Mihomo IPv6 is disabled. Validate IPv6 before enabling router DNS.")
         if dns.get('fallback'):
             raise Error("Remove DNS fallback upstreams from merge YAML before enabling router DNS.")
@@ -1033,22 +1235,31 @@ def render(data, settings, transparent=None, overlay=None, upstreams='', ipv6_ad
     return yaml.safe_dump(result, allow_unicode=True, sort_keys=False).encode()
 
 
-def dns_requested(settings, generated):
+def dns_requested(settings, generated, ipv6_reaching=False):
     """Whether a generated configuration asks Unbound to forward to Mihomo.
 
-    Only the full preset's shape asks: the TUN on and Mihomo DNS listening where
-    the forward zone points. Router DNS keeps Unbound on its own upstreams
-    instead. Nothing here reads the device policy or the capture interfaces, so
-    the request covers every client of the router resolver. Whether Unbound
-    accepts it is the helper's answer, which a validating resolver declines.
+    Only an effective 'all' scope asks: the full preset's shape, and router DNS
+    off, because with it Unbound forwarding back to Mihomo would loop. Nothing
+    here reads the device policy or the capture interfaces, so the request
+    covers every client of the router resolver; a captured scope reaches its
+    clients by redirect instead and never asks. Whether Unbound accepts it is
+    the helper's answer, which a validating resolver declines.
     """
-    tun = generated.get('tun') if isinstance(generated.get('tun'), dict) else {}
-    dns = generated.get('dns') if isinstance(generated.get('dns'), dict) else {}
-    return bool(tun.get('enable') and dns.get('enable') and dns.get('listen') == '127.0.0.1:1053'
-                and not settings.get('router_dns'))
+    return effective_dns_scope(settings, generated, ipv6_reaching)[0] == 'all'
 
 
-def atomic_write(path, content, mode=0o600):
+def restores_direct_dns(settings):
+    """Whether Unbound resolves on its own when Mihomo exits unexpectedly.
+
+    Restore direct DNS on exit decides it for all devices. A captured scope
+    always fails open, also while it answers every device because captured
+    devices are given IPv6: the page hides the switch for that choice.
+    """
+    return bool(settings['dns_fallback']) or settings.get('dns_scope') == 'captured'
+
+
+def atomic_write(path, content, mode=0o600, durable=True):
+    """Replace path in one step; durable also forces the new content to disk first."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
     try:
@@ -1056,21 +1267,26 @@ def atomic_write(path, content, mode=0o600):
             os.fchmod(stream.fileno(), mode)
             stream.write(content)
             stream.flush()
-            os.fsync(stream.fileno())
+            if durable:
+                os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if durable:
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temporary)
 
 
 class System:
-    def __init__(self, process_reader=None):
+    def __init__(self, process_reader=None, report=None):
         self.process_reader = process_reader
+        # Told about a failure that must not fail the operation it happened in;
+        # the Manager points it at the core's log.
+        self.report = report
 
     def _core_group(self, config=None):
         return core_group(process_reader=self.process_reader, signaler=os.kill,
@@ -1625,6 +1841,87 @@ class System:
         self.run(["/usr/local/sbin/configctl", "unbound", "restart"], timeout=90)
         if not self.resolver_running():
             raise Error("The resolver did not come back. No DNS change was left in place.")
+        # This start found no resolver for its stop to dump, so it loaded any
+        # dump that was left: the one the failed restart's stop wrote, if
+        # deleting it failed. Emptying the cache afterwards does not depend on
+        # that delete.
+        self.drop_resolver_cache()
+
+    @staticmethod
+    def wait_for_resolver_start():
+        """Wait, for a bounded time, until OPNsense's Unbound start script is done.
+
+        'configctl unbound restart' returns as soon as the new process has
+        written its pid, while start.sh goes on in the background under
+        UNBOUND_START_LOCK and only then loads the cache the stop dumped.
+        OPNsense's own stop waits on the lock the same way. It is let go at
+        once: a start that finds it held skips itself and would leave the
+        resolver stopped.
+        """
+        try:
+            # Non-blocking, so a FIFO left at the path in /tmp cannot hold the
+            # open, and with it the change, beyond the bounded wait below.
+            descriptor = os.open(UNBOUND_START_LOCK,
+                                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        except OSError:
+            # The start script creates it, so no start has run that could
+            # still be loading anything.
+            return
+        try:
+            # The start script only ever locks the regular file it creates.
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return
+            deadline = time.monotonic() + UNBOUND_START_WAIT
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return
+                    time.sleep(0.1)
+                    continue
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                return
+        finally:
+            os.close(descriptor)
+
+    def drop_resolver_cache(self):
+        """Keep what Unbound cached before a change of its forwarding from answering.
+
+        OPNsense carries the cache across a restart unless "Flush DNS cache
+        during reload" is set: the stop dumps it and the start loads it into
+        the new process. The 'unbound cache flush' action only deletes that
+        dump. Run straight after the restart, it lands while the start is
+        still loading, and it never reaches the running cache, so the AAAA
+        records Mihomo withholds, or Mihomo's own answers after it is
+        removed, were served until their TTL ran out, by default at most a
+        day. The operator's setting stays as it is; the plugin empties the
+        cache only after its own restarts, each of which follows a change of
+        the configuration Unbound resolves with.
+
+        Neither step fails the change already in place: stale answers are
+        the lesser harm, and a failure here would skip repair_resolver() for
+        a restart that left no resolver. A live flush that fails on a running
+        resolver is reported instead, because nothing retries it.
+        """
+        self.wait_for_resolver_start()
+        # A start that finds no running resolver to dump, such as the repair
+        # of one that did not come back, would otherwise load them again.
+        with contextlib.suppress(Error):
+            self.run(["/usr/local/sbin/configctl", "unbound", "cache", "flush"], timeout=90)
+        # Expires every cached record, message and key, and marks the messages
+        # unfit for serve-expired too -- except with serve-expired on and
+        # serve-expired-ttl at 0, which OPNsense accepts and which lets Unbound
+        # serve an expired answer however old it is. A resolver that is not
+        # running holds no cache.
+        try:
+            emptied = self.run(UNBOUND_CONTROL + ["flush_zone", "."], timeout=30, check=False).returncode == 0
+        except Error:
+            emptied = False
+        if not emptied and self.report is not None:
+            with contextlib.suppress(Error):
+                if self.resolver_running():
+                    self.report(RESOLVER_CACHE_KEPT_LOG)
 
     def forwarded(self):
         """Whether the file Unbound actually reads sends queries to Mihomo."""
@@ -1730,7 +2027,7 @@ class System:
         atomic_write(pending, b"pending\n")
         mode = 'rescue' if recovery_only else 'enable' if enabled else 'disable'
         result = self.run(["/usr/local/bin/php", HELPER, mode,
-                  "1" if settings["dns_fallback"] else "0"], timeout=90)
+                  "1" if restores_direct_dns(settings) else "0"], timeout=90)
         integration = integration_state(result.stdout)
         expected_forwarding = integration['effective_forwarding']
         # "unchanged" reports that the configuration already said this. It says
@@ -1762,15 +2059,14 @@ class System:
         # unbound-checkconf is unhappy, and a fetch made while DNS is being
         # changed has nothing to ask. See restore_anchor().
         anchor = self.anchor_snapshot()
-        actions = [["unbound", "restart"], ["unbound", "cache", "flush"]]
+        self.run(["/usr/local/sbin/configctl", "unbound", "restart"], timeout=90)
+        self.drop_resolver_cache()
         # Interface/rule XML is independent of resolver XML. Avoid disrupting
         # all firewall states when this operation changed only DNS; a retry
         # remains conservative because the older pending marker predates the
         # helper's exact decision.
         if integration['filter_changed'] or was_pending:
-            actions.append(["filter", "reload"])
-        for args in actions:
-            self.run(["/usr/local/sbin/configctl", *args], timeout=90)
+            self.run(["/usr/local/sbin/configctl", "filter", "reload"], timeout=90)
         self.repair_resolver(anchor)
         pending.unlink(missing_ok=True)
         return expected_forwarding
@@ -1814,19 +2110,37 @@ class System:
         pending.unlink(missing_ok=True)
         self.routing('enable')
 
+    def ensure_routing_context(self):
+        """Have the filter write the routing context when there is none yet.
+
+        Every filter reload writes it, but a new installation has none until
+        the first one, and tun() reloads only after the start has decided
+        whether IPv6 reaches the interfaces transparent routing captures.
+        """
+        context = Path(STATE) / 'routing-context.json'
+        if context.is_symlink() or not context.is_file():
+            self.run(['/usr/local/sbin/configctl', 'filter', 'reload'], timeout=90)
+
     def redirect_hook_missing(self):
-        """Whether the TCP redirect listener is configured but PF never evaluates its rules.
+        """Whether a loopback redirect is configured but PF never evaluates its rules.
 
         A package upgrade does not reload the filter, so the rdr-anchor hook the
-        plugin registers appears only with the next reload.
+        plugin registers appears only with the next reload. Both the TCP
+        listener and a captured DNS scope need it.
         """
         try:
             config = parse_yaml((Path(STATE) / 'config.yaml').read_bytes())
         except (Error, OSError):
             return False
         listeners = config.get('listeners')
-        if not isinstance(listeners, list) or not any(
-                isinstance(item, dict) and item.get('name') == REDIRECT_LISTENER for item in listeners):
+        tcp = isinstance(listeners, list) and any(
+            isinstance(item, dict) and item.get('name') == REDIRECT_LISTENER for item in listeners)
+        captured = False
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            dns = config.get('dns') if isinstance(config.get('dns'), dict) else {}
+            captured = (json.loads((Path(STATE) / 'settings.json').read_bytes()).get('dns_scope') == 'captured'
+                        and dns.get('enable') is True and dns.get('listen') == DNS_LISTEN)
+        if not tcp and not captured:
             return False
         result = self.run(['/sbin/pfctl', '-sn'], check=False)
         return result.returncode == 0 and 'rdr-anchor "mihomo" all' not in [
@@ -1844,25 +2158,58 @@ class System:
         self.dns(False, settings, recovery_only=True)
 
     def check_router_dns(self):
-        import struct
-        query = struct.pack('!HHHHHH', 0x4d48, 0x100, 1, 0, 0, 0) + b'\x09localhost\x00\x00\x01\x00\x01'
         try:
-            with socket.create_connection(('127.0.0.1', 53), timeout=3) as client:
-                client.sendall(struct.pack('!H', len(query)) + query)
-                length = client.recv(2)
-                if len(length) != 2:
-                    raise ValueError
-                response = b''
-                size = struct.unpack('!H', length)[0]
-                while len(response) < size:
-                    part = client.recv(size - len(response))
-                    if not part:
-                        raise ValueError
-                    response += part
-                if len(response) < 12 or response[:2] != query[:2] or response[3] & 15:
-                    raise ValueError
-        except (OSError, ValueError):
-            raise Error('The router DNS resolver did not answer successfully. No provider DNS fallback is used.') from None
+            rcode = dns_probe.query(*dns_probe.ROUTER, 'localhost', 'tcp', 3.0)
+        except dns_probe.ProbeError:
+            rcode = None
+        if rcode != dns_probe.NOERROR:
+            raise Error('The router DNS resolver did not answer successfully. No provider DNS fallback is used.')
+
+    def dns_query(self, server, name, timeout):
+        """One UDP question to a local DNS listener: its response code, or ProbeError."""
+        return dns_probe.query(server[0], server[1], name, 'udp', timeout)
+
+    def ipv6_addresses(self):
+        """Each interface's IPv6 addresses as the kernel holds them now, or None when unreadable."""
+        try:
+            result = self.run(['/sbin/ifconfig', '-a'], timeout=15, check=False)
+        except Error:
+            return None
+        if result.returncode:
+            return None
+        return interface_ipv6(result.stdout.decode(errors='replace'))
+
+    def core_identity(self):
+        """The running core's recorded identity, which a DNS verdict belongs to; None if unproven."""
+        try:
+            group = self._core_group()
+            record = group.discover(adopt=False)
+            if record is None or not group.same(record['child']):
+                return None
+        except OwnershipError:
+            return None
+        return dns_probe.core_identity(record['child'])
+
+    def dns_redirect_activity(self):
+        """Whether DNS reaches the redirect, and whether captured sources are otherwise active.
+
+        Read from the anchor's own source tables and the firewall states; None
+        when either cannot be read.
+        """
+        try:
+            names = self.run(['/sbin/pfctl', '-a', 'mihomo', '-sT'], timeout=15).stdout.decode()
+            sources = []
+            for name in names.split():
+                if re.fullmatch(r'mihomo_sources_[0-9]+', name):
+                    shown = self.run(['/sbin/pfctl', '-a', 'mihomo', '-t', name, '-T', 'show'], timeout=15)
+                    sources += [ipaddress.ip_network(value, strict=False)
+                                for value in shown.stdout.decode().split()]
+            states = self.run(['/sbin/pfctl', '-ss'], timeout=15).stdout
+        except (Error, ValueError, UnicodeError):
+            return None
+        if len(states) > STATE_TABLE_LIMIT:
+            return None
+        return dns_probe.redirect_activity(states.decode(errors='replace'), sources, DNS_PORT)
 
     def watch(self):
         owner = self._watch_group()
@@ -1931,7 +2278,7 @@ def fetch_subscription(url, user_agent, proxy="127.0.0.1:7891", run=subprocess.r
 class Manager:
     def __init__(self, root=Path("/"), system=None, backup_transport=None, proxy_api=None):
         self.root = Path(root)
-        self.system = system or System()
+        self.system = system or System(report=self.core_log)
         self.state = self.path(STATE)
         self.settings_file = self.state / "settings.json"
         self.source_file = self.state / "subscription.yaml"
@@ -1945,10 +2292,32 @@ class Manager:
         self.replay_file = self.state / 'proxy-replay-pending'
         self.proxy_warning_file = self.state / 'proxy-backup-warning'
         self.tun_reassign_file = self.state / 'tun-reassign-pending'
+        # What the last start saw that the DNS scope depends on beyond the
+        # settings and the applied configuration, for the routing adapter and
+        # every later status to decide the scope exactly as that start did.
+        self.dns_scope_file = self.state / 'dns-scope.json'
+        # A watchdog scope change that has begun and not yet ended in a started
+        # service: its stop may have run and its start may have written the
+        # forward zone before the status says so.
+        self.scope_move_file = self.state / 'dns-scope-move'
+        # The latest verdict on the running core's DNS, which the routing
+        # adapter requires before it redirects captured devices' DNS.
+        self.dns_health_file = self.path(dns_probe.HEALTH_FILE)
+        # Probes are timed with the system-wide monotonic clock, which the
+        # routing adapter, another process, reads the verdict's age with.
+        self.clock = time.monotonic
+        self.sleep = time.sleep
         self.backup_transport = backup_transport or self._backup_transport
         self.proxy_api = proxy_api or self._proxy_api
         self._lock_depth = 0
         self._applied_dns = None
+        self._ipv6_offer = None
+        self._validating = None
+        self._routing_context = None
+        # The watchdog's look at IPv6 reaching captured devices: when it last
+        # looked, what at, how many looks in a row disagree with the scope in
+        # force, and when a failed change may be tried again.
+        self._reach = None
 
     def path(self, path):
         return self.root / path.lstrip("/")
@@ -2054,7 +2423,9 @@ class Manager:
     def _consent_scope(self):
         xml = self._backup_read(self.path('/conf/config.xml'))
         if xml:
-            with contextlib.suppress(ElementTree.ParseError):
+            # The watchdog mirrors every tick; an unknown encoding declaration
+            # raises LookupError, which would stop its loop.
+            with contextlib.suppress(ElementTree.ParseError, ValueError, LookupError):
                 doc = ElementTree.fromstring(xml)
                 identity = [doc.findtext('./system/' + name, '') for name in ('uuid', 'hostname', 'domain')]
                 if any(identity):
@@ -2239,8 +2610,9 @@ class Manager:
                     if field not in stored or stored[field] == '':
                         continue
                     fallback = settings.get(field, [] if field in (*DNS_SERVER_FIELDS, 'device_list', 'capture_interfaces') else
-                                            'off' if field == 'device_mode' else False if field == 'tcp_redirect'
-                                            else LOOPBACK_CONTROLLER)
+                                            'off' if field == 'device_mode'
+                                            else False if field in ('tcp_redirect', 'ipv6_clients_restricted')
+                                            else DNS_SCOPE_DEFAULT if field == 'dns_scope' else LOOPBACK_CONTROLLER)
                     decoded = json.loads(stored[field]) if not isinstance(fallback, str) else self._backup_text(stored[field])
                     if isinstance(fallback, bool) and type(decoded) is int and decoded in (0, 1):
                         decoded = bool(decoded)
@@ -2297,7 +2669,8 @@ class Manager:
                 references = self._reference_restore(stored, data, overlay)
                 pending.update({path: content for path, (content, mode) in references.items()})
                 upstreams, ipv6 = self.router_context(settings)
-                config = render(data, settings, overlay=overlay, upstreams=upstreams, ipv6_advertised=ipv6)
+                config = render(data, settings, overlay=overlay, upstreams=upstreams, ipv6_advertised=ipv6,
+                                local_names=self.local_names(settings))
                 pending[self.config_file] = config
                 pending[self.backup_marker] = (checksum + '\n').encode()
                 self.state.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -2442,8 +2815,11 @@ class Manager:
 
     def check_settings(self, settings):
         for key in ("transparent", "dns_fallback", "service_enabled", 'router_dns',
-                    'dns_override', 'ipv6', 'dns_hijack', 'allow_lan', 'tcp_redirect'):
-            if key not in settings and (key in SWITCH_DEFAULTS or key == 'tcp_redirect'):
+                    'dns_override', 'ipv6', 'dns_hijack', 'allow_lan', 'tcp_redirect',
+                    'ipv6_clients_restricted'):
+            # A switch newer than its settings file is off until stored.
+            if key not in settings and (key in SWITCH_DEFAULTS
+                                        or key in ('tcp_redirect', 'ipv6_clients_restricted')):
                 continue
             if not isinstance(settings.get(key), bool):
                 raise Error("Service policies must be boolean values.")
@@ -2483,6 +2859,10 @@ class Manager:
                 raise Error('The bind address must be an IP address, or * for every address.') from None
         if settings.get('device_mode', 'off') not in DEVICE_MODES:
             raise Error('The device policy must be one of: ' + ', '.join(DEVICE_MODES) + '.')
+        # Router DNS with 'all' is not refused: it counts as off, so settings
+        # every earlier release accepted still load, restore and save.
+        if settings.get('dns_scope', DNS_SCOPE_DEFAULT) not in DNS_SCOPES:
+            raise Error('The DNS scope must be one of: ' + ', '.join(DNS_SCOPES) + '.')
         device_networks(settings.get('device_list'))
         capture_interfaces(settings.get('capture_interfaces'))
         if not isinstance(settings.get("secret"), str) or not settings["secret"]:
@@ -2506,39 +2886,493 @@ class Manager:
         atomic_write(self.settings_file, (json.dumps(settings, indent=2) + "\n").encode())
 
     def unbound_validating(self):
-        """Whether Unbound validates DNSSEC, read where the integration helper reads it."""
-        # The watchdog asks this every tick and its loop survives only Error and
-        # OSError; an unknown or multi-byte encoding declaration raises
-        # LookupError or ValueError rather than ParseError.
-        try:
-            root = ElementTree.fromstring(self.path('/conf/config.xml').read_bytes())
-        except (OSError, ValueError, LookupError, ElementTree.ParseError):
-            return False
-        return (root.findtext('./OPNsense/unboundplus/general/dnssec') or '').strip() == '1'
+        """Whether Unbound validates DNSSEC, read where the integration helper reads it.
 
-    def applied_dns_requested(self, settings):
-        """dns_requested() for the applied configuration.
+        The watchdog asks every tick while a captured scope runs, so, as in
+        ipv6_offered(), config.xml is parsed again only when it changes.
+        """
+        path = self.path('/conf/config.xml')
+        try:
+            info = path.stat()
+            key = (info.st_ino, info.st_mtime_ns, info.st_size)
+            if self._validating is None or self._validating[0] != key:
+                # The watchdog's loop survives only Error and OSError; an
+                # unknown or multi-byte encoding declaration raises
+                # LookupError or ValueError rather than ParseError.
+                try:
+                    root = ElementTree.fromstring(path.read_bytes())
+                    validating = (root.findtext('./OPNsense/unboundplus/general/dnssec') or '').strip() == '1'
+                except (ValueError, LookupError, ElementTree.ParseError):
+                    validating = False
+                self._validating = (key, validating)
+        except OSError:
+            self._validating = None
+            return False
+        return self._validating[1]
+
+    def ipv6_reaching(self, settings):
+        """Whether IPv6 reaches captured devices, which only a captured scope needs to know.
+
+        It does when this router offers clients IPv6 and an interface
+        transparent routing captures holds a global unicast IPv6 address
+        right now: without a prefix on the interface, an offer such as the
+        stock 26.7 Dnsmasq IPv6 range hands captured devices nothing. WAN-like
+        interfaces, the TUN and loopback never count. A configuration or
+        interface list that cannot be read counts as reaching, so the scope
+        falls back to answering every client as earlier releases did. Without
+        a usable routing context, which every filter reload writes and a start
+        with transparent routing has written first, every interface but
+        loopback and the TUN counts: that can only find more, so it answers no
+        only when no interface of the router holds a global address at all.
+        An administrator who declared that captured devices get no IPv6
+        (ipv6_restricted()) is taken at their word, and nothing is read.
+        """
+        if settings.get('dns_scope') != 'captured' or ipv6_restricted(settings):
+            return False
+        offered = self.ipv6_offered()
+        if offered is not True:
+            return offered is None
+        addresses = None
+        with contextlib.suppress(Error, OSError, AttributeError):
+            addresses = self.system.ipv6_addresses()
+        if not isinstance(addresses, dict):
+            return True
+        devices = self.captured_devices(settings)
+        for device, values in addresses.items():
+            if devices is not None and device not in devices:
+                continue
+            if devices is None and (device == 'tun_mihomo' or device.startswith('lo')):
+                continue
+            if any(global_ipv6(value) for value in values):
+                return True
+        return False
+
+    def reach_now(self, settings):
+        """The IPv6 answer a captured scope follows now, and whether DNSSEC alone makes it no.
+
+        While Unbound validates DNSSEC it declines to forward to Mihomo, so a
+        captured scope falling back to every device would answer nobody and
+        leave captured devices the router DNS's IPv6 answers anyway: it stays
+        as it is, and the status says why.
+        """
+        reaching = self.ipv6_reaching(settings)
+        if reaching and self.unbound_validating():
+            return False, True
+        return reaching, False
+
+    def stopped_reason(self):
+        """Why a scope change left the service stopped, or ''."""
+        reason = (self.dns_observation() or {}).get('stopped')
+        return reason if isinstance(reason, str) else ''
+
+    def ipv6_offered(self):
+        """Whether this router offers clients IPv6, or None when its configuration cannot be read.
+
+        The watchdog asks every time it looks, so config.xml is parsed again
+        only when it changes.
+        """
+        path = self.path('/conf/config.xml')
+        try:
+            info = path.stat()
+            key = (info.st_ino, info.st_mtime_ns, info.st_size)
+            if self._ipv6_offer is None or self._ipv6_offer[0] != key:
+                try:
+                    offered = advertises_ipv6(path.read_bytes())
+                except Error:
+                    offered = None
+                self._ipv6_offer = (key, offered)
+        except OSError:
+            self._ipv6_offer = None
+            return None
+        return self._ipv6_offer[1]
+
+    def captured_devices(self, settings):
+        """The devices of the interfaces transparent routing captures, or None when unknown.
+
+        Read from the routing context the firewall rewrites on every reload,
+        narrowed by the capture selection as capture_scope() narrows it, and
+        without the WAN-like interfaces, the TUN and loopback, which
+        normalize_context() drops; parsed again only when the file changes.
+        """
+        path = self.state / 'routing-context.json'
+        try:
+            info = path.stat()
+            key = (info.st_ino, info.st_mtime_ns, info.st_size)
+            if self._routing_context is None or self._routing_context[0] != key:
+                self._routing_context = (key, json.loads(path.read_bytes()))
+            context = self._routing_context[1]
+        except (OSError, ValueError):
+            self._routing_context = None
+            return None
+        interfaces = context.get('interfaces') if isinstance(context, dict) else None
+        if not isinstance(interfaces, list):
+            return None
+        selected = settings.get('capture_interfaces') or []
+        devices = set()
+        for item in interfaces:
+            if (not isinstance(item, dict) or not isinstance(item.get('device'), str)
+                    or not isinstance(item.get('wan'), bool)):
+                return None
+            if item['wan'] or item['device'] in ('tun_mihomo', 'lo0'):
+                continue
+            if not selected or item.get('name') in selected:
+                devices.add(item['device'])
+        return devices
+
+    def reach_inputs(self):
+        """What IPv6 reaching captured devices is read from, as file identities that change with them."""
+        keys = []
+        for path in (self.path('/conf/config.xml'), self.state / 'routing-context.json'):
+            try:
+                info = path.stat()
+                keys.append((info.st_ino, info.st_mtime_ns, info.st_size))
+            except OSError:
+                keys.append(None)
+        return tuple(keys)
+
+    def observed_ipv6(self):
+        """Whether IPv6 reached captured devices when the scope in force was decided; unknown counts as reaching."""
+        observed = self.dns_observation()
+        return not (isinstance(observed, dict) and observed.get('ipv6_reaching') is False)
+
+    def dns_observation(self):
+        """What the last start recorded in dns-scope.json, or None."""
+        try:
+            observed = json.loads(self.dns_scope_file.read_bytes())
+        except (OSError, ValueError):
+            return None
+        return observed if isinstance(observed, dict) else None
+
+    def applied_dns_shape(self):
+        """The parts of the applied configuration the DNS scope depends on, or None.
 
         Status is republished on every watchdog tick, and a subscription's
         configuration can be large enough that parsing it that often costs a
-        small router real time, so only the three values the answer depends on
-        are kept, and the file is parsed again only when its content changes.
+        small router real time, so only the values the answer depends on are
+        kept, and the file is read again only when its identity changes:
+        every writer replaces it whole.
         """
         try:
-            content = self.config_file.read_bytes()
-        except OSError:
-            return False
-        digest = hashlib.sha256(content).digest()
-        if self._applied_dns is None or self._applied_dns[0] != digest:
+            info = self.config_file.stat()
+            key = (info.st_ino, info.st_mtime_ns, info.st_size)
+            if self._applied_dns is None or self._applied_dns[0] != key:
+                generated = parse_yaml(self.config_file.read_bytes())
+                tun = generated.get('tun') if isinstance(generated.get('tun'), dict) else {}
+                dns = generated.get('dns') if isinstance(generated.get('dns'), dict) else {}
+                self._applied_dns = (key, {'ipv6': generated.get('ipv6'), 'tun': {'enable': tun.get('enable')},
+                                           'dns': {'enable': dns.get('enable'), 'listen': dns.get('listen'),
+                                                   'ipv6': dns.get('ipv6')}})
+        except (Error, OSError):
+            self._applied_dns = None
+            return None
+        return self._applied_dns[1]
+
+    def applied_dns_scope(self, settings):
+        """effective_dns_scope() for the applied configuration and the IPv6 reach the last start decided with."""
+        shape = self.applied_dns_shape()
+        return ('off', '') if shape is None else effective_dns_scope(settings, shape, self.observed_ipv6())
+
+    def applied_dns_requested(self, settings):
+        """dns_requested() for the applied configuration."""
+        return self.applied_dns_scope(settings)[0] == 'all'
+
+    def read_dns_health(self):
+        """The recorded verdict on the running core's DNS, or None when there is no usable one."""
+        try:
+            record = json.loads(self.dns_health_file.read_bytes())
+        except (OSError, ValueError):
+            return None
+        return record if dns_probe.valid(record) else None
+
+    def write_dns_health(self, record):
+        # Rewritten every tick, so not forced to disk each time: a torn or
+        # missing verdict only reads as unhealthy.
+        atomic_write(self.dns_health_file, (json.dumps(record, sort_keys=True) + '\n').encode(),
+                     durable=False)
+
+    def dns_redirect_armed(self):
+        """Whether the routing adapter last reported the captured-device DNS redirect loaded."""
+        with contextlib.suppress(OSError, ValueError):
+            routing = json.loads((self.state / 'routing-state.json').read_bytes())
+            return (isinstance(routing, dict) and routing.get('active') is True
+                    and type(routing.get('dns_redirect_port')) is int)
+        return False
+
+    @contextlib.contextmanager
+    def dns_redirect_logged(self, reason, failure=None):
+        """Log whether the enclosed routing change armed or withdrew the DNS redirect.
+
+        A withdrawal the DNS probes caused names their reason; one that came
+        with an error names failure when given; any other names reason.
+        """
+        before = self.dns_redirect_armed()
+        failed = False
+        try:
+            yield
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            after = self.dns_redirect_armed()
+            if after and not before:
+                self.core_log(DNS_ARMED_LOG)
+            elif before and not after:
+                record = self.read_dns_health()
+                paused = record['reason'] if record is not None and not record['healthy'] else ''
+                self.core_log(DNS_WITHDRAWN_LOG % DNS_WITHDRAW_REASONS.get(
+                    paused, failure if failed and failure else reason))
+
+    def _dns_ask(self, server, name, timeout):
+        return self.system.dns_query(server, name, timeout)
+
+    def probe_dns(self, settings):
+        """Probe the running core's DNS for a captured scope, before the routing refresh acts on it.
+
+        Any other scope keeps no verdict. A probe that cannot run or be
+        recorded leaves the last verdict to go stale, and a stale verdict arms
+        nothing, so every failure here hands captured devices back to the
+        router DNS rather than holding them on a core nobody checked.
+        """
+        # The watchdog loop survives only Error and OSError; nothing here may
+        # stop it, or no later failure would be withdrawn at all.
+        with contextlib.suppress(Error, OSError, ValueError, TypeError, KeyError):
+            if self.applied_dns_scope(settings)[0] != 'captured' or not hasattr(self.system, 'dns_query'):
+                self.dns_health_file.unlink(missing_ok=True)
+                return
+            previous = self.read_dns_health()
+            record = dns_probe.tick(previous, self.system.core_identity(), self.clock, self._dns_ask,
+                                    sleep=self.sleep)
+            self.write_dns_health(record)
+            # The router DNS is asked again only in a tick without an upstream
+            # round, so no tick probes for longer than that round.
+            if previous is not None and record['next_upstream'] == previous['next_upstream']:
+                self.recheck_router_dns()
+
+    def observe_dns_redirect(self):
+        """Record since when the redirect is armed, and look for a rule taking its DNS once a minute."""
+        record = self.read_dns_health()
+        if record is None:
+            return
+        with contextlib.suppress(Error, OSError, ValueError, TypeError, KeyError):
+            now = self.clock()
+            updated = dns_probe.observe_arming(record, self.dns_redirect_armed(), now)
+            if dns_probe.activity_due(updated, now) and hasattr(self.system, 'dns_redirect_activity'):
+                updated = dns_probe.observe_activity(updated, self.system.dns_redirect_activity(), now)
+            if updated != record:
+                self.write_dns_health(updated)
+
+    def router_dns_answers(self):
+        """Whether the router's own resolver answers, which captured devices' local names need.
+
+        None when this system cannot ask.
+        """
+        if not hasattr(self.system, 'dns_query'):
+            return None
+        with contextlib.suppress(Error, OSError, ValueError):
+            return dns_probe.verdict(self._dns_ask, dns_probe.ROUTER, dns_probe.LIVENESS_NAME,
+                                     dns_probe.LIVENESS_TIMEOUT) == 'ok'
+        return None
+
+    def recheck_router_dns(self):
+        """Clear a start's finding that the router DNS did not answer, once it does."""
+        observed = self.dns_observation()
+        if observed is None or observed.get('router_dns_answered') is not False:
+            return
+        if self.router_dns_answers():
+            atomic_write(self.dns_scope_file,
+                         (json.dumps(dict(observed, router_dns_answered=True)) + '\n').encode())
+
+    def start_dns_probe(self):
+        """Give a new core up to three seconds to answer, so the first routing enable can arm it.
+
+        Never fails the start: an unanswered probe leaves arming to the watchdog.
+        """
+        if not hasattr(self.system, 'dns_query'):
+            return
+        with contextlib.suppress(Error, OSError, ValueError, TypeError, KeyError):
+            self.write_dns_health(dns_probe.start(self.system.core_identity(), self.clock,
+                                                  self._dns_ask, self.sleep))
+
+    def annotate_observation(self, record, **changes):
+        """Set, or drop with None, the watchdog's own fields in dns-scope.json; written only when they change.
+
+        The start that decides the scope rewrites the whole record, so they
+        last until the next start. A missing record is left missing: it reads
+        as reaching, which a start settles.
+        """
+        if not record:
+            return
+        updated = dict(record)
+        for key, value in changes.items():
+            if value is None:
+                updated.pop(key, None)
+            else:
+                updated[key] = value
+        if updated != record:
+            with contextlib.suppress(OSError):
+                atomic_write(self.dns_scope_file, (json.dumps(updated) + '\n').encode())
+
+    def follow_ipv6_reach(self, settings):
+        """Change the DNS scope once IPv6 starts or stops reaching captured devices.
+
+        Returns the status of a change, or None when the running service
+        stays as it was. The watchdog looks only while the answer can change
+        the scope of the running configuration: every IPV6_POLL seconds, at
+        once when config.xml or the routing context changes, and on the next
+        tick while a new answer waits for its confirmation or its wait has
+        just ended. A look parses config.xml only when it changed and runs
+        ifconfig at most once, and only while the router offers IPv6. A new
+        answer must hold for IPV6_CONFIRM looks in a row; towards every
+        device, the safe answer, the change then follows at once, and back to
+        captured devices no sooner than SCOPE_CHANGE_INTERVAL after the last
+        change, a start included. While Unbound validates DNSSEC the answer is
+        no (see reach_now()), and leaving a fallback that then answers nobody
+        is not held back either.
+        """
+        action = None
+        # The watchdog loop survives only Error and OSError.
+        with contextlib.suppress(Error, OSError, ValueError, TypeError, KeyError):
+            shape = self.applied_dns_shape()
+            if shape is None or not ipv6_matters(settings, shape):
+                self._reach = None
+                return None
+            record = self.dns_observation() or {}
+            # Unknown counts as reaching, as the routing adapter counts it.
+            current = record.get('ipv6_reaching') is not False
+            changed = record.get('changed')
+            changed = float(changed) if type(changed) in (int, float) else None
+            now = self.clock()
+            state = self._reach
+            if state is None or state['decision'] != (current, changed):
+                # A start decided the scope anew: nothing seen before counts.
+                state = self._reach = {'decision': (current, changed), 'checked': None, 'inputs': None,
+                                       'count': 0, 'retry_at': None, 'failures': 0}
+            inputs = self.reach_inputs()
+            if state['checked'] is None or inputs != state['inputs']:
+                due = True
+            elif state['count']:
+                # Confirming, or held back: look again as soon as that ends.
+                due = (state['count'] < IPV6_CONFIRM or reach_verdict(
+                    current, not current, state['count'], now, changed, state['retry_at'])[1] == 'move')
+            else:
+                due = False
+            if not (due or not 0 <= now - state['checked'] < IPV6_POLL):
+                return None
+            observed, blocked = self.reach_now(settings)
+            state.update(checked=now, inputs=inputs)
+            validating = blocked or (current and not observed and self.unbound_validating())
+            state['count'], action = reach_verdict(current, observed, state['count'], now,
+                                                   None if validating else changed, state['retry_at'])
+            changes = {'ipv6_dnssec': True if blocked else None}
+            if action == 'stay':
+                # The answer went back to what runs: an earlier failure or
+                # wait no longer applies.
+                changes.update(waiting=None, failed=None)
+                state.update(retry_at=None, failures=0)
+            elif action == 'hold' and not observed:
+                changes['waiting'] = True
+            self.annotate_observation(record, **changes)
+        if action != 'move':
+            return None
+        return self.move_dns_scope(settings, observed, current)
+
+    def move_dns_scope(self, settings, reaching, previous, announcement=None, check=True):
+        """Restart the service with the scope IPv6 reaching captured devices now calls for.
+
+        Both directions change what the core itself holds -- the local-name
+        policy a captured scope has, and every device must never have -- so
+        the change is a restart, as a WAN address change makes. The new
+        configuration is first rendered and validated while the running core
+        still answers, as apply() does, so one the new scope cannot run tears
+        nothing down. Stop then withdraws the redirect and removes the forward
+        zone before the core stops, and start records its decision in
+        dns-scope.json before the core starts, then writes the zone or arms
+        the redirect once the core answers; the router DNS answers throughout.
+        A change that fails is rolled back to the previous scope and retried
+        later, backing off with each failure in a row (retry_delay()); only if
+        the rollback fails as well does the service stay stopped, with direct
+        DNS restored or retried. Returns the status of the restart, or None
+        when the check failed and the running service was left alone. check
+        is False only to settle a change a dead watchdog left half done, which
+        takes a restart whatever it renders.
+        """
+        self.core_log(announcement or IPV6_MOVE_LOGS[bool(reaching)])
+        failures = (self._reach or {}).get('failures', 0) + 1
+        if check:
             try:
-                generated = parse_yaml(content)
-            except Error:
-                return False
-            tun = generated.get('tun') if isinstance(generated.get('tun'), dict) else {}
-            dns = generated.get('dns') if isinstance(generated.get('dns'), dict) else {}
-            self._applied_dns = (digest, {'tun': {'enable': tun.get('enable')},
-                                          'dns': {'enable': dns.get('enable'), 'listen': dns.get('listen')}})
-        return dns_requested(settings, self._applied_dns[1])
+                self.check_start(settings, reaching)
+            except (Error, OSError, ValueError, TypeError, KeyError) as error:
+                self.scope_move_failed(settings, reaching, error, failures, 'the current scope stays')
+                return None
+        # The new core replays the proxy selections saved here.
+        self.proxy_tick()
+        # Journaled before anything changes, for a watchdog that dies half way:
+        # the next one restores direct DNS for a stopped core, or finishes the
+        # change for a running one. A start that succeeds removes it, and so
+        # does a rollback that stopped with direct DNS restored.
+        atomic_write(self.scope_move_file, (json.dumps({'ipv6_reaching': bool(reaching)}) + '\n').encode())
+        try:
+            self.stop(settings, withdrawal='the DNS scope changed')
+            status = self.start(settings, reaching=reaching)
+        except (Error, OSError, ValueError, TypeError, KeyError) as error:
+            try:
+                status = self.start(settings, reaching=previous)
+            except (Error, OSError, ValueError, TypeError, KeyError):
+                return self.scope_move_stopped(settings, error)
+            self.scope_move_failed(settings, reaching, error, failures, 'Mihomo answers %s again' % (
+                IPV6_SCOPE_NAMES.get(status.get('dns_scope'), 'no device')))
+            return self.publish_status(settings, bool(status.get('dns_active')))
+        self.core_log(IPV6_MOVED_LOG % IPV6_SCOPE_NAMES.get(status.get('dns_scope'), 'no device'))
+        return status
+
+    def check_start(self, settings, reaching):
+        """Render and validate what start(settings, reaching) would run, changing nothing."""
+        settings, data, _, cleaned, context, _ = self.start_inputs(routing_settings(settings), reaching)
+        candidate = self.candidate(data, settings, overlay=cleaned, context=context)
+        try:
+            self.system.validate(candidate)
+        finally:
+            candidate.unlink(missing_ok=True)
+
+    def scope_move_failed(self, settings, reaching, error, failures, outcome):
+        """Record a scope change that failed while a service runs, and when it is tried again."""
+        failure = bounded_routing_diagnostic(error) or 'the service could not restart'
+        record = self.dns_observation() or {}
+        self.annotate_observation(record, failed=failure)
+        changed = record.get('changed')
+        now = self.clock()
+        delay = retry_delay(failures, reaching)
+        # Keyed to the decision now in force, so the next look keeps waiting
+        # for the retry instead of starting afresh.
+        self._reach = {'decision': (record.get('ipv6_reaching') is not False,
+                                    float(changed) if type(changed) in (int, float) else None),
+                       'checked': now, 'inputs': self.reach_inputs(), 'count': 0,
+                       'retry_at': now + delay, 'failures': failures}
+        self.core_log(IPV6_MOVE_FAILED_LOG % (failure, IPV6_RETRY_LOG % (outcome, delay)))
+
+    def scope_move_stopped(self, settings, error):
+        """End a scope change whose rollback failed too: stopped, with direct DNS or its retry.
+
+        Either failure may have been the forward zone's removal itself, so it
+        is tried once more here. Until it succeeds the change stays journaled
+        and the status reports the integration active, which is how the next
+        ticks know to keep retrying it; the reason stays in the status until a
+        start or a stop replaces it.
+        """
+        failure = bounded_routing_diagnostic(error) or 'the service could not restart'
+        self._reach = None
+        direct = False
+        with contextlib.suppress(Error, OSError):
+            self.system.dns(False, settings)
+            direct = True
+        if direct:
+            self.scope_move_file.unlink(missing_ok=True)
+        self.core_log(IPV6_MOVE_FAILED_LOG % (
+            failure, 'the previous scope could not be restarted either, so the service is stopped.'))
+        reason = IPV6_STOPPED_ERROR % failure
+        self.annotate_observation(self.dns_observation(), stopped=reason)
+        return self.publish_status(settings, not direct, error='' if direct else
+                                   'Direct DNS recovery failed and will be retried.')
 
     def publish_status(self, settings=None, dns_active=False, error=""):
         settings = settings or self.settings()
@@ -2546,14 +3380,53 @@ class Manager:
         # Derived here rather than passed in, so every caller that republishes
         # only dns_active and error -- the backup mirror, the watchdog --
         # keeps the explanation too.
-        dns_note = ''
-        if running and not dns_active and self.applied_dns_requested(settings):
-            dns_note = DNSSEC_NOTE if self.unbound_validating() else DNS_RESTART_NOTE
-        routing_active = tcp_redirect = False
+        notes = []
+        dns_scope = 'off'
+        observed = self.dns_observation() or {}
+        if running:
+            dns_scope, scope_note = self.applied_dns_scope(settings)
+            # What the watchdog last recorded about a scope change IPv6
+            # reaching captured devices calls for, until a start replaces it.
+            if observed.get('waiting') is True and scope_note == IPV6_NOTE:
+                scope_note = IPV6_WAIT_NOTE
+            notes.append(scope_note)
+            if isinstance(observed.get('failed'), str) and observed['failed']:
+                notes.append(IPV6_FAILED_NOTE % bounded_routing_diagnostic(observed['failed']))
+            if dns_scope == 'all' and not dns_active:
+                # Asked for, but Unbound is not forwarding: nobody is answered.
+                dns_scope = 'off'
+                notes.insert(0, DNSSEC_NOTE if self.unbound_validating() else DNS_RESTART_NOTE)
+        if dns_active:
+            # Also after a crash with DNS recovery off: Unbound still forwards.
+            dns_scope = 'all'
+        routing_active = tcp_redirect = dns_redirect = False
         with contextlib.suppress(OSError, ValueError, TypeError):
             routing = json.loads((self.state / 'routing-state.json').read_bytes())
             routing_active = running and settings['transparent'] and isinstance(routing, dict) and routing.get('active') is True
             tcp_redirect = routing_active and type(routing.get('tcp_redirect_port')) is int
+            dns_redirect = (routing_active and dns_scope == 'captured'
+                            and type(routing.get('dns_redirect_port')) is int)
+        if dns_scope == 'captured':
+            health = self.read_dns_health()
+            if not dns_redirect:
+                paused = health['reason'] if health is not None and not health['healthy'] else ''
+                notes.append(PAUSED_NOTES.get(paused, CAPTURED_WAIT_NOTE))
+            elif health is not None and health['hint']:
+                notes.append(RULE_HINT_NOTE)
+            if self.unbound_validating():
+                if observed.get('ipv6_dnssec') is True:
+                    notes.append(IPV6_DNSSEC_NOTE)
+                notes.append(CAPTURED_DNSSEC_NOTE)
+            if not settings.get('router_dns') and observed.get('router_dns_answered') is False:
+                notes.append(LOCAL_NAMES_NOTE)
+        if running and ipv6_restricted(settings):
+            notes.append(self.restricted_note(settings, dns_scope))
+        dns_note = ' '.join(note for note in notes if note)
+        stopped = observed.get('stopped')
+        if not running and isinstance(stopped, str) and stopped and not error.startswith(stopped):
+            # A scope change left the service stopped: say so until a start
+            # or a stop replaces the record, whatever else this call reports.
+            error = stopped + (' ' + error if error else '')
         redirect_note = ''
         if settings.get('tcp_redirect') is True and routing_active and not tcp_redirect:
             redirect_note = ('TCP stays on the TUN: port %d is taken by another listener.' % REDIRECT_PORT
@@ -2566,7 +3439,8 @@ class Manager:
         status = {"running": running, "transparent": settings["transparent"],
                   "routing_active": routing_active, "tcp_redirect": tcp_redirect,
                   "tcp_redirect_note": redirect_note,
-                  "dns_active": dns_active, "dns_note": dns_note, "dns_fallback": settings["dns_fallback"],
+                  "dns_active": dns_active, "dns_scope": dns_scope, "dns_redirect": dns_redirect,
+                  "dns_note": dns_note, "dns_fallback": settings["dns_fallback"],
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
                   "error": bounded_routing_diagnostic(error), "backup_warning": self.backup_warning_file.read_text()
                       if self.backup_warning_file.exists() else BACKUP_WARNING
@@ -2574,12 +3448,42 @@ class Manager:
         atomic_write(self.status_file, json.dumps(status).encode(), 0o644)
         return status
 
+    def restricted_note(self, settings, dns_scope):
+        """What the declaration that captured devices get no IPv6 does in the running service, or ''.
+
+        Nothing while Mihomo carries IPv6, which leaves nothing to declare.
+        With every device answered by Mihomo, the devices given IPv6 lose
+        their AAAA records too, which the declaration exists to keep. With
+        router DNS, or a captured scope, an IPv6 offer config.xml shows is
+        what would have been refused or fallen back over, so the status says
+        it was allowed; config.xml is parsed again only when it changes.
+        """
+        shape = self.applied_dns_shape()
+        if shape is None or carries_ipv6(shape):
+            return ''
+        if dns_scope == 'all':
+            return IPV6_RESTRICTED_ALL_NOTE
+        if (settings.get('router_dns') or dns_scope == 'captured') and self.ipv6_offered() is True:
+            return IPV6_RESTRICTED_NOTE
+        return ''
+
     def redirect_configured(self):
         with contextlib.suppress(Error, OSError):
             listeners = parse_yaml(self.config_file.read_bytes()).get('listeners')
             return isinstance(listeners, list) and any(
                 isinstance(item, dict) and item.get('name') == REDIRECT_LISTENER for item in listeners)
         return False
+
+    def core_log(self, message):
+        """Append a line to the core's log, where the watchdog reports too."""
+        line = time.strftime("[%Y-%m-%d %H:%M:%S] ") + message + "\n"
+        path = self.path("/var/log/mihomo.log")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a") as stream:
+                stream.write(line)
+        except OSError:
+            pass
 
     def log(self, message):
         message = time.strftime("[%Y-%m-%d %H:%M:%S] ") + message + "\n"
@@ -2618,6 +3522,11 @@ class Manager:
                         "device": re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname())[:64] or "router",
                         "transparent": False, "dns_fallback": True, "service_enabled": True,
                         **SWITCH_DEFAULTS}
+            # Only a genuinely fresh installation starts with the narrower
+            # scope. An upgrade from the legacy scripts or from a release that
+            # kept no settings answers every client, as it always did.
+            if not upgrade and not existing and not env:
+                settings['dns_scope'] = DNS_SCOPE_FRESH
             if existing:
                 atomic_write(self.source_file, source.read_bytes())
             self.write_settings(settings)
@@ -2687,9 +3596,18 @@ class Manager:
         self.publish_status(settings)
         return self._mirrored_result({"initialized": True, "transparent": settings["transparent"]})
 
-    def router_context(self, settings):
+    def router_context(self, settings, reaching=None):
+        """The router DNS upstreams, and the IPv6 answer the DNS scope is decided with.
+
+        Router DNS needs both and cannot start without them: whether clients
+        are offered IPv6, which it refuses while Mihomo IPv6 is off unless
+        the administrator declared that captured devices get none. A
+        captured DNS scope needs only whether IPv6 reaches its devices, and
+        never fails for it: see ipv6_reaching(). A watchdog scope change
+        passes the answer it confirmed as reaching.
+        """
         if not settings.get('router_dns'):
-            return '', False
+            return '', self.ipv6_reaching(settings) if reaching is None else bool(reaching)
         config = self.path('/conf/config.xml').read_bytes()
         upstreams = self.path('/var/unbound/etc/dot.conf').read_text()
         if (self.state / 'dns-state.json').exists():
@@ -2708,17 +3626,87 @@ class Manager:
         orphans = orphan_policy_keys(merge_yaml(baseline(data), data), overlay)
         atomic_write(self.warnings_file, json.dumps({'policy_orphans': orphans}).encode(), 0o644)
 
-    def candidate(self, data, settings, overlay=None):
-        upstreams, ipv6 = self.router_context(settings)
-        content = render(data, settings, overlay=overlay if overlay is not None else parse_yaml(self.merge_file.read_bytes()), upstreams=upstreams, ipv6_advertised=ipv6)
+    def local_names(self, settings):
+        """The router's local names, for a captured scope without router DNS only.
+
+        Read when a configuration is rendered, that is at start and apply:
+        a name added later reaches Mihomo with the next restart or change.
+        """
+        if settings.get('dns_scope') != 'captured' or settings.get('router_dns'):
+            return []
+        try:
+            content = self.path('/conf/config.xml').read_bytes()
+        except OSError:
+            content = b''
+        return local_domains(content)
+
+    def candidate(self, data, settings, overlay=None, context=None):
+        upstreams, ipv6 = context if context is not None else self.router_context(settings)
+        content = render(data, settings, overlay=overlay if overlay is not None else parse_yaml(self.merge_file.read_bytes()),
+                         upstreams=upstreams, ipv6_advertised=ipv6, local_names=self.local_names(settings))
         fd, name = tempfile.mkstemp(prefix=".candidate-", suffix=".yaml", dir=self.state)
         os.close(fd)
         path = Path(name)
         atomic_write(path, content)
         return path
 
-    def stop(self, settings=None, reason=None):
+    def start_inputs(self, settings, reaching=None):
+        """What a start renders from: (settings, data, overlay, cleaned overlay, router context, why).
+
+        settings are routing_settings(); transparent routing converts an
+        effective fake-ip overlay to redir-host here. See start_context() for
+        the context and why.
+        """
+        data = parse_yaml(self.source_file.read_bytes()) if self.source_file.exists() else {
+            'proxies': [], 'proxy-groups': [], 'rules': ['MATCH,DIRECT']}
+        overlay = parse_yaml(self.merge_file.read_bytes())
+        cleaned = copy.deepcopy(overlay)
+        dns = cleaned.get('dns')
+        if settings.get('transparent') and isinstance(dns, dict) and dns.get('enhanced-mode') == 'fake-ip':
+            dns.pop('enhanced-mode')
+            settings = dict(settings, dns_mode='redir-host')
+        context, why = self.start_context(settings, reaching)
+        return settings, data, overlay, cleaned, context, why
+
+    def start_context(self, settings, reaching=None):
+        """router_context() for a start, and why its IPv6 answer is not the one it saw.
+
+        reaching is an answer the watchdog confirmed, and is used as it is.
+        Without one a start decides from a single look, which can catch a
+        moment -- a WAN reconnect before the delegated prefix is back, a boot
+        before it arrives -- so a captured scope only ever moves towards
+        every device here: a yes the last start recorded stays yes ('kept'),
+        and going back is the watchdog's, which confirms it and waits out
+        SCOPE_CHANGE_INTERVAL from this start. With transparent routing the
+        filter first writes a missing routing context, as it does on the
+        first reload after installation, so the look tells captured
+        interfaces from the WAN. While Unbound validates DNSSEC the answer is
+        no ('dnssec' when it saw yes), as in reach_now(). Otherwise why is None.
+        A declaration that captured devices get no IPv6 keeps no yes: the
+        answer is no, and the scope never falls back.
+        """
+        captured = (settings.get('dns_scope') == 'captured' and not settings.get('router_dns')
+                    and not ipv6_restricted(settings))
+        if captured and reaching is None and settings.get('transparent'):
+            ensure = getattr(self.system, 'ensure_routing_context', None)
+            if ensure is not None:
+                with contextlib.suppress(Error, OSError):
+                    ensure()
+        upstreams, answer = self.router_context(settings, reaching)
+        if not captured or reaching is not None:
+            return (upstreams, answer), None
+        answer = bool(answer)
+        kept = not answer and (self.dns_observation() or {}).get('ipv6_reaching') is True
+        if not (answer or kept):
+            return (upstreams, False), None
+        if self.unbound_validating():
+            return (upstreams, False), 'dnssec' if answer else None
+        return (upstreams, True), 'kept' if kept else None
+
+    def stop(self, settings=None, reason=None, withdrawal='the service stopped'):
         settings = settings or self.settings()
+        # This stop, and whatever start follows it, now explains the service.
+        self.annotate_observation(self.dns_observation(), stopped=None)
         # Restore direct DNS before stopping the listener, even for fail-closed policy.
         failed = None
         try:
@@ -2726,8 +3714,12 @@ class Manager:
         except (Error, OSError) as error:
             failed = error
         try:
-            self.system.stop()
+            with self.dns_redirect_logged(withdrawal):
+                self.system.stop()
         finally:
+            # The next core is probed afresh.
+            with contextlib.suppress(OSError):
+                self.dns_health_file.unlink(missing_ok=True)
             # A cleanup that works leaves nothing behind to explain itself, so
             # the caller's failure is what the status has to name: without it a
             # start that could not arm reads as a service nobody ever asked for.
@@ -2737,7 +3729,7 @@ class Manager:
         if failed:
             raise Error('DNS restoration failed; the core and TUN were stopped. Recovery will be retried.') from None
 
-    def start(self, settings=None):
+    def start(self, settings=None, reaching=None):
         original = settings or self.settings()
         settings = routing_settings(original)
         if not settings["service_enabled"]:
@@ -2752,14 +3744,10 @@ class Manager:
         # makes its own.
         self.tun_reassign_file.unlink(missing_ok=True)
         try:
-            data = parse_yaml(self.source_file.read_bytes()) if self.source_file.exists() else {'proxies': [], 'proxy-groups': [], 'rules': ['MATCH,DIRECT']}
-            overlay = parse_yaml(self.merge_file.read_bytes())
-            cleaned = copy.deepcopy(overlay)
-            dns = cleaned.get('dns')
-            if settings.get('transparent') and isinstance(dns, dict) and dns.get('enhanced-mode') == 'fake-ip':
-                dns.pop('enhanced-mode')
-                settings = dict(settings, dns_mode='redir-host')
-            candidate = self.candidate(data, settings, overlay=cleaned)
+            # One reading of the router serves the render and the scope below,
+            # so the local names in the configuration and the redirect agree.
+            settings, data, overlay, cleaned, context, why = self.start_inputs(settings, reaching)
+            candidate = self.candidate(data, settings, overlay=cleaned, context=context)
             try:
                 self.system.validate(candidate)
                 generated = parse_yaml(candidate.read_bytes())
@@ -2772,7 +3760,38 @@ class Manager:
                 candidate.unlink(missing_ok=True)
             self.record_warnings(data)
             tun = bool(generated.get('tun', {}).get('enable'))
-            requested = dns_requested(settings, generated)
+            # Only 'all' asks Unbound to forward. A captured scope leaves it
+            # alone and is reached by the routing redirect; 'off' leaves it
+            # alone as well. The observation is saved before the core starts,
+            # because arming the redirect reads it. It keeps when the answer
+            # last changed, which the watchdog waits on before changing the
+            # scope back; a time ahead of the clock is from before a reboot.
+            # A yes kept against this look restarts that wait, so a prefix
+            # slow to come back does not move the scope twice. An answer that
+            # cannot change this configuration's scope is recorded as no, so
+            # no later start keeps it (see start_context()); so is an offer
+            # the administrator declared captured devices never get.
+            ipv6_reaching = (bool(context[1]) and settings.get('dns_scope') == 'captured'
+                             and not ipv6_restricted(settings)
+                             and bool(settings.get('router_dns') or ipv6_matters(settings, generated)))
+            requested = dns_requested(settings, generated, ipv6_reaching)
+            captured = effective_dns_scope(settings, generated, ipv6_reaching)[0] == 'captured'
+            previous = self.dns_observation() or {}
+            changed = previous.get('changed')
+            if (previous.get('ipv6_reaching') is not ipv6_reaching or type(changed) not in (int, float)
+                    or not changed <= self.clock() or why == 'kept'):
+                changed = self.clock()
+            observed = {'ipv6_reaching': ipv6_reaching, 'changed': changed}
+            if why == 'dnssec' and ipv6_matters(settings, generated):
+                observed['ipv6_dnssec'] = True
+            if captured and not settings.get('router_dns'):
+                # Mihomo sends captured devices' local names to the router DNS;
+                # one that does not answer only costs those names, so it is
+                # reported rather than refused.
+                answered = self.router_dns_answers()
+                if answered is not None:
+                    observed['router_dns_answered'] = answered
+            atomic_write(self.dns_scope_file, (json.dumps(observed) + '\n').encode())
             dns_active = False
             if settings.get('router_dns'):
                 self.system.check_router_dns()
@@ -2786,7 +3805,14 @@ class Manager:
         try:
             self.system.start(self.config_file, tun)
             if tun:
-                self.system.tun()
+                if captured:
+                    # Before routing is enabled, so an answering core has its
+                    # redirect from the first enable instead of a tick later.
+                    self.start_dns_probe()
+                with self.dns_redirect_logged('transparent routing could not be armed'):
+                    self.system.tun()
+                if captured:
+                    self.observe_dns_redirect()
             if requested:
                 # The helper's answer, not the request: it leaves a validating
                 # resolver on its own upstreams.
@@ -2804,7 +3830,11 @@ class Manager:
         except (Error, OSError) as error:
             self.stop(settings, reason=error)
             raise
-        return self.publish_status(settings, dns_active)
+        status = self.publish_status(settings, dns_active)
+        # Whatever scope change an earlier watchdog left unfinished, this start
+        # decided the scope afresh and published what it did.
+        self.scope_move_file.unlink(missing_ok=True)
+        return status
 
     def apply(self, content, settings=None, subscription=True, overlay=None):
         self._guard_backup()
@@ -2964,19 +3994,26 @@ class Manager:
                 active = bool(json.loads(self.status_file.read_bytes()).get('dns_active'))
             rescue_error = ''
             if not self.system.running():
+                # As in _watchdog_tick: an unfinished scope change may have
+                # written the forward zone before any status said so.
+                active = active or self.scope_move_file.exists()
                 try:
-                    self.system.destroy_tun()
+                    with self.dns_redirect_logged('Mihomo exited'):
+                        self.system.destroy_tun()
                 except (Error, OSError) as routing_failure:
                     rescue_error = routing_status_error(
                         'Routing cleanup failed and will be retried.', routing_failure) + ' '
+                with contextlib.suppress(OSError):
+                    self.dns_health_file.unlink(missing_ok=True)
                 pending_dns = (self.state / 'dns-reload-pending').exists()
-                if pending_dns or (active and (settings['dns_fallback'] or not settings['service_enabled'])):
+                if pending_dns or (active and (restores_direct_dns(settings) or not settings['service_enabled'])):
                     try:
                         if hasattr(self.system, 'rescue'):
                             self.system.rescue(settings)
                         else:
                             self.system.dns(False, settings)
                         active = False
+                        self.scope_move_file.unlink(missing_ok=True)
                     except (Error, OSError):
                         rescue_error += 'Direct DNS recovery failed and will be retried. '
             elif active and self.unbound_validating():
@@ -2993,6 +4030,19 @@ class Manager:
                     active = False
                 except (Error, OSError):
                     rescue_error += 'Returning DNS to the validating resolver failed and will be retried. '
+            elif (settings.get('transparent') and hasattr(self.system, 'routing')
+                    and self.applied_dns_scope(settings)[0] == 'captured'):
+                # A stalled core's DNS redirect is part of the rescue too:
+                # captured devices must not wait for the backup to be repaired
+                # to get their DNS back. Only the probe and the refresh run.
+                self.probe_dns(settings)
+                try:
+                    with self.dns_redirect_logged(DNS_NOT_READY, 'transparent routing recovery failed'):
+                        self.system.routing('refresh')
+                except (Error, OSError) as routing_failure:
+                    rescue_error += routing_status_error(
+                        'Transparent routing recovery failed and will be retried.', routing_failure) + ' '
+                self.observe_dns_redirect()
             if isinstance(error, BackupIntegrityError):
                 atomic_write(self.backup_warning_file, BACKUP_INTEGRITY_WARNING.encode())
             return self.publish_status(settings, active, error=rescue_error + str(error))
@@ -3010,23 +4060,42 @@ class Manager:
         except (OSError, ValueError):
             status = {}
         active = bool(status.get("dns_active"))
+        # A scope change a watchdog did not live to finish may have written
+        # the forward zone before any status said so.
+        interrupted = self.scope_move_file.exists()
         if not self.system.running():
+            if interrupted:
+                active = True
             routing_error = ''
             try:
-                self.system.destroy_tun()
+                # Whatever dns_fallback says: the redirect is withdrawn with
+                # capture, so captured devices return to the router DNS.
+                with self.dns_redirect_logged('Mihomo exited'):
+                    self.system.destroy_tun()
             except (Error, OSError) as error:
                 routing_error = routing_status_error(
                     'Routing cleanup failed and will be retried.', error) + ' '
-            if active and (settings['dns_fallback'] or not settings['service_enabled'] or (self.state / 'dns-reload-pending').exists()):
+            with contextlib.suppress(OSError):
+                self.dns_health_file.unlink(missing_ok=True)
+            if active and (restores_direct_dns(settings) or not settings['service_enabled'] or (self.state / 'dns-reload-pending').exists()):
                 try:
                     self.system.dns(False, settings)
                     active = False
                 except (Error, OSError):
                     return self.publish_status(settings, active, error=routing_error + 'Direct DNS recovery failed and will be retried.')
-                return self.publish_status(settings, error=routing_error or "Mihomo exited. Direct DNS and routing were restored automatically.")
+                self.scope_move_file.unlink(missing_ok=True)
+                return self.publish_status(settings, error=routing_error or (
+                    'Direct DNS was restored.' if self.stopped_reason() else
+                    "Mihomo exited. Direct DNS and routing were restored automatically."))
             if routing_error:
                 return self.publish_status(settings, active, error=routing_error)
         else:
+            if interrupted:
+                # Its new core runs, or its old one still does, and what
+                # Unbound does may not be what the status says: a restart
+                # decides the scope afresh and settles both.
+                return self.move_dns_scope(settings, self.reach_now(settings)[0], self.observed_ipv6(),
+                                           IPV6_FINISH_LOG, check=False)
             if active and self.unbound_validating():
                 # DNSSEC was switched on after the forward zone was written.
                 # Unbound now validates what Mihomo answers, and every signed
@@ -3054,16 +4123,30 @@ class Manager:
                         'DNS was returned to the validating resolver, but restoring the TUN assignment '
                         'failed and will be retried.', error))
                 self.tun_reassign_file.unlink(missing_ok=True)
+            if settings.get('transparent'):
+                # A scope change restarts the service, which leaves nothing
+                # for this tick to probe or refresh.
+                moved = self.follow_ipv6_reach(settings)
+                if moved is not None:
+                    return moved
             if settings.get('transparent') and hasattr(self.system, 'routing'):
+                # The verdict first: a change in it changes the policy the
+                # refresh computes, which reloads the anchor and so withdraws
+                # or re-arms the DNS redirect without touching the core.
+                self.probe_dns(settings)
                 try:
-                    self.system.routing('refresh')
+                    with self.dns_redirect_logged(DNS_NOT_READY, 'transparent routing recovery failed'):
+                        self.system.routing('refresh')
                 except (Error, OSError) as error:
                     return self.publish_status(settings, active, error=routing_status_error(
                         'Transparent routing recovery failed and will be retried.', error))
+                self.observe_dns_redirect()
         if settings.get('router_dns'):
             upstreams, ipv6 = self.router_context(settings)
             data = parse_yaml(self.config_file.read_bytes())
-            if ipv6 and not (data.get('ipv6') is True and data.get('dns', {}).get('ipv6') is True):
+            # A declared offer is a status note (publish_status()), not an error.
+            if (ipv6 and not ipv6_restricted(settings)
+                    and not (data.get('ipv6') is True and data.get('dns', {}).get('ipv6') is True)):
                 return self.publish_status(settings, active, error='IPv6 is now being advertised to clients while Mihomo IPv6 is disabled. Disable router DNS or validate IPv6 support.')
             pins = dns_transport_rules(upstreams)
             if self.system.running() and data.get('rules', [])[:len(pins)] != pins:
@@ -3153,9 +4236,10 @@ class Manager:
             value = json.loads(Path(argument).read_bytes())
             settings = self.settings()
             for key in ("subscription_url", "secret", "device", "dns_fallback",
-                        'router_dns', 'dns_override', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
+                        'router_dns', 'dns_scope', 'dns_override', 'ipv6', 'dns_hijack', 'dns_mode', 'geo_source',
                         'device_mode', 'device_list', 'capture_interfaces', 'mixed_port', 'socks_port',
-                        'allow_lan', 'bind_address', 'tun_stack', 'tun_mtu', 'tcp_redirect', *DNS_SERVER_FIELDS):
+                        'allow_lan', 'bind_address', 'tun_stack', 'tun_mtu', 'tcp_redirect',
+                        'ipv6_clients_restricted', *DNS_SERVER_FIELDS):
                 if key in value:
                     settings[key] = value[key]
             if settings.get('tcp_redirect') is True and any(
@@ -3206,7 +4290,9 @@ class Manager:
                 self.stop(settings)
             if self.system.running():
                 self.system.watch()
-                generated = parse_yaml(self.config_file.read_bytes())
+                # A configuration that no longer parses fails here, as it
+                # always has, instead of reading as a request for nothing.
+                parse_yaml(self.config_file.read_bytes())
                 # Nothing is applied here, so what the last start published
                 # stands; the request alone cannot say whether a validating
                 # resolver declined it. Without a published value the request
@@ -3217,7 +4303,7 @@ class Manager:
                     published = json.loads(self.status_file.read_bytes())
                     if isinstance(published, dict) and 'dns_active' in published:
                         stored = bool(published['dns_active'])
-                return self.publish_status(settings, dns_requested(settings, generated) and stored is not False)
+                return self.publish_status(settings, self.applied_dns_requested(settings) and stored is not False)
             return self.start(settings)
         if action == "status":
             try:

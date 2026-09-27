@@ -1,11 +1,14 @@
 """Exercise merge policy, transport pins, and real System error boundaries."""
 import copy
+import fcntl
 import json
 import os
 import shutil
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from test_mihomo import m, SUBSCRIPTION
@@ -148,6 +151,100 @@ class MergeTests(unittest.TestCase):
         self.assertFalse(m.advertises_ipv6(config(opnsense='<Kea><dhcp6><general><enabled>0</enabled></general>'
                                                   '<ha><enabled>1</enabled></ha></dhcp6></Kea>')))
 
+    def test_a_declared_ipv6_offer_does_not_stop_router_dns(self):
+        self.settings['router_dns'] = True
+        self.data['ipv6'] = False
+        self.data['dns']['ipv6'] = False
+        upstreams = 'forward-addr: 192.0.2.53@853'
+        with self.assertRaisesRegex(m.Error, 'offered IPv6'):
+            self.generated(upstreams=upstreams, ipv6_advertised=True)
+        # Only a stored true declares that captured devices get no IPv6.
+        for value in (False, 'true', 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(m.Error, 'offered IPv6'):
+                self.generated(settings=dict(self.settings, ipv6_clients_restricted=value),
+                               upstreams=upstreams, ipv6_advertised=True)
+        self.settings['ipv6_clients_restricted'] = True
+        generated = self.generated(upstreams=upstreams, ipv6_advertised=True)
+        # The offer changes nothing else: Mihomo still gives no AAAA.
+        self.assertEqual(self.generated(upstreams=upstreams, ipv6_advertised=False), generated)
+        self.assertFalse(generated['ipv6'])
+        self.assertFalse(generated['dns']['ipv6'])
+        self.assertEqual('IP-CIDR,192.0.2.53/32,DIRECT,no-resolve', generated['rules'][0])
+        # The provider fallback check is not the IPv6 guard, and still refuses.
+        self.data['dns']['fallback'] = ['https://example.invalid/dns-query']
+        with self.assertRaisesRegex(m.Error, 'fallback'):
+            self.generated(upstreams=upstreams, ipv6_advertised=True)
+
+    def test_ipv6_for_chosen_devices_is_still_detected_as_offered(self):
+        # How an administrator gives IPv6 to one device on OPNsense 26.7: a
+        # Dnsmasq DHCPv6 range built from the LAN's delegated prefix that
+        # serves static reservations only, a reservation by MAC, and Router
+        # Advertisements in Managed mode. The declaration that captured devices
+        # get none changes what follows detection, never detection itself.
+        wan = ('<wan><enable>1</enable><if>igc0</if><ipaddr>dhcp</ipaddr><ipaddrv6>dhcp6</ipaddrv6>'
+               '<dhcp6-ia-pd-len>3</dhcp6-ia-pd-len></wan>')
+        lan = ('<lan><enable>1</enable><if>igc1</if><ipaddr>192.168.0.1</ipaddr><subnet>24</subnet>'
+               '<ipaddrv6>track6</ipaddrv6><track6-interface>wan</track6-interface>'
+               '<track6-prefix-id>0</track6-prefix-id>%s</lan>')
+        # The manual adjustment that hands the LAN's DHCPv6 and RA to other services.
+        manual = '<dhcpd6track6allowoverride>1</dhcpd6track6allowoverride>'
+        host = ('<hosts uuid="3d1e8a52-6d0b-4c1e-9a55-0a4f5f2b1c01"><host>nas</host><domain/><local>0</local>'
+                '<ip>::4</ip><cnames/><client_id/><hwaddr>00:11:32:0a:0b:0c</hwaddr><lease_time/>'
+                '<ignore>0</ignore><set_tag/><descr>NAS</descr><comments/><aliases/></hosts>')
+        v4_range = ('<dhcp_ranges uuid="7b0f3c14-1f4e-4d61-8e1b-2d2c1c0a9e01"><interface>lan</interface><set_tag/>'
+                    '<start_addr>192.168.0.100</start_addr><end_addr>192.168.0.199</end_addr><subnet_mask/>'
+                    '<constructor/><mode/><prefix_len/><lease_time/><domain_type>range</domain_type><domain/>'
+                    '<nosync>0</nosync><ra_mode/><ra_priority/><ra_mtu/><ra_interval/><ra_router_lifetime/>'
+                    '<description/></dhcp_ranges>')
+        static_range = ('<dhcp_ranges uuid="c2a6d1b0-44f1-4e0c-b1d7-5b8e0f7a6c02"><interface>lan</interface>'
+                        '<set_tag/><start_addr>%s</start_addr><end_addr>%s</end_addr><subnet_mask/>'
+                        '<constructor>lan</constructor><mode>static</mode><prefix_len>64</prefix_len>'
+                        '<lease_time/><domain_type>range</domain_type><domain/><nosync>0</nosync><ra_mode/>'
+                        '<ra_priority/><ra_mtu/><ra_interval/><ra_router_lifetime/>'
+                        '<description>NAS only</description></dhcp_ranges>')
+        dnsmasq = ('<dnsmasq version="1.0.9"><enable>%s</enable><dhcp><no_interface/><fqdn>1</fqdn><domain/>'
+                   '<local>1</local><lease_max/><authoritative>0</authoritative>'
+                   '<default_fw_rules>1</default_fw_rules><reply_delay/><enable_ra>0</enable_ra>'
+                   '<host_ping>1</host_ping><nosync>0</nosync><log_dhcp>0</log_dhcp><log_quiet>0</log_quiet>'
+                   '</dhcp>' + host + '%s</dnsmasq>')
+        entry = ('<entries uuid="0e6a2f4c-9d3b-4b8a-a1f0-6c7d8e9f0a03"><enabled>%s</enabled>'
+                 '<interface>lan</interface><Base6Interface/><mode>%s</mode><DeprecatePrefix/><RemoveAdvOnExit/>'
+                 '<RemoveRoute/><routes/><RDNSS/><DNSSL/><dns>1</dns><MinRtrAdvInterval>200</MinRtrAdvInterval>'
+                 '<MaxRtrAdvInterval>600</MaxRtrAdvInterval><AdvDNSSLLifetime/><AdvDefaultLifetime/>'
+                 '<AdvLinkMTU/><AdvPreferredLifetime/><AdvRDNSSLifetime/><AdvRouteLifetime/>'
+                 '<AdvValidLifetime/><AdvDefaultPreference>medium</AdvDefaultPreference><nat64prefix/>'
+                 '<AdvCurHopLimit>64</AdvCurHopLimit></entries>')
+
+        def config(lan_extra=manual, radvd='', ranges=''):
+            return ('<opnsense><interfaces>%s%s</interfaces><OPNsense><radvd version="1.0.1">%s</radvd>'
+                    '</OPNsense>%s</opnsense>' % (wan, lan % lan_extra, radvd, dnsmasq % ('1', v4_range + ranges))
+                    ).encode()
+
+        # Nothing but the IPv4 pool, and the LAN handed off: no offer.
+        self.assertFalse(m.advertises_ipv6(config()))
+        # The static-only range offers IPv6, whichever suffix it starts at.
+        for start, end in (('::', ''), ('::4', '::4'), ('::4', '')):
+            with self.subTest(start=start, end=end):
+                self.assertTrue(m.advertises_ipv6(config(ranges=static_range % (start, end))))
+        # Only while Dnsmasq runs.
+        disabled = config(ranges=static_range % ('::', '')).replace(b'<enable>1</enable><dhcp>',
+                                                                    b'<enable>0</enable><dhcp>')
+        self.assertFalse(m.advertises_ipv6(disabled))
+        # A Managed entry advertises on its own, on a tracking LAN handed off
+        # or on one with a static IPv6 address; switched off, it silences a
+        # tracking LAN that would otherwise advertise automatically.
+        for mode in ('managed', 'assist', 'stateless', 'unmanaged', 'router'):
+            with self.subTest(mode=mode):
+                self.assertTrue(m.advertises_ipv6(config(radvd=entry % ('1', mode))))
+        static_lan = config(radvd=entry % ('1', 'managed')).replace(
+            b'<ipaddrv6>track6</ipaddrv6>', b'<ipaddrv6>2001:470:1f05::1</ipaddrv6><subnetv6>64</subnetv6>')
+        self.assertTrue(m.advertises_ipv6(static_lan))
+        self.assertFalse(m.advertises_ipv6(config(radvd=entry % ('0', 'managed'))))
+        self.assertFalse(m.advertises_ipv6(config(lan_extra='', radvd=entry % ('0', 'managed'))))
+        self.assertTrue(m.advertises_ipv6(config(lan_extra='')))
+        # Both together, as on the router this is for.
+        self.assertTrue(m.advertises_ipv6(config(radvd=entry % ('1', 'managed'), ranges=static_range % ('::', ''))))
+
     def test_provider_fallback_is_not_silent_when_router_dns_enabled(self):
         self.settings['router_dns'] = True
         self.data['dns']['fallback'] = ['https://example.invalid/dns-query']
@@ -195,9 +292,9 @@ class RuntimeBoundaryTests(unittest.TestCase):
         self.manager.apply(SUBSCRIPTION)
         settings = self.manager.settings()
         settings['router_dns'] = True
-        self.manager.router_context = lambda settings: ('forward-addr: 192.0.2.53@853', False)
+        self.manager.router_context = lambda settings, reaching=None: ('forward-addr: 192.0.2.53@853', False)
         self.manager.apply(SUBSCRIPTION, settings)
-        self.manager.router_context = lambda settings: ('forward-addr: 192.0.2.54@853', False)
+        self.manager.router_context = lambda settings, reaching=None: ('forward-addr: 192.0.2.54@853', False)
         self.manager.watchdog_tick()
         rules = m.parse_yaml(self.manager.config_file.read_bytes())['rules']
         self.assertEqual('IP-CIDR,192.0.2.54/32,DIRECT,no-resolve', rules[0])
@@ -489,7 +586,9 @@ class CaptureInterfaceTests(unittest.TestCase):
         found = self.candidates(self.CONTEXT)
         automatic = m.device_routing_policy(settings, found)
         self.assertEqual(['Enter TUN: 192.168.3.0/24', 'Other devices bypass TUN.',
-                          'Router traffic and WAN connections bypass TUN.'], automatic)
+                          'Router traffic and WAN connections bypass TUN.',
+                          'DNS: with the full preset, Mihomo answers every device that uses the router DNS, '
+                          'bypassed devices included.'], automatic)
         settings['capture_interfaces'] = ['lan', 'opt5']
         self.assertEqual(['Capture only from: LAN (lan), OPT5 (opt5).'] + automatic,
                          m.device_routing_policy(settings, found))
@@ -510,6 +609,21 @@ class CaptureInterfaceTests(unittest.TestCase):
         # Without the context the summary still states the selection.
         self.assertEqual('Capture only from: opt2.', m.device_routing_policy(settings)[0])
         self.assertEqual([], m.device_routing_policy(dict(settings, transparent=False), found))
+
+    def test_policy_summary_says_who_mihomo_answers_through_the_router_dns(self):
+        settings = {'transparent': True, 'device_mode': 'off', 'device_list': []}
+        captured = ('DNS: Mihomo answers the router DNS for devices captured above; '
+                    'other devices and this router use the router DNS.')
+        router = 'DNS: every device that uses the router DNS is answered by it.'
+        for scope, router_dns, expected in (
+                ('captured', False, captured), ('captured', True, captured),
+                ('off', False, router), ('off', True, router),
+                # Router DNS with 'all' counts as off rather than looping.
+                ('all', True, router)):
+            with self.subTest(scope=scope, router_dns=router_dns):
+                summary = m.device_routing_policy(dict(settings, dns_scope=scope, router_dns=router_dns))
+                self.assertEqual(expected, summary[-1])
+                self.assertEqual('Internal devices may enter TUN.', summary[0])
 
 
 class DeviceDiscoveryTests(unittest.TestCase):
@@ -1009,6 +1123,20 @@ class StaleForwarderTests(unittest.TestCase):
         with patch.object(self.system, 'run', side_effect=self.record):
             self.system.dns(False, {'dns_fallback': True})
         self.assertTrue(self.reloaded())
+
+    def test_the_helper_is_told_to_fail_open_for_a_captured_scope_whatever_the_switch(self):
+        # A captured scope answering every device while clients are offered
+        # IPv6 hides Restore direct DNS on exit, so the switch cannot keep
+        # Unbound from resolving on its own when Mihomo stops answering.
+        self.generated.write_text('forward-addr: 8.8.8.8@853\n')
+        for settings, expected in (({'dns_fallback': True, 'dns_scope': 'all'}, '1'),
+                                   ({'dns_fallback': False, 'dns_scope': 'all'}, '0'),
+                                   ({'dns_fallback': False}, '0'),
+                                   ({'dns_fallback': False, 'dns_scope': 'captured'}, '1')):
+            with self.subTest(settings=settings), patch.object(self.system, 'run', side_effect=self.record):
+                self.ran.clear()
+                self.system.dns(True, settings)
+                self.assertEqual([expected], [args[3] for args in self.ran if args[0].endswith('php')])
 
     def test_enabling_against_a_file_without_the_forwarder_also_reloads(self):
         self.generated.write_text('forward-addr: 8.8.8.8@853\n')
@@ -1561,6 +1689,225 @@ class ResolverRepairTests(unittest.TestCase):
         self.assertIn(['/usr/local/sbin/configctl', 'unbound', 'restart'], self.calls)
 
 
+class ResolverCacheTests(unittest.TestCase):
+    """What Unbound cached before its forwarding changed must not answer after it.
+
+    OPNsense 26.7 keeps the cache across a restart unless the operator set
+    "Flush DNS Cache during reload": the stop dumps it, and start.sh loads it
+    into the new process in the background, under /tmp/unbound_start.lock,
+    after 'configctl unbound restart' has already returned. The configd flush
+    only deletes the dump. On a real guest a flush issued straight after the
+    restart landed while the load was still running, and AAAA records cached
+    before the scope moved to all devices kept being answered.
+    """
+
+    RESTART = '/usr/local/sbin/configctl unbound restart'
+    DUMP = '/usr/local/sbin/configctl unbound cache flush'
+    LIVE = '/usr/local/sbin/unbound-control -c /var/unbound/unbound.conf flush_zone .'
+    LOADED = 'start script loaded the dumped cache'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        (root / 'state').mkdir()
+        self.lock = root / 'unbound_start.lock'
+        self.lock.touch()
+        # No forwarder in the file yet, so asking for one restarts the resolver.
+        self.generated = root / 'zz-mihomo.conf'
+        for entry in (patch.object(m, 'STATE', str(root / 'state')),
+                      patch.object(m, 'UNBOUND_GENERATED', str(self.generated)),
+                      patch.object(m, 'UNBOUND_START_LOCK', str(self.lock)),
+                      patch.object(m, 'ROOT_ANCHOR', str(root / 'root.key'))):
+            entry.start()
+            self.addCleanup(entry.stop)
+        self.system = m.System()
+        self.events = []
+
+    def start_script(self, seconds):
+        """Hold the lock as start.sh does: from before the restart returns until its load is done."""
+        held = threading.Event()
+
+        def body():
+            with self.lock.open('rb') as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                held.set()
+                time.sleep(seconds)
+                self.events.append(self.LOADED)
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        thread = threading.Thread(target=body)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.assertTrue(held.wait(5))
+
+    def runner(self, loading=0.0, alive=None, changed=True, fail_control=False, lock_free=True,
+               control_exit=0, fail_dump=False):
+        alive = [True] if alive is None else alive
+        state = {'effective_forwarding': True, 'dns_changed': changed, 'integration_changed': changed,
+                 'filter_changed': changed, 'cron_changed': False}
+
+        def run(args, **kwargs):
+            name = ' '.join(str(part) for part in args)
+            self.events.append(name)
+            if args[0].endswith('php'):
+                return subprocess.CompletedProcess(args, 0, b'Mihomo integration state: '
+                                                   + json.dumps(state).encode() + b'\n', b'')
+            if name == self.RESTART and loading:
+                self.start_script(loading)
+            if name in (self.DUMP, self.LIVE) and lock_free:
+                # A start that overlaps the flush must still get the lock:
+                # one that finds it held skips itself and leaves no resolver.
+                with self.lock.open('rb') as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        self.fail(name + ' ran while the start lock was held')
+            if args[0].endswith('pgrep'):
+                return subprocess.CompletedProcess(args, 0 if alive.pop(0) else 1, b'', b'')
+            if name == self.LIVE and fail_control:
+                raise m.Error('A system operation failed or timed out.')
+            if name == self.LIVE:
+                return subprocess.CompletedProcess(args, control_exit, b'', b'')
+            if name == self.DUMP and fail_dump:
+                raise m.Error('A system operation failed; the previous configuration was retained.')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+        return run
+
+    def test_the_cache_is_emptied_only_once_the_start_script_has_loaded_the_dump(self):
+        with patch.object(self.system, 'run', side_effect=self.runner(loading=0.4)):
+            self.assertIs(True, self.system.dns(True, {'dns_fallback': True}))
+        order = [self.events.index(step) for step in (self.RESTART, self.LOADED, self.DUMP, self.LIVE)]
+        self.assertEqual(sorted(order), order, self.events)
+        # Before the filter reload, so the old answers do not also outlive its length.
+        self.assertLess(order[-1], self.events.index('/usr/local/sbin/configctl filter reload'))
+        self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
+
+    def test_every_restart_for_a_forwarding_change_empties_the_cache(self):
+        # Towards Mihomo, and back to Unbound's own upstreams, where the
+        # cache holds Mihomo's answers, its hosts entries and empty AAAA.
+        self.generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), patch.object(self.system, 'run', side_effect=self.runner()):
+                self.events.clear()
+                self.system.dns(enabled, {'dns_fallback': True})
+                self.assertEqual(1, self.events.count(self.RESTART))
+                self.assertEqual(1, self.events.count(self.DUMP))
+                self.assertEqual(1, self.events.count(self.LIVE))
+
+    def test_nothing_is_flushed_when_the_forwarding_stays(self):
+        self.generated.write_text('forward-addr: %s\n' % m.FORWARDER)
+        with patch.object(self.system, 'run', side_effect=self.runner(changed=False)):
+            self.assertIs(True, self.system.dns(True, {'dns_fallback': True}))
+        self.assertEqual([], [name for name in self.events if 'flush' in name or 'restart' in name])
+
+    def finishes(self, operation, seconds=5):
+        """Run operation in a thread: whether it returned, without raising, within seconds.
+
+        A wait that blocks for good then fails the test instead of hanging it.
+        """
+        done = threading.Event()
+
+        def body():
+            operation()
+            done.set()
+        worker = threading.Thread(target=body, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        return done.is_set()
+
+    def test_a_start_script_that_does_not_finish_holds_the_flush_back_only_for_a_while(self):
+        with self.lock.open('rb') as handle, patch.object(m, 'UNBOUND_START_WAIT', 0.3), \
+                patch.object(self.system, 'run', side_effect=self.runner(lock_free=False)):
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            began = time.monotonic()
+            self.assertTrue(self.finishes(lambda: self.system.dns(True, {'dns_fallback': True})))
+            waited = time.monotonic() - began
+        self.assertGreaterEqual(waited, 0.3)
+        self.assertLess(waited, 5)
+        self.assertIn(self.DUMP, self.events)
+        self.assertIn(self.LIVE, self.events)
+
+    def test_a_lock_path_that_is_no_regular_file_holds_nothing_back(self):
+        # Opening a FIFO for reading waits for a writer that never comes, and
+        # anyone can leave one in /tmp before the start script first runs.
+        self.lock.unlink()
+        os.mkfifo(self.lock)
+        with patch.object(m, 'UNBOUND_START_WAIT', 30):
+            began = time.monotonic()
+            self.assertTrue(self.finishes(m.System.wait_for_resolver_start))
+            self.assertLess(time.monotonic() - began, 5)
+
+    def test_the_start_lock_is_never_created_or_followed(self):
+        # The start script creates it; with none there, nothing is loading.
+        self.lock.unlink()
+        m.System.wait_for_resolver_start()
+        self.assertFalse(self.lock.exists())
+        target = Path(self.temp.name) / 'elsewhere'
+        self.lock.symlink_to(target)
+        m.System.wait_for_resolver_start()
+        self.assertFalse(target.exists())
+
+    def test_a_resolver_that_cannot_be_flushed_keeps_the_change(self):
+        # Stale records are the lesser harm: failing here would roll back a
+        # change that is already in place and working.
+        with patch.object(self.system, 'run', side_effect=self.runner(fail_control=True)):
+            self.assertIs(True, self.system.dns(True, {'dns_fallback': True}))
+        self.assertIn(self.LIVE, self.events)
+        self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
+
+    def test_a_running_resolver_left_with_its_cache_is_reported(self):
+        # Nothing retries the flush, so the log is the only trace of it.
+        for failure in ({'fail_control': True}, {'control_exit': 1}):
+            with self.subTest(**failure):
+                reports = []
+                self.system.report = reports.append
+                with patch.object(self.system, 'run', side_effect=self.runner(alive=[True, True], **failure)):
+                    self.assertIs(True, self.system.dns(True, {'dns_fallback': True}))
+                self.assertEqual([m.RESOLVER_CACHE_KEPT_LOG], reports)
+                self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
+
+    def test_only_a_cache_that_is_left_is_reported(self):
+        reports = []
+        self.system.report = reports.append
+        # Flushed, and no resolver left to hold anything.
+        for failure, alive in (({}, []), ({'control_exit': 1}, [False])):
+            with self.subTest(**failure), \
+                    patch.object(self.system, 'run', side_effect=self.runner(alive=alive, **failure)):
+                self.system.drop_resolver_cache()
+                self.assertEqual([], alive)
+        self.assertEqual([], reports)
+
+    def test_a_dump_that_cannot_be_deleted_does_not_skip_the_repair(self):
+        # The restart left no resolver. Deleting the dump fails, so the
+        # repair's start loads it; the cache is then emptied after that start.
+        with patch.object(self.system, 'run', side_effect=self.runner(alive=[False, True], fail_dump=True)):
+            self.assertIs(True, self.system.dns(True, {'dns_fallback': True}))
+        restarts = [index for index, name in enumerate(self.events) if name == self.RESTART]
+        self.assertEqual(2, len(restarts), self.events)
+        self.assertIn('/usr/local/sbin/configctl filter reload', self.events)
+        self.assertGreater(len(self.events) - 1 - self.events[::-1].index(self.LIVE), restarts[1])
+        self.assertFalse((Path(m.STATE) / 'dns-reload-pending').exists())
+
+    def test_the_service_logs_a_cache_it_could_not_empty(self):
+        root = Path(self.temp.name) / 'root'
+        manager = m.Manager(root)
+        manager.system.report(m.RESOLVER_CACHE_KEPT_LOG)
+        self.assertIn(m.RESOLVER_CACHE_KEPT_LOG, (root / 'var/log/mihomo.log').read_text())
+
+    def test_the_dump_is_gone_before_a_repair_starts_the_resolver_again(self):
+        # The repair's start finds no running resolver to dump, so it would
+        # load whatever dump is left.
+        with patch.object(self.system, 'run', side_effect=self.runner(alive=[False, True])):
+            self.system.dns(True, {'dns_fallback': True})
+        restarts = [index for index, name in enumerate(self.events) if name == self.RESTART]
+        self.assertEqual(2, len(restarts), self.events)
+        self.assertLess(restarts[0], self.events.index(self.DUMP))
+        self.assertLess(self.events.index(self.DUMP), restarts[1])
+        # And whatever that start found is emptied once it is done.
+        self.assertEqual([self.DUMP, self.LIVE], [name for name in self.events[restarts[1]:]
+                                                  if name in (self.DUMP, self.LIVE)])
+
+
 class FailedArmRecoveryTests(unittest.TestCase):
     """A start that cannot arm routing fails loudly and stays failed."""
 
@@ -1605,3 +1952,217 @@ class FailedArmRecoveryTests(unittest.TestCase):
         self.assertEqual('', self.status()['error'])
         self.assertEqual(['watch'], self.watches)
         self.assertIn('assign-tun', self.system.events)
+
+
+class LocalNameTests(unittest.TestCase):
+    """A captured scope without router DNS sends the router's local names back to the router DNS."""
+
+    # The shape of a stock 26.7 installation, as read on a fresh guest.
+    STOCK = ('<opnsense><system><hostname>OPNsense</hostname><domain>internal</domain></system>'
+             '<OPNsense><unboundplus><general><enabled>1</enabled><regdhcp>0</regdhcp><regdhcpdomain/>'
+             '</general><hosts/><aliases/><dots/></unboundplus>'
+             '<Kea><dhcp4><general><enabled>0</enabled></general></dhcp4></Kea></OPNsense>'
+             '<dnsmasq><enable>1</enable><dhcp><domain/></dhcp>'
+             '<dhcp_ranges uuid="4"><interface>lan</interface><start_addr>192.168.1.100</start_addr><domain/></dhcp_ranges>'
+             '<dhcp_ranges uuid="6"><interface>lan</interface><start_addr>::1000</start_addr><domain/></dhcp_ranges>'
+             '</dnsmasq></opnsense>')
+
+    def setUp(self):
+        self.settings = {'transparent': True, 'secret': 'state-secret', 'router_dns': False,
+                         'dns_scope': 'captured'}
+        # No dns block, so the baseline policy with geosite:private applies.
+        self.data = {'proxies': [{'name': 'Test', 'type': 'socks5', 'server': 'example.invalid', 'port': 1080}],
+                     'proxy-groups': [{'name': 'Proxy', 'type': 'select', 'proxies': ['Test']}],
+                     'rules': ['MATCH,Proxy']}
+        self.overlay = m.parse_yaml((m.Path(m.__file__).resolve().parents[3] / 'share/mihomo/presets/full.yaml').read_bytes())
+        self.names = m.local_domains(self.STOCK.encode())
+
+    def policy(self, settings=None, overlay=None, data=None, **kwargs):
+        generated = m.parse_yaml(m.render(self.data if data is None else data, settings or self.settings,
+                                          overlay=self.overlay if overlay is None else overlay,
+                                          local_names=kwargs.pop('local_names', self.names), **kwargs))
+        return generated['dns'].get('nameserver-policy')
+
+    def own(self, names=None):
+        return ['+.' + name for name in (self.names if names is None else names)]
+
+    def test_a_stock_installation_contributes_its_domain_and_the_private_reverse_zones(self):
+        self.assertEqual(sorted(('internal',) + m.PRIVATE_REVERSE_ZONES), self.names)
+        # The public reverse trees stay with Mihomo, so public PTR lookups do too.
+        for public in ('in-addr.arpa', 'ip6.arpa', 'arpa', '172.in-addr.arpa', '100.in-addr.arpa'):
+            self.assertNotIn(public, self.names)
+        for private in ('10.in-addr.arpa', '16.172.in-addr.arpa', '31.172.in-addr.arpa', '168.192.in-addr.arpa',
+                        '254.169.in-addr.arpa', 'c.f.ip6.arpa', 'd.f.ip6.arpa', '8.e.f.ip6.arpa',
+                        'b.e.f.ip6.arpa', 'home.arpa'):
+            self.assertIn(private, self.names)
+        self.assertNotIn('15.172.in-addr.arpa', self.names)
+        self.assertNotIn('32.172.in-addr.arpa', self.names)
+        # Unreadable configuration still keeps the reverse zones local.
+        self.assertEqual(sorted(m.PRIVATE_REVERSE_ZONES), m.local_domains(b'<opnsense'))
+
+    def test_the_26_7_sources_each_contribute_and_switched_off_ones_do_not(self):
+        config = ('<opnsense><system><domain>Home.Example.</domain></system><OPNsense><unboundplus>'
+                  '<general><regdhcp>1</regdhcp><regdhcpdomain>leases.test</regdhcpdomain></general><hosts>'
+                  '<host uuid="h1"><enabled>1</enabled><hostname>nas</hostname><domain>www.google.com</domain></host>'
+                  '<host uuid="h2"><enabled>1</enabled><hostname>*</hostname><domain>wild.test</domain></host>'
+                  '<host uuid="h3"><enabled>1</enabled><hostname/><domain>apex.test</domain></host>'
+                  '<host uuid="h4"><enabled>0</enabled><hostname>off</hostname><domain>disabled.test</domain></host>'
+                  '<host uuid="h5"><hostname>implicit</hostname><domain>default-on.test</domain></host>'
+                  '<host><hostname>nouuid</hostname><domain>plain.test</domain></host>'
+                  '</hosts><aliases>'
+                  '<alias uuid="a1"><enabled>1</enabled><host>h1</host><hostname>files</hostname><domain/></alias>'
+                  '<alias uuid="a2"><enabled>1</enabled><host>h1</host><hostname>media</hostname><domain>alias.test</domain></alias>'
+                  '<alias uuid="a3"><enabled>1</enabled><host>h4</host><hostname>gone</hostname><domain>parent-off.test</domain></alias>'
+                  '</aliases><dots>'
+                  '<dot uuid="d1"><enabled>1</enabled><type>forward</type><domain>corp.example</domain><server>10.0.0.53</server></dot>'
+                  '<dot uuid="d2"><enabled>1</enabled><type>dot</type><domain>secure.example</domain><server>10.0.0.54</server></dot>'
+                  '<dot uuid="d3"><enabled>0</enabled><type>forward</type><domain>off.example</domain></dot>'
+                  '<dot uuid="d4"><enabled>1</enabled><type>dot</type><domain/><server>1.1.1.1</server></dot>'
+                  '<dot uuid="d5"><enabled>1</enabled><type>forward</type><domain>1.168.192.in-addr.arpa</domain></dot>'
+                  '</dots></unboundplus>'
+                  '<Kea><dhcp4><general><enabled>1</enabled></general><subnets>'
+                  '<subnet4 uuid="s"><option_data><domain_name>kea.test</domain_name>'
+                  '<domain_search>search.example</domain_search></option_data>'
+                  '<ddns_forward_zone>ddns.test</ddns_forward_zone></subnet4></subnets><reservations>'
+                  '<reservation uuid="r"><hostname>tv</hostname><option_data><domain_name>reserved.test</domain_name>'
+                  '</option_data></reservation></reservations></dhcp4></Kea></OPNsense>'
+                  '<dnsmasq><enable>1</enable><regdhcpdomain>forwarder.test</regdhcpdomain>'
+                  '<dhcp><domain>dhcp.test</domain></dhcp>'
+                  '<dhcp_ranges uuid="x"><domain>range.test</domain></dhcp_ranges>'
+                  '<hosts uuid="y"><host>printer</host><domain>office.example</domain></hosts>'
+                  '<hosts uuid="z"><host>bare</host><domain/></hosts>'
+                  '<domainoverrides uuid="o"><domain>override.example</domain></domainoverrides></dnsmasq>'
+                  '<dhcpd><lan><enable/><domain>isc.test</domain></lan>'
+                  '<opt1><enable>0</enable><domain>isc-off.test</domain></opt1>'
+                  '<opt2><domain>isc-absent.test</domain></opt2></dhcpd></opnsense>')
+        names = set(m.local_domains(config.encode())) - set(m.PRIVATE_REVERSE_ZONES)
+        self.assertEqual({
+            'home.example', 'leases.test',
+            # Host overrides and their aliases by exact name: Unbound answers
+            # only these from local data and the rest of google.com as usual.
+            'nas.www.google.com', 'files.www.google.com', 'media.alias.test',
+            'wild.test', 'apex.test', 'implicit.default-on.test', 'nouuid.plain.test',
+            'corp.example', 'secure.example',
+            'kea.test', 'ddns.test', 'reserved.test',
+            'forwarder.test', 'dhcp.test', 'range.test', 'printer.office.example', 'override.example',
+            'isc.test'}, names)
+        # A forward for part of a private reverse zone is inside it already.
+        self.assertNotIn('1.168.192.in-addr.arpa', m.local_domains(config.encode()))
+        self.assertNotIn('google.com', names)
+        # Switched off, a service adds nothing.
+        silent = (config.replace('<general><regdhcp>', '<general><enabled>0</enabled><regdhcp>')
+                  .replace('<dnsmasq><enable>1</enable>', '<dnsmasq><enable>0</enable>')
+                  .replace('<dhcp4><general><enabled>1</enabled>', '<dhcp4><general><enabled>0</enabled>'))
+        self.assertEqual({'home.example', 'isc.test'},
+                         set(m.local_domains(silent.encode())) - set(m.PRIVATE_REVERSE_ZONES))
+
+    def test_values_that_are_not_plain_domain_names_are_skipped_and_covered_suffixes_dropped(self):
+        config = ('<opnsense><system><domain>lan</domain></system><OPNsense><unboundplus><dots>'
+                  + ''.join('<dot><domain>%s</domain></dot>' % value for value in (
+                      'a.lan', 'b.c.lan', 'two words', 'comma,split', '*.star', '-leading.test',
+                      'x' * 64 + '.test', 'ok_underscore.test', 'Upper.TEST', 'trailing.test.'))
+                  + '</dots></unboundplus></OPNsense></opnsense>')
+        names = set(m.local_domains(config.encode())) - set(m.PRIVATE_REVERSE_ZONES)
+        self.assertEqual({'lan', 'ok_underscore.test', 'upper.test', 'trailing.test'}, names)
+
+    def test_the_block_leads_the_policy_ahead_of_geosite_private(self):
+        policy = self.policy()
+        keys = list(policy)
+        self.assertEqual(self.own(), keys[:len(self.names)])
+        self.assertEqual({key: ['127.0.0.1'] for key in self.own()},
+                         {key: policy[key] for key in self.own()})
+        self.assertEqual(list(m.BASELINE_DNS['nameserver-policy']), keys[len(self.names):])
+        self.assertEqual(['system'], policy['geosite:private'])
+
+    def test_a_subscription_policy_keeps_its_entries_behind_the_block(self):
+        data = dict(self.data, dns={'enable': True, 'nameserver': ['https://dns.example/dns-query'],
+                                    'nameserver-policy': {'rule-set:private': ['192.0.2.1'],
+                                                          '+.internal': ['https://provider.example/dns-query'],
+                                                          'geosite:cn': ['223.5.5.5']}})
+        policy = self.policy(data=data)
+        keys = list(policy)
+        self.assertEqual(self.own(), keys[:len(self.names)])
+        # A provider key naming a local domain is the router's to answer.
+        self.assertEqual(['127.0.0.1'], policy['+.internal'])
+        self.assertEqual(['rule-set:private', 'geosite:cn'], keys[len(self.names):])
+
+    def test_the_merge_yaml_still_wins_for_a_key_it_states(self):
+        overlay = m.merge_yaml(self.overlay, {'dns': {'nameserver-policy': {
+            '+.internal': ['192.0.2.53'], '+.merge.test': ['192.0.2.54']}}})
+        policy = self.policy(overlay=overlay)
+        keys = list(policy)
+        self.assertEqual(self.own(), keys[:len(self.names)])
+        self.assertEqual(['192.0.2.53'], policy['+.internal'])
+        self.assertEqual(['192.0.2.54'], policy['+.merge.test'])
+        # An emptied policy clears the provider's, not the router's.
+        policy = self.policy(overlay=m.merge_yaml(self.overlay, {'dns': {'nameserver-policy': {}}}))
+        self.assertEqual(self.own(), list(policy))
+
+    def test_never_where_the_router_dns_forwards_to_mihomo_or_mihomo_asks_it_anyway(self):
+        baseline = list(m.BASELINE_DNS['nameserver-policy'])
+        for name, settings, kwargs in (
+                # The loop the block would close: Unbound forwards to Mihomo.
+                ('all', dict(self.settings, dns_scope='all'), {}),
+                ('off', dict(self.settings, dns_scope='off'), {}),
+                # Captured falling back to all for IPv6 is the same loop.
+                ('IPv6 fallback', self.settings, {'ipv6_advertised': True}),
+                ('transparent off', dict(self.settings, transparent=False), {})):
+            with self.subTest(name):
+                self.assertEqual(baseline, list(self.policy(settings, **kwargs)))
+        # Router DNS already asks the router for everything.
+        self.assertEqual({}, self.policy(dict(self.settings, router_dns=True),
+                                         upstreams='forward-addr: 192.0.2.53@853'))
+        # Without Mihomo DNS on its listener nobody is captured.
+        tun_only = m.parse_yaml((m.Path(m.__file__).resolve().parents[3] / 'share/mihomo/presets/tun-only.yaml').read_bytes())
+        self.assertNotIn('+.internal', self.policy(overlay=tun_only) or {})
+        # With Mihomo carrying IPv6 the captured scope stands, and so does the block.
+        carried = dict(self.settings, ipv6=True)
+        self.assertEqual(self.own(), list(self.policy(carried, ipv6_advertised=True))[:len(self.names)])
+
+    def test_the_block_is_no_override_and_no_orphan(self):
+        generated = m.parse_yaml(m.render(self.data, self.settings, overlay=self.overlay, local_names=self.names))
+        self.assertEqual([], m.switch_conflicts(generated, self.settings))
+        self.assertEqual([], m.orphan_policy_keys(m.merge_yaml(m.baseline(self.data), self.data), self.overlay))
+        self.assertEqual([], m.switch_overrides(self.overlay))
+
+
+class LocalNameRenderTests(unittest.TestCase):
+    """The manager reads the router's local names whenever it renders, and only for this scope."""
+
+    setUp = fixtures.StateTests.setUp
+
+    def config(self, domain):
+        path = self.manager.path('/conf/config.xml')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('<opnsense><system><domain>%s</domain></system></opnsense>' % domain)
+
+    def policy(self):
+        return m.parse_yaml(self.manager.config_file.read_bytes())['dns'].get('nameserver-policy') or {}
+
+    def request(self, **values):
+        payload = self.manager.state / 'request.json'
+        payload.write_text(json.dumps(values))
+        return self.manager.dispatch('set-settings', str(payload))
+
+    def test_start_and_apply_read_the_names_and_other_scopes_never_do(self):
+        self.config('first.test')
+        self.manager.apply(SUBSCRIPTION)
+        self.request(dns_scope='captured')
+        self.manager.dispatch('enable-transparent')
+        self.assertEqual(['127.0.0.1'], self.policy()['+.first.test'])
+        # Read when a configuration is rendered, not by the watchdog.
+        self.config('second.test')
+        self.manager.watchdog_tick()
+        self.assertIn('+.first.test', self.policy())
+        self.manager.dispatch('restart')
+        self.assertNotIn('+.first.test', self.policy())
+        self.assertIn('+.second.test', self.policy())
+        for values in ({'dns_scope': 'all'}, {'dns_scope': 'off'}, {'dns_scope': 'captured', 'router_dns': True}):
+            with self.subTest(values=values):
+                if values.get('router_dns'):
+                    dot = self.manager.path('/var/unbound/etc/dot.conf')
+                    dot.parent.mkdir(parents=True, exist_ok=True)
+                    dot.write_text('forward-addr: 192.0.2.53@853\n')
+                self.request(**values)
+                self.assertFalse([key for key in self.policy() if key.endswith('.arpa') or key == '+.second.test'])
+                self.request(router_dns=False)

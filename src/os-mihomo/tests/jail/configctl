@@ -37,10 +37,12 @@ if args == ['filter', 'reload']:
         os.replace(temporary, '/var/db/os-mihomo/routing-context.json')
     finally:
         Path(temporary).unlink(missing_ok=True)
-    # A non-quick head anchor selects a FIB without granting permission.
-    # This lifecycle-only jail has no LAN clients; packet policy is tested
-    # separately with the three-party native PF/Core fixture.
-    rules = ['set skip on lo0', 'anchor "mihomo" all']
+    # A non-quick head anchor selects a FIB without granting permission, and
+    # the tail rdr-anchor takes the redirects, as mihomo.inc registers them.
+    # The only LAN clients are the epair client jail's, which exercise
+    # router-bound DNS; other packet policy is tested separately with the
+    # three-party native PF/Core fixture.
+    rules = ['set skip on lo0', 'rdr-anchor "mihomo" all', 'anchor "mihomo" all']
     if any(mapping.get(rule.findtext('interface'), {}).get('if') == 'tun_mihomo'
            for rule in root.findall('./filter/rule')):
         rules.append('pass in on tun_mihomo inet from any to any keep state')
@@ -76,9 +78,16 @@ if args == ['dns', 'reload']:
         Path(temporary).unlink(missing_ok=True)
     sys.exit(0)
 if args == ['template', 'reload', 'OPNsense/Unbound']:
+    # The router also answers the client jail on its epair address, where a
+    # client the DNS redirect does not take asks it. Only Mihomo's hosts know
+    # mihomo-only.test, so the answer says which of the two replied.
+    lan = ''
+    if re.search(r'\binet 10\.60\.0\.1 ', subprocess.run(['/sbin/ifconfig', '-a'], capture_output=True,
+                                                          text=True).stdout):
+        lan = '  interface: 10.60.0.1\n  access-control: 10.60.0.0/24 allow\n'
     Path('/var/unbound/unbound.conf').write_text('''server:
   interface: 127.0.0.1
-  port: 53
+''' + lan + '''  port: 53
   username: ""
   chroot: ""
   directory: /var/unbound
@@ -86,6 +95,7 @@ if args == ['template', 'reload', 'OPNsense/Unbound']:
   use-syslog: no
   local-zone: "policy.test." static
   local-data: "policy.test. IN A 192.0.2.20"
+  local-zone: "mihomo-only.test." static
 ''')
 if args == ['unbound', 'restart']:
     if Path('/var/run/unbound.pid').exists():

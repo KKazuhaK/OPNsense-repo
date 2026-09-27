@@ -112,6 +112,10 @@ $(function () {
             ['dns_mode', 'geo_source', 'device_mode', 'tun_stack'].forEach(function (choice) {
                 $('#' + choice).val(s[choice] || $('#' + choice + ' option:first').val());
             });
+            /* A store from before the setting existed answers every device. */
+            $('#dns_scope').val(s.dns_scope || 'all');
+            /* One from before the declaration existed has none. */
+            $('#ipv6_clients_restricted').prop('checked', s.ipv6_clients_restricted === true);
             /* A stored value fills the box; the placeholder already shows the
                default, so an empty box reads as "whatever the default is". */
             ['mixed_port', 'socks_port', 'tun_mtu', 'bind_address'].forEach(function (field) {
@@ -125,6 +129,7 @@ $(function () {
                 $('#effective_' + field).text(inherited.length ? inherited.join(', ')
                     : '{{ lang._('not present') }}');
             });
+            ipv6Overridden = (data.overrides || []).indexOf('ipv6') !== -1;
             updateDnsControls();
             $('#device_list').val((s.device_list || []).join('\n'));
             /* The stored selection wins over whatever the picker showed. */
@@ -201,12 +206,34 @@ $(function () {
         captureReady = true;
     }
 
+    /* Whether the merge YAML sets Mihomo IPv6, as the page last loaded it. */
+    let ipv6Overridden = false;
+
     function updateDnsControls() {
         const editable = $('#dns_override').is(':checked') && !$('#router_dns').is(':checked');
         $('#dns_default,#dns_nameserver,#dns_proxy_nameserver').prop('disabled', !editable);
+        /* With router DNS Mihomo asks Unbound, so answering every device
+           through Mihomo would loop; the backend treats that choice as off
+           without changing it, so a stored one stays visible. jQuery reads a
+           select whose chosen option is disabled as null, so the choice is
+           read from the element itself. */
+        const routerDns = $('#router_dns').is(':checked');
+        $('#dns_scope option[value="all"]').prop('disabled', routerDns);
+        $('#dns_scope').selectpicker('refresh');
+        $('#dns_scope_loop').toggle(routerDns);
+        /* Only the resolver-wide integration has an exit policy to choose. */
+        $('#dns_fallback_row').toggle(!routerDns && ($('#dns_scope').prop('value') || 'all') === 'all');
+        /* Answering every device without IPv6 answers withholds AAAA records
+           from the devices the declaration gives IPv6 to. While the merge YAML
+           sets IPv6 itself the box does not show the running value, so the
+           status note alone says it then. */
+        $('#ipv6_restricted_all').toggle($('#ipv6_clients_restricted').is(':checked') && !routerDns
+            && !ipv6Overridden && !$('#ipv6').is(':checked') && ($('#dns_scope').prop('value') || 'all') === 'all');
     }
 
     $('#dns_override,#router_dns').on('change', updateDnsControls);
+    $('#dns_scope').on('change', updateDnsControls);
+    $('#ipv6_clients_restricted,#ipv6').on('change', updateDnsControls);
 
     /* One entry can cover a whole segment, and a segment keeps covering it as
        devices come and go, which an address picked from a lease cannot. With
@@ -353,8 +380,17 @@ $(function () {
             const routed = state.routing_active === true;
             $('#mihomo-transparent').attr('class', 'label label-' + (routed ? 'success' : 'default'))
                 .text(routed ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
-            $('#mihomo-dns').attr('class', 'label label-' + (state.dns_active ? 'success' : 'default'))
-                .text(state.dns_active ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
+            /* Who Mihomo answers through the router DNS, as the backend
+               derives it; a status from an older release has dns_active only.
+               A captured scope without its redirect is paused, and the note
+               says why: captured devices use the router DNS meanwhile. */
+            const dnsScope = state.dns_scope || (state.dns_active ? 'all' : 'off');
+            const paused = dnsScope === 'captured' && !state.dns_redirect;
+            const answering = dnsScope === 'all' ? !!state.dns_active : dnsScope === 'captured' && !paused;
+            $('#mihomo-dns').attr('class', 'label label-' + (answering ? 'success' : paused ? 'warning' : 'default'))
+                .text(dnsScope === 'all' ? '{{ lang._('All devices') }}'
+                      : paused ? '{{ lang._('Paused') }}'
+                      : dnsScope === 'captured' ? '{{ lang._('Captured devices') }}' : '{{ lang._('Off') }}');
             $('#mihomo-dns-note').text(state.dns_note || '');
             $('#mihomo-tcp-redirect').attr('class', 'label label-' + (state.tcp_redirect ? 'success' : 'default'))
                 .text(state.tcp_redirect ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
@@ -406,6 +442,11 @@ $(function () {
             dns_mode: $('#dns_mode').val(),
             geo_source: $('#geo_source').val(),
             device_mode: $('#device_mode').val(),
+            /* .val() reads a choice router DNS greyed out as null. */
+            dns_scope: $('#dns_scope').prop('value'),
+            /* Sent apart from the flags: the controller keeps the stored
+               declaration when a post leaves it out. */
+            ipv6_clients_restricted: $('#ipv6_clients_restricted').is(':checked') ? 1 : 0,
             device_list: $('#device_list').val(),
             capture_interfaces: ($('#capture_interfaces').val() || []).join(','),
             dns_default: $('#dns_default').val(),
@@ -496,7 +537,7 @@ $(function () {
                         <button type="button" class="btn btn-primary mihomo-action" id="mihomo-enable" data-action="enableTransparent" data-done="{{ lang._('Transparent routing enabled. LAN traffic now follows the saved device policy.') }}">{{ lang._('Enable transparent routing') }}</button>
                         <button type="button" class="btn btn-default mihomo-action" id="mihomo-disable" style="display:none" data-action="disableTransparent" data-done="{{ lang._('Transparent routing disabled. Routing and DNS were returned to the router.') }}">{{ lang._('Disable transparent routing') }}</button>
                         <div class="hidden" data-for="help_for_transparent">
-                            {{ lang._('Sends eligible LAN traffic through Mihomo according to the saved device policy. Bypassed devices keep their existing routes. Firewall rules still apply. The router itself and incoming WAN connections, including port forwards, keep their existing routing. Transparent routing requires DNS answers with real addresses. The device policy selects traffic only: with the full preset and router DNS off, bypassed devices that use the router DNS are answered by Mihomo too (see Capture client DNS).') }}
+                            {{ lang._('Sends eligible LAN traffic through Mihomo according to the saved device policy. Bypassed devices keep their existing routes. Firewall rules still apply. The router itself and incoming WAN connections, including port forwards, keep their existing routing. Transparent routing requires DNS answers with real addresses. The device policy selects traffic; which devices Mihomo answers when they ask the router DNS is the DNS scope on the DNS tab, and with all devices, bypassed devices that use the router DNS are answered by Mihomo too.') }}
                         </div>
                     </td>
                 </tr>
@@ -780,11 +821,11 @@ $(function () {
                         <ul id="mihomo-orphan-list" style="margin:6px 0 0 0"></ul>
                     </div></td>
                 </tr>
-                <tr>
+                <tr id="dns_fallback_row">
                     <td><a id="help_for_fallback" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Restore direct DNS on exit') }}</td>
                     <td><input type="checkbox" id="dns_fallback">
                         <div class="hidden" data-for="help_for_fallback">
-                            {{ lang._('This policy is local to this router. Turning it off keeps proxy DNS forwarding in place after an unexpected exit. An explicit Stop always restores the original DNS configuration.') }}
+                            {{ lang._('This policy is local to this router and applies only to the All devices DNS scope. Turning it off keeps proxy DNS forwarding in place after an unexpected exit. An explicit Stop always restores the original DNS configuration. Only devices captured by transparent routing always returns to the router DNS when Mihomo stops, also while it runs as all devices.') }}
                         </div>
                     </td>
                 </tr>
@@ -814,7 +855,7 @@ $(function () {
                     <td><a id="help_for_hijack" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Capture client DNS') }}</td>
                     <td><input type="checkbox" id="dns_hijack"> <span class="label label-warning mihomo-override" id="override_dns_hijack" style="display:none">{{ lang._('Overridden by the merge YAML') }}</span>
                         <div class="hidden" data-for="help_for_hijack">
-                            {{ lang._('Default on. Redirects DNS queries that enter the tunnel to Mihomo. This switch only takes effect while transparent routing is enabled. Queries addressed to the router DNS do not depend on this switch: while transparent routing uses the full preset and router DNS is off, Unbound forwards every name it does not answer from local data or a more specific forward zone to Mihomo, unless Unbound validates DNSSEC. Every device that uses the router DNS is then answered by Mihomo, including bypassed devices, interfaces outside capture and VPN clients. Any other resolver that bypassed devices use must return real addresses.') }}
+                            {{ lang._('Default on. Redirects DNS queries that enter the tunnel to Mihomo. This switch only takes effect while transparent routing is enabled. Queries addressed to the router DNS do not depend on this switch: the DNS scope below decides whether Mihomo answers them, and with all devices it answers every device that uses the router DNS, including bypassed devices, interfaces outside capture and VPN clients. Any other resolver that bypassed devices use must return real addresses.') }}
                         </div>
                     </td>
                 </tr>
@@ -874,7 +915,34 @@ $(function () {
                     <td><a id="help_for_routerdns" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('Resolve through the router DNS') }}</td>
                     <td><input type="checkbox" id="router_dns">
                         <div class="hidden" data-for="help_for_routerdns">
-                            {{ lang._('Default off. Uses the router resolver and pins its DNS transport DIRECT. Activation is refused if clients are offered IPv6 while Mihomo IPv6 is disabled. While transparent routing uses the full preset, this switch also decides who answers devices that use the router DNS: on, Unbound\'s own upstreams; off, Mihomo, unless Unbound validates DNSSEC.') }}
+                            {{ lang._('Default off. Uses the router resolver and pins its DNS transport DIRECT. Activation is refused if clients are offered IPv6 while Mihomo IPv6 is disabled, unless IPv6 only for uncaptured devices is on. While router DNS is on, a DNS scope of all devices would send Unbound\'s queries back to Mihomo in a loop, so that scope is treated as off and every device keeps Unbound\'s own upstreams. Only captured devices still works, and is the recommended pairing: captured devices are answered by Mihomo, which resolves through the router DNS with its local names and blocklists.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_dnsscope" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('DNS scope') }}</td>
+                    <td>
+                        <select id="dns_scope" class="selectpicker" data-style="btn-default" data-width="320px">
+                            <option value="all">{{ lang._('All devices') }}</option>
+                            <option value="captured">{{ lang._('Only devices captured by transparent routing') }}</option>
+                            <option value="off">{{ lang._('No devices') }}</option>
+                        </select>
+                        <div id="dns_scope_loop" class="text-warning" style="display:none">
+                            {{ lang._('All devices is unavailable while router DNS is selected: Unbound would forward to Mihomo and Mihomo back to Unbound in a loop. A stored All devices is treated as off.') }}
+                        </div>
+                        <div class="hidden" data-for="help_for_dnsscope">
+                            {{ lang._('Which devices Mihomo answers when they ask this router for DNS (full preset). All devices: Unbound forwards to Mihomo, as before, and an upgrade keeps it. Only devices captured by transparent routing, the default of a fresh installation: only the devices the device policy and capture interfaces select; every other device keeps the router DNS. It runs as all devices while captured devices get IPv6 addresses from this router and Mihomo IPv6 is off, switching back on its own afterwards, except under DNSSEC validation or IPv6 only for uncaptured devices. Turning on router DNS as well keeps Unbound\'s blocklists and local names for captured devices. The firewall rules of a captured interface must pass DNS to 127.0.0.1 port 1053 without a gateway. No devices: Unbound is left alone. The README, under Who gets Mihomo DNS, has the details.') }}
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td><a id="help_for_ipv6restricted" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> {{ lang._('IPv6 only for uncaptured devices') }}</td>
+                    <td><input type="checkbox" id="ipv6_clients_restricted">
+                        <div id="ipv6_restricted_all" class="text-warning" style="display:none">
+                            {{ lang._('With All devices, Mihomo answers every device without IPv6 answers, so the devices given IPv6 get no AAAA records from the router DNS either. Choose another DNS scope or turn on router DNS.') }}
+                        </div>
+                        <div class="hidden" data-for="help_for_ipv6restricted">
+                            {{ lang._('Default off. Your promise that this router gives IPv6 only to chosen devices transparent routing does not capture. The plugin does not check it: a captured device given IPv6 can bypass the proxy over IPv6. When on, an IPv6 offer no longer stops router DNS, and Only devices captured by transparent routing no longer runs as all devices; the status notes it instead. It fits router DNS, Only devices captured or No devices; with All devices and router DNS off, Mihomo withholds AAAA records from every device. Recommended: Router Advertisements in Managed mode with DNS off; in Dnsmasq, router advertisements off, the stock IPv6 range deleted and DHCPv6 only as per-MAC reservations in a constructor range; firewall rules that pass IPv6 only for those devices. The README, under IPv6 only for uncaptured devices, has the details.') }}
                         </div>
                     </td>
                 </tr>

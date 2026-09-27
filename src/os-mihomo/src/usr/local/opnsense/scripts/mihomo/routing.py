@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 
 import yaml
 from tun_policy_routing import (
@@ -17,6 +18,8 @@ from tun_policy_routing import (
     parse_routes, route_identity, route_key, route_semantic, source_networks,
     state_tuple,
 )
+from dns_probe import HEALTH_FILE, core_identity, redirect_allowed
+from dns_scope import DNS_LISTEN, DNS_PORT, effective_dns_scope
 from process_owner import OwnershipError, REDIRECT_LISTENER, REDIRECT_PORT, core_group
 
 
@@ -36,7 +39,9 @@ def capture_scope(settings, context):
     them, so WAN-like interfaces, the TUN and loopback stay excluded whatever
     is listed, and a listed interface that is missing or disabled simply
     contributes nothing. Router addresses and native routes, which keep traffic
-    to every local network off the TUN, are not part of what is narrowed.
+    to every local network off the TUN, are not part of what is narrowed, and
+    neither is the TUN's own entry: the policy never captures it, and needs its
+    networks to keep the TUN's address out of the router's own.
     """
     selected = settings.get('capture_interfaces') or []
     if (not isinstance(selected, list) or len(selected) > DEVICE_LIMIT
@@ -45,7 +50,8 @@ def capture_scope(settings, context):
     if not selected or not isinstance(context, dict) or not isinstance(context.get('interfaces'), list):
         return context
     return dict(context, interfaces=[item for item in context['interfaces']
-                                     if isinstance(item, dict) and item.get('name') in selected])
+                                     if isinstance(item, dict)
+                                     and (item.get('name') in selected or item.get('device') == TUN)])
 
 
 def normalize_context(context):
@@ -66,6 +72,9 @@ class Routing(TunPolicyRouting):
     NATIVE_HELPER = '/usr/local/opnsense/scripts/mihomo/native_route.py'
     ROUTING_LOCK = '/var/run/mihomo-routing.lock'
     TCP_REDIRECT = True
+    DNS_REDIRECT = True
+    # The manager stamps the DNS verdict with the system-wide monotonic clock.
+    clock = staticmethod(time.monotonic)
 
     def core_alive(self):
         try:
@@ -103,12 +112,7 @@ class Routing(TunPolicyRouting):
         return settings, capture_scope(settings, context), config.get('ipv6') is True
 
     def redirect_port(self, settings):
-        """Offer the TCP redirect only to the core's own, actually bound listener.
-
-        The rendered config alone is not proof: an upgrade rewrites it without a
-        restart, and another process could hold the port. Redirected TCP would
-        then fail, so every listener on the port must be the running core.
-        """
+        """Offer the TCP redirect only to the core's own, actually bound listener."""
         if settings.get('tcp_redirect') is not True:
             return None
         listeners = (getattr(self, 'config', None) or {}).get('listeners')
@@ -117,6 +121,53 @@ class Routing(TunPolicyRouting):
         if owned != [{'name': REDIRECT_LISTENER, 'type': 'redir',
                       'port': REDIRECT_PORT, 'listen': '127.0.0.1'}]:
             return None
+        return REDIRECT_PORT if self.core_listener(REDIRECT_PORT, ('tcp',)) is not None else None
+
+    def dns_redirect_port(self, settings):
+        """Offer the DNS redirect only for a captured scope the core answers on both transports.
+
+        The scope is decided exactly as the manager decides it, from the same
+        settings and applied configuration, with whether IPv6 reached captured
+        devices when the last start decided it. A resolver that answers UDP
+        alone would leave a client retrying a truncated answer over TCP with
+        nothing behind it, so both listeners must belong to the running core,
+        and the manager's latest probe of that same core must have found it
+        answering. Every refusal here leaves captured sources on the router DNS.
+        """
+        config = getattr(self, 'config', None) or {}
+        dns = config.get('dns') if isinstance(config.get('dns'), dict) else {}
+        if (effective_dns_scope(settings, config, self.ipv6_reaching())[0] != 'captured'
+                or dns.get('enable') is not True or dns.get('listen') != DNS_LISTEN
+                or dns.get('enhanced-mode') == 'fake-ip'):
+            return None
+        child = self.core_listener(DNS_PORT, ('udp', 'tcp'))
+        return DNS_PORT if child is not None and self.dns_healthy(child) else None
+
+    def dns_healthy(self, child):
+        """Whether the manager's fresh verdict about this very core lets the redirect arm."""
+        try:
+            raw = self.read(self.path(HEALTH_FILE), None, private=True)
+            record = json.loads(raw) if raw is not None else None
+        except (RoutingError, ValueError):
+            return False
+        return redirect_allowed(record, core_identity(child), self.clock())
+
+    def ipv6_reaching(self):
+        """Whether the last start found IPv6 reaching captured devices; unknown counts as reaching."""
+        try:
+            observed = json.loads(self.read(self.state / 'dns-scope.json', b'{}', private=True))
+        except (RoutingError, ValueError):
+            return True
+        return not (isinstance(observed, dict) and observed.get('ipv6_reaching') is False)
+
+    def core_listener(self, port, protocols):
+        """The running core's recorded identity when every listener on the loopback port is it.
+
+        The rendered config alone is not proof: an upgrade rewrites it without a
+        restart, and another process could hold the port. Redirected traffic
+        would then fail, so every listener on the port, for each transport,
+        must be the running core. None otherwise.
+        """
         try:
             group = core_group(root=self.root,
                                process_reader=getattr(self, 'process_reader', None),
@@ -126,15 +177,16 @@ class Routing(TunPolicyRouting):
                 return None
         except OwnershipError:
             return None
-        value = self.command(['/usr/bin/sockstat', '-4', '-l', '-q', '-P', 'tcp',
-                              '-p', str(REDIRECT_PORT)], check=False)
-        rows = [line.split() for line in value.stdout.decode(errors='replace').splitlines()
-                if line.strip()]
-        expected = (str(record['child']['pid']), '127.0.0.1:%d' % REDIRECT_PORT)
-        if value.returncode or not rows or any(
-                len(row) < 6 or (row[2], row[5]) != expected for row in rows):
-            return None
-        return REDIRECT_PORT
+        expected = (str(record['child']['pid']), '127.0.0.1:%d' % port)
+        for protocol in protocols:
+            value = self.command(['/usr/bin/sockstat', '-4', '-l', '-q', '-P', protocol,
+                                  '-p', str(port)], check=False)
+            rows = [line.split() for line in value.stdout.decode(errors='replace').splitlines()
+                    if line.strip()]
+            if value.returncode or not rows or any(
+                    len(row) < 6 or (row[2], row[5]) != expected for row in rows):
+                return None
+        return record['child']
 
 
 def main():

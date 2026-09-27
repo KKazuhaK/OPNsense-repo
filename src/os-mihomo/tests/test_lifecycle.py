@@ -123,10 +123,17 @@ with Path(os.environ['TEST_CALLS']).open('a') as stream:
         self.assertEqual(1, self.calls.read_text().count('register remove os-mihomo'))
 
     def test_post_deinstall_restarts_unbound_only_after_removing_a_remnant(self):
+        for name in ('usr/local/bin/flock', 'usr/local/sbin/unbound-control'):
+            self.executable(name, '''import os,sys
+from pathlib import Path
+with Path(os.environ['TEST_CALLS']).open('a') as stream:
+    stream.write(Path(sys.argv[0]).name + ' ' + ' '.join(sys.argv[1:]) + '\\n')
+''')
         result = self.run_hook('+POST_DEINSTALL')
         self.assertEqual(0, result.returncode, result.stderr)
         calls = self.calls.read_text() if self.calls.exists() else ''
         self.assertNotIn('configctl unbound restart', calls)
+        self.assertNotIn('flush', calls)
 
         fragment = self.root / 'usr/local/etc/unbound.opnsense.d/zz-mihomo.conf'
         fragment.parent.mkdir(parents=True)
@@ -135,3 +142,13 @@ with Path(os.environ['TEST_CALLS']).open('a') as stream:
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertFalse(fragment.exists())
         self.assertEqual(1, self.calls.read_text().count('configctl unbound restart'))
+        # The restart loads the cache its stop dumped, answers from the removed
+        # forwarder included, in the background: wait for it, then drop the
+        # dump and flush the running resolver.
+        unbound = [line for line in self.calls.read_text().splitlines()
+                   if 'unbound' in line and not line.startswith('control')]
+        self.assertEqual(['configctl unbound restart',
+                          'flock -w 60 -o /tmp/unbound_start.lock true',
+                          'configctl unbound cache flush',
+                          'unbound-control -c %s/var/unbound/unbound.conf flush_zone .' % self.root],
+                         unbound)

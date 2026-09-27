@@ -136,6 +136,86 @@ class BackupTests(unittest.TestCase):
         writes = self.store.writes
         self.assertFalse(self.manager.mirror_backup()['changed'])
         self.assertEqual(self.store.writes, writes)
+    def test_dns_scope_roundtrips_and_an_older_backup_keeps_the_current_one(self):
+        self.seed()
+        # The seeded settings come from a fresh installation.
+        self.assertEqual('captured', self.manager.settings()['dns_scope'])
+        for scope in m.DNS_SCOPES:
+            with self.subTest(scope=scope):
+                self.manager.write_settings(dict(self.manager.settings(), dns_scope=scope))
+                self.assertTrue(self.manager.mirror_backup()['ok'])
+                self.assertEqual(json.dumps(scope), self.store.value['dns_scope'])
+                shutil.rmtree(self.manager.state)
+                self.assertTrue(self.manager.restore_backup()['restored'])
+                self.assertEqual(scope, self.manager.settings()['dns_scope'])
+        # A backup taken before the setting existed keeps what the box has.
+        older = copy.deepcopy(self.store.value)
+        del older['dns_scope']
+        older['checksum'] = self.manager._backup_checksum(older)
+        for current in ('off', 'captured'):
+            with self.subTest(current=current):
+                self.manager.write_settings(dict(self.manager.settings(), dns_scope=current))
+                self.store.value = copy.deepcopy(older)
+                self.assertTrue(self.manager.restore_backup(force=True)['restored'])
+                self.assertEqual(current, self.manager.settings()['dns_scope'])
+        # On an empty box that is the scope the backed-up router always had.
+        shutil.rmtree(self.manager.state)
+        self.assertTrue(self.manager.restore_backup()['restored'])
+        self.assertEqual('all', self.manager.settings()['dns_scope'])
+        # An unknown scope is refused as a whole.
+        invalid = copy.deepcopy(older)
+        invalid['dns_scope'] = json.dumps('everything')
+        invalid['checksum'] = self.manager._backup_checksum(invalid)
+        self.store.value = invalid
+        before = self.manager.settings_file.read_bytes()
+        with self.assertRaises(m.Error):
+            self.manager.restore_backup(force=True)
+        self.assertEqual(before, self.manager.settings_file.read_bytes())
+    def test_the_ipv6_declaration_roundtrips_and_an_older_backup_keeps_the_current_one(self):
+        self.seed()
+        # Never stored, so never mirrored.
+        self.assertNotIn('ipv6_clients_restricted', self.manager.settings())
+        self.assertNotIn('ipv6_clients_restricted', self.store.value)
+        older = copy.deepcopy(self.store.value)
+        for declared in (True, False):
+            with self.subTest(declared=declared):
+                self.manager.write_settings(dict(self.manager.settings(), ipv6_clients_restricted=declared))
+                self.assertTrue(self.manager.mirror_backup()['ok'])
+                self.assertEqual(json.dumps(declared), self.store.value['ipv6_clients_restricted'])
+                shutil.rmtree(self.manager.state)
+                self.assertTrue(self.manager.restore_backup()['restored'])
+                self.assertIs(declared, self.manager.settings()['ipv6_clients_restricted'])
+        # A backup taken before the setting existed keeps what the box has.
+        for current in (True, False):
+            with self.subTest(current=current):
+                self.manager.write_settings(dict(self.manager.settings(), ipv6_clients_restricted=current))
+                self.store.value = copy.deepcopy(older)
+                self.assertTrue(self.manager.restore_backup(force=True)['restored'])
+                self.assertIs(current, self.manager.settings()['ipv6_clients_restricted'])
+        # On an empty box nothing is declared.
+        shutil.rmtree(self.manager.state)
+        self.store.value = copy.deepcopy(older)
+        self.assertTrue(self.manager.restore_backup()['restored'])
+        self.assertNotIn('ipv6_clients_restricted', self.manager.settings())
+        # A box that never stored it takes the backup's, the XML boolean form included.
+        for raw, expected in ((json.dumps(True), True), ('1', True), ('0', False)):
+            with self.subTest(raw=raw):
+                settings = self.manager.settings()
+                settings.pop('ipv6_clients_restricted', None)
+                self.manager.write_settings(settings)
+                newer = dict(copy.deepcopy(older), ipv6_clients_restricted=raw)
+                newer['checksum'] = self.manager._backup_checksum(newer)
+                self.store.value = newer
+                self.assertTrue(self.manager.restore_backup(force=True)['restored'])
+                self.assertIs(expected, self.manager.settings()['ipv6_clients_restricted'])
+        # Anything but a boolean is refused as a whole.
+        invalid = dict(copy.deepcopy(older), ipv6_clients_restricted=json.dumps('yes'))
+        invalid['checksum'] = self.manager._backup_checksum(invalid)
+        self.store.value = invalid
+        before = self.manager.settings_file.read_bytes()
+        with self.assertRaises(m.Error):
+            self.manager.restore_backup(force=True)
+        self.assertEqual(before, self.manager.settings_file.read_bytes())
     def test_restore_between_import_and_export_cannot_be_overwritten(self):
         old_marker = self.manager.backup_marker.read_bytes()
         restored = copy.deepcopy(self.store.value)
@@ -373,7 +453,9 @@ class BackupTests(unittest.TestCase):
 
     def test_corrupt_mirror_crash_rescue_preserves_explicit_fail_closed_dns_policy(self):
         self.store.value['checksum'] = '0' * 64
-        settings = self.manager.settings(); settings['dns_fallback'] = False
+        # Forwarding that is the resolver-wide integration: a stored captured
+        # scope that runs as all devices always fails open.
+        settings = self.manager.settings(); settings['dns_fallback'] = False; settings['dns_scope'] = 'all'
         self.manager.write_settings(settings)
         self.system.forwarded = True
         self.manager.publish_status(dns_active=True)
@@ -386,6 +468,13 @@ class BackupTests(unittest.TestCase):
         result = self.manager.watchdog_tick()
         self.assertIn('dns-off', self.system.events)
         self.assertFalse(result['dns_active'])
+        # The same rescue for a stored captured scope ignores the hidden switch.
+        (self.manager.state / 'dns-reload-pending').unlink()
+        self.manager.write_settings(dict(self.manager.settings(), dns_scope='captured'))
+        self.manager.publish_status(dns_active=True)
+        self.system.events.clear()
+        self.assertFalse(self.manager.watchdog_tick()['dns_active'])
+        self.assertIn('dns-off', self.system.events)
 
     def test_repair_validates_saved_content_before_fixing_checksum_and_releases_guard(self):
         self.seed()

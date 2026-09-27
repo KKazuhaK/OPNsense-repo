@@ -6,7 +6,10 @@ but the contracts below are ones a wrong call satisfies silently. Each of these
 has already been violated once.
 """
 import ast
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 import unittest
 from xml.etree import ElementTree
@@ -185,6 +188,181 @@ class DnsScopeWordingTests(unittest.TestCase):
         self.assertIn('id="mihomo-dns-note"', view)
         self.assertIn("$('#mihomo-dns-note').text(state.dns_note || '');", view)
         self.assertIn('"dns_note": dns_note', MANAGER.read_text())
+
+
+class DnsScopeSettingTests(unittest.TestCase):
+    """The scope travels through form, controller, backup and status, and never widens by omission."""
+
+    def setUp(self):
+        self.view = VIEW.read_text()
+        self.settings = [p for p in CONTROLLERS if p.name == 'SettingsController.php'][0].read_text()
+
+    def test_the_form_offers_the_three_scopes_under_their_names(self):
+        select = re.search(r'<select id="dns_scope"[^>]*>(.*?)</select>', self.view, re.S)
+        self.assertIsNotNone(select)
+        options = re.findall(r'<option value="([a-z]+)">\{\{ lang._\(\'([^\']+)\'\) \}\}</option>', select.group(1))
+        self.assertEqual([('all', 'All devices'),
+                          ('captured', 'Only devices captured by transparent routing'),
+                          ('off', 'No devices')], options)
+        self.assertIn('id="help_for_dnsscope"', self.view)
+        self.assertIn('data-for="help_for_dnsscope"', self.view)
+
+    def test_a_missing_value_loads_as_all_and_the_choice_is_saved(self):
+        # Falling back to the first option would silently pick whatever is
+        # listed first; the store from before the setting means every device.
+        self.assertIn("$('#dns_scope').val(s.dns_scope || 'all');", self.view)
+        # jQuery reads a select whose chosen option is disabled as null, and
+        # router DNS disables all devices; the element's own value is kept.
+        self.assertIn("dns_scope: $('#dns_scope').prop('value'),", self.view)
+        self.assertNotIn("$('#dns_scope').val()", self.view)
+        self.assertNotIn("'device_mode', 'tun_stack', 'dns_scope'", self.view)
+
+    def test_router_dns_greys_out_all_devices_and_explains_the_loop(self):
+        self.assertIn('$(\'#dns_scope option[value="all"]\').prop(\'disabled\', routerDns);', self.view)
+        # Whatever is chosen: a greyed-out option needs its reason beside it.
+        self.assertIn("$('#dns_scope_loop').toggle(routerDns);", self.view)
+        loop = re.search(r'<div id="dns_scope_loop"[^>]*>(.*?)</div>', self.view, re.S).group(1)
+        self.assertIn('loop', loop)
+        self.assertIn('treated as off', loop)
+        self.assertIn("$('#dns_scope').on('change', updateDnsControls);", self.view)
+
+    def test_the_exit_policy_is_offered_only_for_all_devices(self):
+        self.assertIn('<tr id="dns_fallback_row">', self.view)
+        self.assertIn("$('#dns_fallback_row').toggle(!routerDns && ($('#dns_scope').prop('value') || 'all') === 'all');",
+                      self.view)
+
+    def test_the_controller_forwards_the_scope_only_when_the_post_carries_it(self):
+        # A default here would turn a captured router into a resolver-wide one
+        # on any stale page or partial API submission.
+        choices = re.search(r'CHOICES = \[(.*?)\];', self.settings, re.S).group(1)
+        self.assertNotIn('dns_scope', choices)
+        self.assertNotIn('dns_scope', re.search(r'FLAGS = \[(.*?)\];', self.settings, re.S).group(1))
+        self.assertIn("if (isset($given['dns_scope'])) {\n            $payload['dns_scope'] = (string)$given['dns_scope'];",
+                      self.settings)
+        self.assertIn("'dns_scope'", MANAGER.read_text().split('if action == "set-settings":', 1)[1].split('for key in', 1)[1][:400])
+
+    def test_the_scope_is_mirrored_into_the_native_backup(self):
+        self.assertIsNotNone(ElementTree.parse(BACKUP_MODEL).find('./items/dns_scope'))
+
+    def test_the_status_names_who_mihomo_answers(self):
+        manager = MANAGER.read_text()
+        for field in ('"dns_scope": dns_scope', '"dns_redirect": dns_redirect'):
+            self.assertIn(field, manager)
+        self.assertIn("const dnsScope = state.dns_scope || (state.dns_active ? 'all' : 'off');", self.view)
+        for label in ('All devices', 'Captured devices', 'Paused'):
+            self.assertIn("'{{ lang._('%s') }}'" % label, self.view)
+        # A captured scope whose redirect the watchdog withdrew, or has not
+        # armed yet, reads as paused, with the note saying why.
+        self.assertIn("const paused = dnsScope === 'captured' && !state.dns_redirect;", self.view)
+        self.assertIn("$('#mihomo-dns-note').text(state.dns_note || '');", self.view)
+
+    def test_the_scope_help_is_short_and_points_to_the_details(self):
+        help_text = re.search(r'data-for="help_for_dnsscope">(.*?)</div>', self.view, re.S).group(1)
+        self.assertLessEqual(len(help_text.split()), 140)
+        for phrase in ('an upgrade keeps it', 'the default of a fresh installation',
+                       'runs as all devices while captured devices get IPv6 addresses from this router',
+                       'switching back on its own',
+                       'router DNS as well', '127.0.0.1 port 1053 without a gateway', 'Who gets Mihomo DNS'):
+            self.assertIn(phrase, help_text)
+        self.assertIn('\n## Who gets Mihomo DNS\n', (ROOT / 'README.US.md').read_text())
+
+    def test_the_readmes_name_the_zones_the_watchdog_probes(self):
+        probe = (MANAGER.parent / 'dns_probe.py').read_text()
+        zones = ast.literal_eval(re.search(r'^UPSTREAM_DOMAINS = (\(.*?\))$', probe, re.M).group(1))
+        for readme in ('README.US.md', 'README.md'):
+            for zone in zones:
+                with self.subTest(readme=readme, zone=zone):
+                    self.assertIn(zone, (ROOT / readme).read_text())
+
+
+class Ipv6RestrictedSettingTests(unittest.TestCase):
+    """The IPv6 declaration travels through form, controller and backup, and never changes by omission."""
+
+    def setUp(self):
+        self.view = VIEW.read_text()
+        self.settings = [p for p in CONTROLLERS if p.name == 'SettingsController.php'][0].read_text()
+
+    def test_the_controller_forwards_it_only_when_the_post_carries_it(self):
+        # A flag is always posted, as false when missing, which would take the
+        # declaration back on any partial API submission.
+        self.assertNotIn('ipv6_clients_restricted', re.search(r'FLAGS = \[(.*?)\];', self.settings, re.S).group(1))
+        # Read strictly: on is the less safe side, so a posted "false" must not
+        # turn it on, and a value that is no boolean reaches the backend's refusal.
+        self.assertIn("if (isset($given['ipv6_clients_restricted'])) {\n"
+                      "            $restricted = filter_var($given['ipv6_clients_restricted'], FILTER_VALIDATE_BOOLEAN, "
+                      "FILTER_NULL_ON_FAILURE);\n"
+                      "            $payload['ipv6_clients_restricted'] = $restricted ?? $given['ipv6_clients_restricted'];",
+                      self.settings)
+        manager = MANAGER.read_text()
+        self.assertIn("'ipv6_clients_restricted'",
+                      manager.split('if action == "set-settings":', 1)[1].split('if key in value', 1)[0])
+        self.assertIsNotNone(ElementTree.parse(BACKUP_MODEL).find('./items/ipv6_clients_restricted'))
+
+    def test_the_controller_turns_it_on_only_for_a_true_value(self):
+        # The one block that reads it, run as it stands; the rest of the
+        # controller needs the framework.
+        php = shutil.which('php')
+        if not php:
+            self.skipTest('PHP is verified separately on FreeBSD.')
+        block = re.search(r"\n( +if \(isset\(\$given\['ipv6_clients_restricted'\]\)\) \{\n.*?\n +\}\n)",
+                          self.settings, re.S).group(1)
+        script = '$payload = []; $given = json_decode($argv[1], true);\n' + block + 'echo json_encode($payload);'
+        # JSON as the page posts it, and strings as a form-encoded post carries them.
+        for given, expected in (({'ipv6_clients_restricted': True}, True), ({'ipv6_clients_restricted': 1}, True),
+                                ({'ipv6_clients_restricted': '1'}, True), ({'ipv6_clients_restricted': 'true'}, True),
+                                ({'ipv6_clients_restricted': False}, False), ({'ipv6_clients_restricted': 0}, False),
+                                ({'ipv6_clients_restricted': '0'}, False), ({'ipv6_clients_restricted': 'false'}, False),
+                                ({'ipv6_clients_restricted': ''}, False),
+                                # No boolean: the backend refuses what arrives unchanged.
+                                ({'ipv6_clients_restricted': 'maybe'}, 'maybe'),
+                                ({'ipv6_clients_restricted': [True]}, [True])):
+            with self.subTest(given=given):
+                result = subprocess.run([php, '-r', script, json.dumps(given)], capture_output=True, check=True)
+                self.assertEqual({'ipv6_clients_restricted': expected}, json.loads(result.stdout))
+        # Absent, or null, keeps whatever is stored.
+        for given in ({}, {'ipv6_clients_restricted': None}):
+            with self.subTest(given=given):
+                result = subprocess.run([php, '-r', script, json.dumps(given)], capture_output=True, check=True)
+                self.assertEqual([], json.loads(result.stdout))
+
+    def test_the_form_loads_saves_and_explains_it_beside_the_dns_settings(self):
+        rows = [self.view.index(marker) for marker in
+                ('id="router_dns"', 'id="dns_scope"', 'id="ipv6_clients_restricted"', 'id="mihomo-save-dns"')]
+        self.assertEqual(sorted(rows), rows)
+        self.assertIn("$('#ipv6_clients_restricted').prop('checked', s.ipv6_clients_restricted === true);", self.view)
+        self.assertIn("ipv6_clients_restricted: $('#ipv6_clients_restricted').is(':checked') ? 1 : 0,", self.view)
+        for flags in re.findall(r"\['dns_fallback'[^\]]*\]", self.view):
+            self.assertNotIn('ipv6_clients_restricted', flags)
+        help_text = re.search(r'data-for="help_for_ipv6restricted">(.*?)</div>', self.view, re.S).group(1)
+        self.assertIn('id="help_for_ipv6restricted"', self.view)
+        self.assertLessEqual(len(help_text.split()), 140)
+        for phrase in ('Default off', 'does not check it', 'bypass the proxy over IPv6', 'no longer stops router DNS',
+                       'no longer runs as all devices', 'router DNS off, Mihomo withholds AAAA records from every device',
+                       'Managed mode with DNS off', 'router advertisements off', 'the stock IPv6 range deleted',
+                       'per-MAC reservations', 'constructor range', 'pass IPv6 only for those devices',
+                       'IPv6 only for uncaptured devices'):
+            self.assertIn(phrase, help_text)
+        self.assertIn('\n## IPv6 only for uncaptured devices\n', (ROOT / 'README.US.md').read_text())
+        # Beside the switch: every device answered without IPv6 answers defeats it.
+        self.assertIn('<div id="ipv6_restricted_all" class="text-warning" style="display:none">', self.view)
+        self.assertIn("$('#ipv6_restricted_all').toggle($('#ipv6_clients_restricted').is(':checked') && !routerDns\n"
+                      "            && !ipv6Overridden && !$('#ipv6').is(':checked') && ($('#dns_scope').prop('value') || 'all') === 'all');",
+                      self.view)
+        # The box does not show an IPv6 value the merge YAML sets, so the status note speaks then.
+        self.assertIn("ipv6Overridden = (data.overrides || []).indexOf('ipv6') !== -1;\n            updateDnsControls();",
+                      self.view)
+        self.assertIn("$('#ipv6_clients_restricted,#ipv6').on('change', updateDnsControls);", self.view)
+        # The two helps it relaxes say so.
+        for key in ('help_for_routerdns', 'help_for_dnsscope'):
+            text = re.search(r'data-for="%s">(.*?)</div>' % key, self.view, re.S).group(1)
+            self.assertIn('IPv6 only for uncaptured devices', text)
+
+    def test_every_document_describes_it(self):
+        for path in (ROOT / 'README.US.md', ROOT / 'README.md', ROOT / 'DESIGN.md', ROOT.parents[1] / 'DEPLOYMENT.md'):
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                self.assertIn('ipv6_clients_restricted', text)
+                self.assertIn('Managed', text)
 
 
 class CaptureInterfaceViewTests(unittest.TestCase):

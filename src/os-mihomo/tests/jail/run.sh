@@ -20,18 +20,25 @@ sh "$TEST_DIR/prepare.sh"
 cp "$1" "$JAIL_ROOT/root/new.pkg"
 cp "$2" "$JAIL_ROOT/root/old.pkg"
 cp "$TEST_DIR/case.py" "$JAIL_ROOT/root/case.py"
+cp "$TEST_DIR/dns-client.py" "$JAIL_ROOT/root/dns-client.py"
 cp "$TEST_DIR/config.inc" "$JAIL_ROOT/usr/local/etc/inc/config.inc"
 cp "$TEST_DIR/util.inc" "$JAIL_ROOT/usr/local/etc/inc/util.inc"
 cp "$TEST_DIR/configctl" "$JAIL_ROOT/usr/local/sbin/configctl"
 cp "$TEST_DIR/service" "$JAIL_ROOT/usr/sbin/service"
 chmod 0755 "$JAIL_ROOT/usr/local/sbin/configctl" "$JAIL_ROOT/usr/sbin/service"
 jail_name="mihomo-lifecycle-$$"
+# A second VNET jail on the same root is the router's LAN: it holds the far end
+# of an epair and asks the router for DNS from a listed and an unlisted address.
+client_name="mihomo-client-$$"
 ruleset=48000
 while devfs rule showsets | awk -v number="$ruleset" '$1 == number {found=1} END {exit !found}'; do ruleset=$((ruleset + 1)); done
 [ "$ruleset" -lt 60000 ] || { echo 'No unused private devfs ruleset' >&2; exit 1; }
 ownership="mihomo-lifecycle-owned-$$"
 jail_id=''
+client_id=''
+epair=''
 [ -z "$(jls -j "$jail_name" jid 2>/dev/null || true)" ] || { echo 'test jail already exists' >&2; exit 1; }
+[ -z "$(jls -j "$client_name" jid 2>/dev/null || true)" ] || { echo 'client jail already exists' >&2; exit 1; }
 snapshot_host()
 {
     python3 - <<'PY'
@@ -62,6 +69,16 @@ cleanup()
 {
     result=$?
     trap - EXIT HUP INT TERM
+    # The client jail shares the router jail's root and devfs, so it goes first.
+    current_id="$(jls -j "$client_name" jid 2>/dev/null || true)"
+    if [ -n "$current_id" ]; then
+        if [ "$(jls -j "$client_name" path)" = "$JAIL_ROOT" ] && { [ -z "$client_id" ] || [ "$current_id" = "$client_id" ]; }; then
+            jail -r "$client_name" || result=1
+        else
+            echo 'Refusing cleanup of a client jail with different ownership' >&2
+            result=1
+        fi
+    fi
     current_id="$(jls -j "$jail_name" jid 2>/dev/null || true)"
     if [ -n "$current_id" ]; then
         current_path="$(jls -j "$jail_name" path)"
@@ -69,6 +86,8 @@ cleanup()
             if [ "$result" -ne 0 ]; then
                 jexec "$jail_name" /usr/bin/netstat -rn -F 0 > "$JAIL_ROOT/root/failure-native-routes.txt" 2>&1 || true
                 jexec "$jail_name" /usr/bin/netstat -rn -F 1 > "$JAIL_ROOT/root/failure-private-routes.txt" 2>&1 || true
+                { jexec "$jail_name" /sbin/pfctl -a mihomo -sn; jexec "$jail_name" /sbin/pfctl -ss -vv; } \
+                    > "$JAIL_ROOT/root/failure-states.txt" 2>&1 || true
             fi
             # jail removal terminates only this owned VNET's remaining processes.
             jail -r "$jail_name" || result=1
@@ -76,6 +95,16 @@ cleanup()
             echo 'Refusing cleanup of a jail with different ownership' >&2
             result=1
         fi
+    fi
+    if [ -n "$epair" ]; then
+        # Both ends return to the host once their jails are gone; destroying
+        # one end destroys the pair.
+        attempts=0
+        while ! ifconfig "$epair" >/dev/null 2>&1 && [ "$attempts" -lt 20 ]; do
+            sleep 0.5
+            attempts=$((attempts + 1))
+        done
+        ifconfig "$epair" destroy || result=1
     fi
     if mount -p | awk -v target="$JAIL_ROOT/dev" '$2 == target && $3 == "devfs" {found=1} END {exit !found}'; then
         umount "$JAIL_ROOT/dev" || result=1
@@ -116,7 +145,24 @@ jexec "$jail_name" /sbin/ifconfig lo1 create inet 192.0.2.10/24 up
 jexec "$jail_name" /sbin/route -n add -net 192.0.2.0/24 -iface lo1
 jexec "$jail_name" /sbin/route -n get 192.0.2.1 | awk '/interface:/ {if ($2 != "lo1") exit 1; found=1} END {if (!found) exit 1}'
 jexec "$jail_name" /sbin/route add default 192.0.2.1
-jexec "$jail_name" /usr/bin/env MIHOMO_JAIL_DNSSEC="$dnssec" "/usr/local/bin/$target_python" /root/case.py
+# The client LAN: 10.60.0.1 on the router's end, 10.60.0.2 (listed by the
+# captured round's whitelist) and 10.60.0.3 (not listed) on the client's.
+# The client jail shares the root and its devfs mount, so it mounts nothing.
+jail -c name="$client_name" path="$JAIL_ROOT" host.hostname=mihomo-client vnet persist
+client_id="$(jls -j "$client_name" jid)"
+epair="$(ifconfig epair create)"
+case "$epair" in epair[0-9]*a) ;; *) echo "Unexpected epair name: $epair" >&2; exit 1 ;; esac
+ifconfig "$epair" vnet "$jail_name"
+ifconfig "${epair%a}b" vnet "$client_name"
+jexec "$jail_name" /sbin/ifconfig "$epair" inet 10.60.0.1/24 up
+jexec "$client_name" /sbin/ifconfig lo0 inet 127.0.0.1/8 up
+jexec "$client_name" /sbin/ifconfig "${epair%a}b" inet 10.60.0.2/24 up
+jexec "$client_name" /sbin/ifconfig "${epair%a}b" inet 10.60.0.3/32 alias
+jexec "$client_name" /sbin/pfctl -s info | awk '/^Status:/ {if ($2 != "Disabled") exit 1; found=1} END {if (!found) exit 1}'
+# The helper lives until the client jail is removed.
+jexec "$client_name" "/usr/local/bin/$target_python" -B /root/dns-client.py </dev/null >"$JAIL_ROOT/root/dns-client.log" 2>&1 &
+jexec "$jail_name" /usr/bin/env MIHOMO_JAIL_DNSSEC="$dnssec" MIHOMO_JAIL_CLIENT_IF="$epair" \
+    "/usr/local/bin/$target_python" /root/case.py
 jexec "$jail_name" "/usr/local/bin/$target_python" -B - <<'PY'
 import json
 from pathlib import Path

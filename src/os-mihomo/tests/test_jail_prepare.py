@@ -1,11 +1,17 @@
 """Keep native jail framework copies separate from live router configuration."""
 import ast
+import importlib.util
+import json
 import os
 from pathlib import Path
 import re
+import socket
+import struct
 import subprocess
 import tempfile
+import threading
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 
@@ -136,6 +142,122 @@ class JailPreparationTests(unittest.TestCase):
                                         text=True, capture_output=True)
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn('JAIL_ROOT', result.stderr)
+
+
+def client_helper():
+    spec = importlib.util.spec_from_file_location('jail_dns_client', JAIL / 'dns-client.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeResolver:
+    """Answer one A record, behind a compressed name, or NXDOMAIN, over UDP and TCP on loopback."""
+
+    def __init__(self, rcode=0, address='192.0.2.30', skew=0):
+        self.rcode, self.address, self.skew = rcode, address, skew
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.bind(('127.0.0.1', 0))
+        self.port = self.udp.getsockname()[1]
+        self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.tcp.bind(('127.0.0.1', self.port))
+        self.tcp.listen(4)
+        for target in (self.serve_udp, self.serve_tcp):
+            threading.Thread(target=target, daemon=True).start()
+
+    def reply(self, query):
+        identifier = (struct.unpack('!H', query[:2])[0] + self.skew) & 0xFFFF
+        question = query[12:]
+        answers = 0 if self.rcode else 1
+        header = struct.pack('!HHHHHH', identifier, 0x8180 | self.rcode, 1, answers, 0, 0)
+        record = (b'\xc0\x0c' + struct.pack('!HHIH', 1, 1, 60, 4) + socket.inet_aton(self.address)) if answers else b''
+        return header + question + record
+
+    def serve_udp(self):
+        while True:
+            try:
+                query, peer = self.udp.recvfrom(512)
+            except OSError:
+                return
+            self.udp.sendto(self.reply(query), peer)
+
+    def serve_tcp(self):
+        while True:
+            try:
+                connection, _ = self.tcp.accept()
+            except OSError:
+                return
+            with connection:
+                size = struct.unpack('!H', connection.recv(2))[0]
+                answer = self.reply(connection.recv(size))
+                connection.sendall(struct.pack('!H', len(answer)) + answer)
+
+    def close(self):
+        self.udp.close()
+        self.tcp.close()
+
+
+class LanClientHelperTests(unittest.TestCase):
+    """The client jail's helper is what tells Mihomo's answers from Unbound's in the captured round."""
+
+    def resolver(self, **kwargs):
+        resolver = FakeResolver(**kwargs)
+        self.addCleanup(resolver.close)
+        return resolver
+
+    def test_answers_are_read_over_both_transports(self):
+        helper = client_helper()
+        port = self.resolver().port
+        for transport in ('udp', 'tcp'):
+            with self.subTest(transport=transport):
+                self.assertEqual({'rcode': 0, 'addresses': ['192.0.2.30']},
+                                 helper.query('127.0.0.1', '127.0.0.1', 'mihomo-only.test', transport, 2, port))
+        port = self.resolver(rcode=3).port
+        self.assertEqual({'rcode': 3, 'addresses': []},
+                         helper.query('127.0.0.1', '127.0.0.1', 'mihomo-only.test', 'udp', 2, port))
+
+    def test_a_reply_to_another_query_is_refused(self):
+        helper = client_helper()
+        port = self.resolver(skew=1).port
+        with self.assertRaises(ValueError):
+            helper.query('127.0.0.1', '127.0.0.1', 'mihomo-only.test', 'tcp', 2, port)
+
+    def test_requests_and_answers_travel_as_files(self):
+        helper = client_helper()
+        port = self.resolver().port
+        with tempfile.TemporaryDirectory() as directory:
+            requests, answers = Path(directory) / 'requests', Path(directory) / 'answers'
+            requests.mkdir()
+            with mock.patch.object(helper, 'ANSWERS', answers):
+                request = requests / '1-2.json'
+                request.write_text(json.dumps({'source': '127.0.0.1', 'server': '127.0.0.1', 'port': port,
+                                               'name': 'mihomo-only.test', 'transport': 'udp', 'timeout': 2}))
+                helper.answer(request)
+                self.assertFalse(request.exists())
+                self.assertEqual({'rcode': 0, 'addresses': ['192.0.2.30']},
+                                 json.loads((answers / '1-2.json').read_text()))
+                # Nothing listening is an answer too, not a crash of the helper.
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as silent:
+                    silent.bind(('127.0.0.1', 0))
+                    request.write_text(json.dumps({'source': '127.0.0.1', 'server': '127.0.0.1',
+                                                   'port': silent.getsockname()[1], 'name': 'mihomo-only.test',
+                                                   'transport': 'tcp', 'timeout': 1}))
+                    helper.answer(request)
+                self.assertIn('error', json.loads((answers / '1-2.json').read_text()))
+                self.assertEqual([], [path.name for path in answers.iterdir() if path.name.startswith('.')])
+
+    def test_the_harness_wires_the_client_lan_and_tears_it_down(self):
+        run = (JAIL / 'run.sh').read_text()
+        self.assertIn('MIHOMO_JAIL_CLIENT_IF="$epair"', run)
+        self.assertIn('ifconfig "$epair" destroy', run)
+        self.assertIn('cp "$TEST_DIR/dns-client.py" "$JAIL_ROOT/root/dns-client.py"', run)
+        # The client jail goes before the router jail whose devfs it shares.
+        self.assertLess(run.index('jail -r "$client_name"'), run.index('jail -r "$jail_name"'))
+        self.assertLess(run.index('jail -r "$jail_name"'), run.index('ifconfig "$epair" destroy'))
+        adapter = (JAIL / 'configctl').read_text()
+        self.assertIn("rules = ['set skip on lo0', 'rdr-anchor \"mihomo\" all', 'anchor \"mihomo\" all']", adapter)
+        self.assertIn('sockstat', (JAIL / 'prepare.sh').read_text())
 
 
 if __name__ == '__main__':

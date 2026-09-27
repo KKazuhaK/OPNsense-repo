@@ -49,8 +49,14 @@
         <dns_hijack type="TextField"/>
         <dns_fallback type="TextField"/>
         <router_dns type="TextField"/>
+        <!-- Absent from a backup taken before the setting existed; the import
+             then keeps the scope the restored box already has. -->
+        <dns_scope type="TextField"/>
         <dns_override type="TextField"/>
         <tcp_redirect type="TextField"/>
+        <!-- Absent from a backup taken before the setting existed; the import
+             then keeps the declaration the restored box already has. -->
+        <ipv6_clients_restricted type="TextField"/>
         <ipv6 type="TextField"/>
         <geo_source type="TextField"/>
         <dns_default type="TextField"/>

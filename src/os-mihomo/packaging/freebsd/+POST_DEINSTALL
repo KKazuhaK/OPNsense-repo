@@ -7,7 +7,10 @@
 # behind points the router's root zone at a port nothing is listening on any
 # more -- the whole network without DNS and no plugin left to undo it. Remove
 # it here as well, along with the copy inside the chroot. Restart the resolver
-# only when this fallback actually removed a remnant.
+# only when this fallback actually removed a remnant, and then empty its cache
+# as the plugin does after its own restarts: the start loads the cache the
+# stop dumped, in the background under the start lock, and the configd flush
+# only deletes that dump, so wait for the start and flush the running resolver.
 unbound_changed=
 for path in \
     /usr/local/etc/unbound.opnsense.d/zz-mihomo.conf \
@@ -23,6 +26,9 @@ do
 done
 if [ -n "$unbound_changed" ]; then
     configctl unbound restart >/dev/null 2>&1 || true
+    /usr/local/bin/flock -w 60 -o /tmp/unbound_start.lock true >/dev/null 2>&1 || true
+    configctl unbound cache flush >/dev/null 2>&1 || true
+    /usr/local/sbin/unbound-control -c /var/unbound/unbound.conf flush_zone . >/dev/null 2>&1 || true
 fi
 
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json

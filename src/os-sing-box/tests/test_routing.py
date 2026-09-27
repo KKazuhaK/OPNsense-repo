@@ -1,10 +1,12 @@
 """Exercise private-FIB routing, firewall policy, and ownership transitions."""
 import copy
+import hashlib
 import importlib.util
 import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -220,6 +222,48 @@ class RoutingTests(unittest.TestCase):
             self.assertNotIn('-sT', args)
             self.assertNotIn('flush', args)
             self.assertNotIn('-sn', args)
+
+    # Captured from os-sing-box 1.1.6 before the shared module learned the DNS
+    # redirect: the full command transcript, anchor text, statuses and journal
+    # of the lifecycle below. Mihomo's DNS redirect is an opt-in hook, so
+    # sing-box must keep producing these exact bytes.
+    BASELINE_ANCHOR = (
+        'table <singbox_local> { 10.0.0.0/24, 10.0.0.1/32, 10.2.0.0/24, 127.0.0.0/8, 127.0.0.1/32, '
+        '169.254.0.0/16, 192.0.2.0/24, 192.0.2.2/32, 2001:db8:1::/64, 2001:db8:1::1/128, 224.0.0.0/4, '
+        '255.255.255.255/32, ::1/128, fe80::/10, ff00::/8 }\n'
+        'table <singbox_sources_0> { 10.0.0.0/24, 10.2.0.0/24, 2001:db8:1::/64 }\n'
+        'match in on vtnet1 inet proto tcp from <singbox_sources_0> to !<singbox_local> flags S/SA rtable 1 label "singbox-routing"\n'
+        'match in on vtnet1 inet proto udp from <singbox_sources_0> to !<singbox_local> rtable 1 label "singbox-routing"\n'
+        'match in on vtnet1 inet6 proto tcp from <singbox_sources_0> to !<singbox_local> flags S/SA rtable 1 label "singbox-routing"\n'
+        'match in on vtnet1 inet6 proto udp from <singbox_sources_0> to !<singbox_local> rtable 1 label "singbox-routing"\n')
+    BASELINE_TRANSCRIPT = '09a6848dfbdc7e3bd524da3f394f52edbcfba220dcc22351cd227ebe9ed984c0'
+
+    def test_shared_dns_redirect_leaves_sing_box_byte_identical(self):
+        self.assertFalse(getattr(m.Routing, 'DNS_REDIRECT', False))
+        for name in ('DNS_REDIRECT', 'dns_redirect_port', 'redirect_port'):
+            self.assertNotIn(name, vars(m.Routing))
+        self.assertIsNone(self.routing.dns_redirect_port(self.settings))
+        self.assertIsNone(self.routing.dns_redirect_target(self.settings))
+        results = [self.routing.execute(action) for action in ('enable', 'refresh')]
+        self.assertEqual(self.BASELINE_ANCHOR, self.kernel.anchor)
+        fib = results[0]['fib']
+        # States a DNS or TCP redirect would own are never sing-box's to kill.
+        self.kernel.states = (
+            state(1, fib) + state(2, 0)
+            + 'all udp 127.0.0.1:1053 (10.0.0.1:53) <- 10.0.0.2:45302       SINGLE:MULTIPLE\n'
+              '   id: a861b76a00000000 creatorid: 2f5db096\n'
+            + 'all tcp 127.0.0.1:7894 (203.0.113.9:443) <- 10.0.0.5:5000       ESTABLISHED:ESTABLISHED\n'
+              '   id: 00000000000000aa creatorid: 11223344\n'
+            + 'all udp 10.0.0.1:53 <- 10.0.0.2:45300       SINGLE:MULTIPLE\n'
+              '   id: a861b76a00000001 creatorid: 2f5db096\n')
+        results += [self.routing.execute(action) for action in ('disable', 'enable', 'refresh', 'disable')]
+        self.assertEqual(['0000000000000001/11223344'] * 2, self.kernel.killed)
+        calls = [[re.sub(r'\.routing-pf-[^/]+$', '<anchor>', value.replace(str(self.root), '<root>'))
+                  for value in args] for args in self.kernel.calls]
+        transcript = json.dumps({'calls': calls, 'results': results, 'record': self.routing.load()},
+                                sort_keys=True)
+        self.assertEqual(self.BASELINE_TRANSCRIPT, hashlib.sha256(transcript.encode()).hexdigest(),
+                         '\n'.join(' '.join(args) for args in calls))
 
     def test_withdrawn_capture_rearms_when_a_lan_address_appears(self):
         # A LAN that comes up after the core leaves nothing to capture at

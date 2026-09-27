@@ -54,6 +54,7 @@ class SharedSourceTests(unittest.TestCase):
             'execute', 'kill_redirect_states', 'load', 'neutralize_sources', 'occupied',
             'owned_translation_line', 'path', 'policy', 'rdr_anchor_hooked', 'read',
             'redirect_target', 'route_command', 'routes', 'save', 'status', 'sync',
+            'dns_redirect_target', 'router_addresses', 'drop_untranslated_dns', 'withdraw_dns_redirect',
         }
         for routing in [
                 REPO / 'src/os-mihomo/src/usr/local/opnsense/scripts/mihomo/routing.py',
@@ -594,6 +595,317 @@ class TcpRedirectPolicyTests(unittest.TestCase):
             adapter.offered = value
             with self.subTest(port=value), self.assertRaisesRegex(policy.RoutingError, 'port is invalid'):
                 adapter.redirect_target({})
+
+
+class DnsRedirectPolicyTests(unittest.TestCase):
+    """Router-bound DNS from captured sources: an opt-in beside the fast TCP path."""
+
+    Adapter = TcpRedirectPolicyTests.Adapter
+
+    class DnsAdapter(TcpRedirectPolicyTests.Adapter):
+        TCP_REDIRECT = True
+        DNS_REDIRECT = True
+
+    SETTINGS = TcpRedirectPolicyTests.SETTINGS
+    # Beside the connected networks: loopback, link-local, IPv6 and the TUN's
+    # own address, none of which a client asks for DNS.
+    CONTEXT = {'interfaces': TcpRedirectPolicyTests.CONTEXT['interfaces'] + [
+        {'device': 'tun_test', 'wan': False, 'networks': ['198.18.0.1/30']}],
+        'local_addresses': ['192.0.2.2', '10.2.0.1', '10.3.0.1', '127.0.0.1', '::1', 'fd00::1',
+                            'fe80::1%vtnet1', '169.254.10.1', '198.18.0.1']}
+    LOCAL = ('table <test_local> { 10.2.0.1/32, 10.3.0.1/32, 127.0.0.0/8, 127.0.0.1/32, 169.254.0.0/16, '
+             '169.254.10.1/32, 192.0.2.2/32, 198.18.0.1/32, 224.0.0.0/4, 255.255.255.255/32, ::1/128, '
+             'fd00::1/128, fe80::/10, fe80::1/128, ff00::/8 }')
+    SELF = 'table <test_self> { 10.2.0.1/32, 10.3.0.1/32, 192.0.2.2/32 }'
+    # Headlines and identifiers as pfctl -ss -vv printed them on OPNsense 26.7
+    # (FreeBSD 15.1) for UDP and TCP queries redirected to 127.0.0.1:1053.
+    STATES = (
+        'all udp 127.0.0.1:1053 (10.60.0.1:53) <- 10.60.0.2:45302       SINGLE:MULTIPLE\n'
+        '   age 00:00:04, expires in 00:00:26, 1:1 pkts, 62:78 bytes, rule 115, rlabel 51e7777f-d456-40d2-814b-e4ace0bd8f0f\n'
+        '   id: a861b76a00000000 creatorid: 2f5db096\n'
+        '   origif: epair0a\n'
+        'all tcp 127.0.0.1:1053 (192.168.1.1:53) <- 10.60.0.2:40381       FIN_WAIT_2:FIN_WAIT_2\n'
+        '   [1026476285 + 65792] wscale 7  [129971869 + 65792] wscale 7\n'
+        '   age 00:00:04, expires in 00:00:26, 5:4 pkts, 330:262 bytes, rule 115, rlabel 51e7777f-d456-40d2-814b-e4ace0bd8f0f\n'
+        '   id: 9f61b76a00000000 creatorid: 2f5db096\n'
+        '   origif: epair0a\n'
+        'all udp 10.60.0.1:53 <- 10.60.0.2:45300       SINGLE:MULTIPLE\n'
+        '   id: a761b76a00000000 creatorid: 2f5db096\n'
+        '   origif: epair0a\n'
+        'all tcp 127.0.0.1:7894 (203.0.113.9:443) <- 10.60.0.2:5000       ESTABLISHED:ESTABLISHED\n'
+        '   id: 5c00b46a00000001 creatorid: 2f5db096\n'
+        'all udp 127.0.0.1:1054 (10.60.0.1:53) <- 10.60.0.2:45303       SINGLE:MULTIPLE\n'
+        '   id: 5c00b46a00000002 creatorid: 2f5db096\n')
+
+    def render(self, redirect=None, dns_redirect=None, families=(4, 6), context=None):
+        adapter = self.Adapter(Path('/nonexistent'))
+        return adapter.policy(self.SETTINGS, context or self.CONTEXT, {}, set(families), 7,
+                              redirect, dns_redirect)[0]
+
+    match = staticmethod(TcpRedirectPolicyTests.match)
+
+    def test_dns_redirect_groups_tables_translation_and_filters(self):
+        expected = [
+            self.LOCAL, self.SELF,
+            'table <test_sources_0> { 10.2.0.0/24, fd00::/64 }',
+            'table <test_sources_1> { 10.3.0.0/24 }',
+            'table <test_sources_2> { fd01::/64 }',
+            'rdr on vtnet1 inet proto udp from <test_sources_0> to <test_self> port 53 -> 127.0.0.1 port 1053',
+            'rdr on vtnet1 inet proto tcp from <test_sources_0> to <test_self> port 53 -> 127.0.0.1 port 1053',
+            'rdr on vtnet2 inet proto udp from <test_sources_1> to <test_self> port 53 -> 127.0.0.1 port 1053',
+            'rdr on vtnet2 inet proto tcp from <test_sources_1> to <test_self> port 53 -> 127.0.0.1 port 1053',
+            self.match('vtnet1', 'inet', 'tcp', 'test_sources_0'),
+            self.match('vtnet1', 'inet', 'udp', 'test_sources_0'),
+            self.match('vtnet1', 'inet6', 'tcp', 'test_sources_0'),
+            self.match('vtnet1', 'inet6', 'udp', 'test_sources_0'),
+            self.match('vtnet2', 'inet', 'tcp', 'test_sources_1'),
+            self.match('vtnet2', 'inet', 'udp', 'test_sources_1'),
+            self.match('vtnet3', 'inet6', 'tcp', 'test_sources_2'),
+            self.match('vtnet3', 'inet6', 'udp', 'test_sources_2')]
+        self.assertEqual('\n'.join(expected) + '\n', self.render(dns_redirect=1053))
+        text = self.render(dns_redirect=1053)
+        self.assertNotIn('rdr pass', text)
+        self.assertNotIn('inet6 proto udp from <test_sources_2> to <test_self>', text)
+        self.assertNotIn('<test_sources_2> to <test_self>', text)
+
+    def test_dns_rules_precede_the_fast_path_that_would_keep_tcp_on_the_router(self):
+        # Translation is first match, and the fast path's no rdr also matches
+        # TCP 53 addressed to the router.
+        lines = self.render(7894, 1053).splitlines()
+        tables = [index for index, line in enumerate(lines) if line.startswith('table ')]
+        rdr = [index for index, line in enumerate(lines) if ' rdr ' in ' ' + line]
+        matches = [index for index, line in enumerate(lines) if line.startswith('match ')]
+        self.assertLess(max(tables), min(rdr))
+        self.assertLess(max(rdr), min(matches))
+        for interface, table in (('vtnet1', 'test_sources_0'), ('vtnet2', 'test_sources_1')):
+            with self.subTest(interface=interface):
+                dns = [lines.index('rdr on %s inet proto %s from <%s> to <test_self> port 53 -> 127.0.0.1 port 1053'
+                                   % (interface, protocol, table)) for protocol in ('udp', 'tcp')]
+                fast = lines.index('no rdr on %s inet proto tcp from <%s> to any port 53' % (interface, table))
+                self.assertLess(dns[0], dns[1])
+                self.assertLess(dns[1], fast)
+        # The TUN rules are untouched by either redirect.
+        self.assertEqual(sorted(line for line in self.render().splitlines() if line.startswith('match ')),
+                         sorted(lines[index] for index in matches))
+        self.assertEqual(8, len(rdr))
+
+    def test_the_router_table_holds_only_its_ipv4_host_addresses(self):
+        selected = [line for line in self.render(dns_redirect=1053).splitlines()
+                    if line.startswith('table <test_self>')]
+        self.assertEqual([self.SELF], selected)
+        # Another resolver on a connected network is never redirected.
+        self.assertNotIn('10.2.0.0/24', self.SELF)
+
+    def test_nothing_to_redirect_leaves_todays_exact_text(self):
+        today = self.render()
+        # No address of the router's own to redirect to.
+        bare = dict(self.CONTEXT, local_addresses=['127.0.0.1', '::1', '198.18.0.1', '169.254.10.1'])
+        self.assertEqual(self.render(context=bare), self.render(dns_redirect=1053, context=bare))
+        self.assertNotIn('<test_self>', self.render(dns_redirect=1053, context=bare))
+        # No IPv4 family at all.
+        self.assertEqual(self.render(families=(6,)), self.render(dns_redirect=1053, families=(6,)))
+        # And without the parameter the text is the one every release wrote.
+        self.assertEqual(today, self.render(dns_redirect=None))
+        self.assertEqual(self.render(7894), self.render(7894, None))
+
+    def test_translation_ownership_accepts_the_printed_dns_rules_only_for_dns_adapters(self):
+        adapter = self.DnsAdapter(Path('/nonexistent'))
+        owned = [
+            'rdr on epair0a inet proto udp from <test_sources_0> to <test_self> port = domain -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet proto tcp from <test_sources_0> to <test_self> port = domain -> 127.0.0.1 port 1053',
+            'rdr on vtnet1 inet proto udp from <test_sources_12> to <test_self> port = 53 -> 127.0.0.1 port 1053',
+            # The fast path's printed rules remain owned beside them.
+            'no rdr on epair0a inet proto tcp from <test_sources_0> to any port = domain',
+            'rdr on epair0a inet proto tcp from <test_sources_0> to ! <test_local> -> 127.0.0.1 port 7894',
+        ]
+        foreign = [
+            'rdr pass on epair0a inet proto udp from <test_sources_0> to <test_self> port = domain -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet proto udp from <test_sources_0> to <test_local> port = domain -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet proto udp from <test_sources_0> to <other_self> port = domain -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet proto udp from <other_sources_0> to <test_self> port = domain -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet proto udp from any to <test_self> port = domain -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet proto udp from <test_sources_0> to <test_self> port = domain -> 10.0.0.9 port 1053',
+            'rdr on epair0a inet proto udp from <test_sources_0> to <test_self> port = domain -> 127.0.0.1 port 53',
+            'rdr on epair0a inet proto udp from <test_sources_0> to <test_self> port = domain -> 127.0.0.1 port 70000',
+            'rdr on epair0a inet proto udp from <test_sources_0> to <test_self> port = http -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet proto udp from <test_sources_0> to <test_self> -> 127.0.0.1 port 1053',
+            'rdr on epair0a inet6 proto udp from <test_sources_0> to <test_self> port = domain -> ::1 port 1053',
+            'rdr on epair0a inet proto icmp from <test_sources_0> to <test_self> -> 127.0.0.1',
+            'rdr on epair0a inet proto { udp tcp } from <test_sources_0> to <test_self> port = domain -> 127.0.0.1 port 1053',
+        ]
+        for line in owned:
+            with self.subTest(line=line):
+                self.assertTrue(adapter.owned_translation_line(line))
+        for line in foreign:
+            with self.subTest(line=line):
+                self.assertFalse(adapter.owned_translation_line(line))
+        # An adapter that never generates them does not own them either.
+        plain = self.Adapter(Path('/nonexistent'))
+        self.assertFalse(plain.owned_translation_line(owned[0]))
+        self.assertTrue(plain.owned_translation_line(owned[-1]))
+
+    def test_generated_and_printed_rules_compare_equal(self):
+        for generated, printed in (
+                ('rdr on epair0a inet proto udp from <mihomo_sources_0> to <mihomo_self> port 53 -> 127.0.0.1 port 1053',
+                 'rdr on epair0a inet proto udp from <mihomo_sources_0> to <mihomo_self> port = domain -> 127.0.0.1 port 1053'),
+                ('no rdr on epair0a inet proto tcp from <mihomo_sources_0> to any port 53',
+                 'no rdr on epair0a inet proto tcp from <mihomo_sources_0> to any port = domain'),
+                ('rdr on epair0a inet proto tcp from <mihomo_sources_0> to !<mihomo_local> -> 127.0.0.1 port 7894',
+                 'rdr on epair0a  inet proto tcp from <mihomo_sources_0> to ! <mihomo_local> -> 127.0.0.1 port 7894')):
+            with self.subTest(generated=generated):
+                self.assertEqual(policy.translation_key(generated), policy.translation_key(printed))
+        self.assertNotEqual(
+            policy.translation_key('rdr on epair0a inet proto udp from <mihomo_sources_0> to <mihomo_self> port 53 -> 127.0.0.1 port 1053'),
+            policy.translation_key('rdr on epair0a inet proto udp from <mihomo_sources_0> to <mihomo_self> port = domain -> 127.0.0.1 port 1054'))
+
+    def test_redirected_dns_states_are_selected_per_transport(self):
+        self.assertEqual(['a861b76a00000000/2f5db096'], policy.redirect_states(self.STATES, 1053, 'udp'))
+        self.assertEqual(['9f61b76a00000000/2f5db096'], policy.redirect_states(self.STATES, 1053, 'tcp'))
+        # The untranslated query and other listeners' states are not ours.
+        self.assertEqual(['5c00b46a00000001/2f5db096'], policy.redirect_states(self.STATES, 7894))
+        self.assertEqual([], policy.redirect_states(self.STATES, 1053, 'udp')[1:])
+        with self.assertRaisesRegex(policy.RoutingError, 'transport'):
+            policy.redirect_states(self.STATES, 1053, 'icmp')
+
+    def test_untranslated_router_dns_from_captured_sources_is_selected(self):
+        own = {ipaddress.ip_address('10.60.0.1'), ipaddress.ip_address('192.168.1.1')}
+        sources = {'epair0a': [ipaddress.ip_network('10.60.0.0/24')]}
+        self.assertEqual(['a761b76a00000000/2f5db096'], policy.untranslated_dns_states(self.STATES, own, sources))
+        pending = ('all tcp 192.168.1.1:53 <- 10.60.0.7:40999       ESTABLISHED:ESTABLISHED\n'
+                   '   id: 0000000000000071 creatorid: 2f5db096\n'
+                   '   origif: epair0a\n')
+        cases = {
+            'another interface': pending.replace('epair0a', 'epair1a'),
+            'a source outside capture': pending.replace('10.60.0.7', '10.61.0.7'),
+            'another resolver': pending.replace('192.168.1.1:53', '10.60.0.9:53'),
+            'another port': pending.replace('192.168.1.1:53', '192.168.1.1:853'),
+            'no interface recorded': pending.replace('   origif: epair0a\n', ''),
+            'no identifier': pending.replace('   id: 0000000000000071 creatorid: 2f5db096\n', ''),
+            'outbound': pending.replace(' <- ', ' -> '),
+        }
+        self.assertEqual(['0000000000000071/2f5db096'], policy.untranslated_dns_states(pending, own, sources))
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.assertEqual([], policy.untranslated_dns_states(text, own, sources))
+
+    def test_a_loaded_dns_redirect_drops_earlier_states_best_effort(self):
+        content = self.render(dns_redirect=1053)
+        states = ('all udp 10.2.0.1:53 <- 10.2.0.9:5353       SINGLE:MULTIPLE\n'
+                  '   id: 0000000000000081 creatorid: 2f5db096\n'
+                  '   origif: vtnet1\n'
+                  'all udp 10.3.0.1:53 <- 10.2.0.9:5354       SINGLE:MULTIPLE\n'
+                  '   id: 0000000000000082 creatorid: 2f5db096\n'
+                  '   origif: vtnet1\n'
+                  'all udp 192.0.2.2:53 <- 10.3.0.4:5355       SINGLE:MULTIPLE\n'
+                  '   id: 0000000000000083 creatorid: 2f5db096\n'
+                  '   origif: vtnet2\n'
+                  'all udp 192.0.2.2:53 <- 10.3.0.4:5356       SINGLE:MULTIPLE\n'
+                  '   id: 0000000000000084 creatorid: 2f5db096\n'
+                  '   origif: vtnet1\n')
+        calls, failing = [], []
+
+        def run(args, **_options):
+            calls.append(args)
+            if args[:3] == ['/sbin/pfctl', '-k', 'id'] and failing:
+                return subprocess.CompletedProcess(args, 1, b'', b'pfctl: no such state\n')
+            output = states.encode() if args == ['/sbin/pfctl', '-ss', '-vv'] else b''
+            return subprocess.CompletedProcess(args, 0, output, b'')
+
+        adapter = self.DnsAdapter(Path('/nonexistent'), run)
+        adapter.drop_untranslated_dns(content)
+        # Any router address, from the sources of the interface it entered.
+        self.assertEqual([['/sbin/pfctl', '-ss', '-vv'],
+                          ['/sbin/pfctl', '-k', 'id', '-k', '0000000000000081/2f5db096'],
+                          ['/sbin/pfctl', '-k', 'id', '-k', '0000000000000082/2f5db096'],
+                          ['/sbin/pfctl', '-k', 'id', '-k', '0000000000000083/2f5db096']], calls)
+        # A snapshot already taken is reused, and failures are swallowed.
+        calls.clear()
+        failing.append(True)
+        adapter.drop_untranslated_dns(content, states)
+        self.assertEqual([['/sbin/pfctl', '-k', 'id', '-k', '0000000000000081/2f5db096']], calls)
+        # Without DNS rules there is nothing to take over.
+        calls.clear()
+        adapter.drop_untranslated_dns(self.render(), states)
+        self.assertEqual([], calls)
+
+    def test_dns_state_kill_takes_both_transports_from_one_snapshot(self):
+        calls = []
+
+        def run(args, **_options):
+            calls.append(args)
+            output = self.STATES.encode() if args == ['/sbin/pfctl', '-ss', '-vv'] else b''
+            return subprocess.CompletedProcess(args, 0, output, b'')
+
+        self.DnsAdapter(Path('/nonexistent'), run).kill_redirect_states(1053, protocols=policy.DNS_PROTOCOLS)
+        self.assertEqual([['/sbin/pfctl', '-ss', '-vv'],
+                          ['/sbin/pfctl', '-k', 'id', '-k', 'a861b76a00000000/2f5db096'],
+                          ['/sbin/pfctl', '-k', 'id', '-k', '9f61b76a00000000/2f5db096']], calls)
+
+    def test_dns_redirect_target_requires_opt_in_owned_distinct_port_and_hooked_anchor(self):
+        answers = {'hook': 'rdr-anchor "test" all\n', 'code': 0}
+
+        def run(args, **_options):
+            self.assertEqual(['/sbin/pfctl', '-sn'], args)
+            return subprocess.CompletedProcess(args, answers['code'], answers['hook'].encode(), b'')
+
+        class Offering(self.DnsAdapter):
+            offered = 1053
+
+            def dns_redirect_port(self, _settings):
+                return self.offered
+
+        class Unflagged(Offering):
+            DNS_REDIRECT = False
+
+        self.assertIsNone(self.DnsAdapter(Path('/nonexistent'), run).dns_redirect_target({}))
+        self.assertIsNone(Unflagged(Path('/nonexistent'), run).dns_redirect_target({}))
+        adapter = Offering(Path('/nonexistent'), run)
+        self.assertEqual(1053, adapter.dns_redirect_target({}))
+        self.assertEqual(1053, adapter.dns_redirect_target({}, 7894))
+        # One loopback port cannot serve both redirects; DNS stays on the router.
+        self.assertIsNone(adapter.dns_redirect_target({}, 1053))
+        for hook, code in (('rdr-anchor "other" all\n', 0), ('', 0), ('rdr-anchor "test" all\n', 1)):
+            answers.update(hook=hook, code=code)
+            with self.subTest(hook=hook, code=code):
+                self.assertIsNone(adapter.dns_redirect_target({}))
+        adapter.offered = None
+        self.assertIsNone(adapter.dns_redirect_target({}))
+        for value in (53, 0, True, '1053'):
+            adapter.offered = value
+            with self.subTest(port=value), self.assertRaisesRegex(policy.RoutingError, 'DNS redirect port is invalid'):
+                adapter.dns_redirect_target({})
+
+    def test_journal_dns_port_is_validated_and_reported_only_when_present(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter = self.DnsAdapter(Path(root))
+            base = {'schema': 1, 'fib': 7, 'active': True, 'pending': False, 'routes': {}}
+            adapter.save(dict(base))
+            self.assertNotIn('dns_redirect_port', adapter.status(adapter.load()))
+            adapter.save(dict(base, dns_redirect_port=1053, tcp_redirect_port=7894))
+            self.assertEqual((1053, 7894), tuple(adapter.status(adapter.load())[field]
+                                                 for field in ('dns_redirect_port', 'tcp_redirect_port')))
+            for value in (53, 0, True, '1053', None):
+                adapter.save(dict(base, dns_redirect_port=value))
+                with self.subTest(value=value), self.assertRaises(policy.RoutingError):
+                    adapter.load()
+
+    def test_the_router_table_is_owned_and_emptied_only_by_dns_adapters(self):
+        line = 'table <test_self> { 10.2.0.1/32, 192.0.2.2/32 }'
+        self.assertTrue(self.DnsAdapter(Path('/nonexistent')).owned_anchor_line(line))
+        self.assertFalse(self.Adapter(Path('/nonexistent')).owned_anchor_line(line))
+        for adapter_class, expected in ((self.DnsAdapter, ['test_sources_0', 'test_self']),
+                                        (self.Adapter, ['test_sources_0'])):
+            flushed = []
+
+            def run(args, **_options):
+                if args[-1] == '-sT':
+                    return subprocess.CompletedProcess(args, 0, b'test_local\ntest_sources_0\ntest_self\n', b'')
+                flushed.append(args[4])
+                return subprocess.CompletedProcess(args, 0, b'', b'')
+
+            with self.subTest(adapter=adapter_class.__name__):
+                adapter_class(Path('/nonexistent'), run).neutralize_sources()
+                self.assertEqual(expected, flushed)
 
 
 if __name__ == '__main__':

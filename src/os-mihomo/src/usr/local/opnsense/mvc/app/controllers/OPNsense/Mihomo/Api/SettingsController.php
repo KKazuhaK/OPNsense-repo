@@ -97,6 +97,21 @@ class SettingsController extends ApiControllerBase
         foreach (self::CHOICES as $field => $fallback) {
             $payload[$field] = (string)($given[$field] ?? $fallback);
         }
+        /* The DNS scope has no fallback: a page or script from before it
+           existed, or any partial submission, keeps the stored scope instead
+           of silently widening a captured router to every device. */
+        if (isset($given['dns_scope'])) {
+            $payload['dns_scope'] = (string)$given['dns_scope'];
+        }
+        /* Nor has the declaration that captured devices get no IPv6: without
+           the key the stored answer stands, and nothing stored means off. It
+           is read strictly, because on is the less safe side: a posted "false"
+           is off, and a value that is no boolean at all is passed through for
+           the backend to refuse. */
+        if (isset($given['ipv6_clients_restricted'])) {
+            $restricted = filter_var($given['ipv6_clients_restricted'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+            $payload['ipv6_clients_restricted'] = $restricted ?? $given['ipv6_clients_restricted'];
+        }
         foreach (self::LISTS as $field) {
             /* Commas and newlines both separate; an empty field inherits. */
             $payload[$field] = array_values(preg_split('/[\s,]+/', (string)($given[$field] ?? ''), -1, PREG_SPLIT_NO_EMPTY));

@@ -18,6 +18,7 @@ import secrets
 import shlex
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from urllib import parse as urlparse, request as urlrequest
 
 import yaml
 import dns_probe
+import process_identity
 from dns_scope import (DNS_LISTEN, DNS_PORT, DNS_SCOPE_DEFAULT, DNS_SCOPE_FRESH, DNS_SCOPES, IPV6_CONFIRM,
                        IPV6_DNSSEC_NOTE, IPV6_NOTE, IPV6_POLL, IPV6_RESTRICTED_ALL_NOTE, IPV6_RESTRICTED_NOTE,
                        IPV6_ROUTER_DNS_NOTE, PRESET_NOTE, ROUTER_DNS_NOTE, SCOPE_CHANGE_INTERVAL, carries_ipv6,
@@ -99,6 +101,59 @@ IPV6_FAILED_NOTE = ('Switching the DNS scope after an IPv6 change failed (%s); t
 # until a start or a stop replaces it.
 IPV6_STOPPED_ERROR = ('Switching the DNS scope after an IPv6 change failed, and the service could not restart: '
                       '%s')
+# A core that exits without a stop is restarted by the watchdog, through the
+# same start as the Start button, once the crash rescue is done. The record
+# lives in /var/run, which a reboot clears: the boot start runs the core anyway.
+RESTART_FILE = '/var/run/mihomo-restart.json'
+# Seconds from the exit to the attempt, by how many automatic restarts the
+# last RESTART_WINDOW seconds already hold; a failed start is an attempt too.
+RESTART_DELAYS = (10, 60, 300)
+RESTART_WINDOW = 3600
+RESTART_BUDGET = 3
+EXIT_UNEXPECTED = 'exited unexpectedly'
+EXIT_KILLED = 'killed by the kernel: %s'
+# vm_pageout's line when the kernel kills a process for memory, by its pid.
+KERNEL_KILL = re.compile(r'(?:^|\s)pid ([0-9]+) \(mihomo\), jid [0-9]+, uid [0-9]+, was killed: ([^\n]+)',
+                         re.MULTILINE)
+RESTART_SCHEDULED_LOG = 'Mihomo stopped (%s); restarting it automatically in %d seconds.'
+RESTART_DECLINED_LOG = 'Mihomo stopped (%s); it is not restarted automatically, because %s.'
+RESTART_ATTEMPT_LOG = 'Restarting Mihomo automatically (%d of %d within an hour).'
+RESTART_DONE_LOG = 'Mihomo restarted automatically.'
+RESTART_FAILED_LOG = 'The automatic restart failed (%s); %s'
+RESTART_RETRY_LOG = 'the next attempt follows in %d seconds.'
+RESTART_PAUSE_TAIL = 'automatic restart is paused after %d restarts within an hour. Start resumes it.' % RESTART_BUDGET
+# The status error while the budget is spent, by what the pause began with:
+# an exit or a failed start, or a core the memory guard found above its limit
+# again, which still runs.
+RESTART_PAUSED = 'Mihomo exited repeatedly; ' + RESTART_PAUSE_TAIL
+MEMORY_PAUSED = 'Mihomo went above its memory restart limit again; ' + RESTART_PAUSE_TAIL
+RESTART_PENDING = 'Mihomo stopped (%s) and is restarted automatically at about %s.'
+# While the backup guard fails, or the rescue of a stopped core does not
+# finish, the watchdog makes no restart, so the status promises no time.
+RESTART_HELD = 'Mihomo stopped (%s); its automatic restart waits until the problem reported here is resolved.'
+RESTART_FAILED = 'The automatic restart failed: %s'
+RESTART_NOTE = 'Restarted automatically at %s (%s).'
+RESTART_BLOCKERS = {'disabled': 'the service is administratively stopped',
+                    'scope': 'a DNS scope change left it stopped',
+                    'sing-box': 'Sing-box owns transparent routing'}
+# A stop and start nobody asked for -- a WAN change, the watchdog's own
+# re-apply, a subscription update -- whose start failed: the core is down
+# without anyone meaning it to be, so it is restarted as after an exit.
+RESTART_CYCLE_WAN = 'the restart after a WAN change failed: %s'
+RESTART_CYCLE_APPLY = 'the restart for new router DNS upstreams failed: %s'
+RESTART_CYCLE_UPDATE = 'the restart after a subscription update failed: %s'
+# Go's soft memory limit for the core, as a share of physical memory and never
+# below the floor, and the resident size at which the watchdog restarts it
+# rather than wait for the kernel to kill a process when memory runs out.
+GOMEMLIMIT_PERCENT = 30
+GOMEMLIMIT_FLOOR = 256 * 1024 * 1024
+MEMORY_RESTART_PERCENT = 50
+MEMORY_RESTART_REASON = 'memory use %s above the restart limit of %s'
+MEMORY_RESTART_LOG = 'Mihomo uses %s of memory, above the restart limit of %s; restarting it.'
+MEMORY_PAUSED_LOG = ('Mihomo uses %s of memory, above the restart limit of %s, but automatic restart is '
+                     'paused.')
+MEMORY_WAIT_LOG = ('Mihomo uses %s of memory, above the restart limit of %s; an automatic restart was made '
+                   '%d seconds ago, so it is restarted in about %d seconds if it is still above the limit then.')
 # A firewall state table this large is not read for a status hint.
 STATE_TABLE_LIMIT = 64 * 1024 * 1024
 UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
@@ -1258,6 +1313,77 @@ def restores_direct_dns(settings):
     return bool(settings['dns_fallback']) or settings.get('dns_scope') == 'captured'
 
 
+def kernel_kill_reasons(messages, pid):
+    """Every reason the kernel message buffer gives for killing a Mihomo process with this pid, oldest first.
+
+    The buffer keeps lines for days on a quiet router while pids wrap within
+    hours, so a line may belong to an earlier process with the same pid; the
+    caller tells them apart by how many there were when its core was armed.
+    """
+    return [bounded_routing_diagnostic(match.group(2)) or 'no reason given'
+            for match in KERNEL_KILL.finditer(messages) if int(match.group(1)) == pid]
+
+
+def kernel_kill_reason(reasons, known):
+    """The kernel's reason for killing the armed core, from kernel_kill_reasons(), or None.
+
+    known is how many lines that pid already had when the core was armed:
+    only a line written after it can be this core's. Unknown counts as none.
+    """
+    if not reasons or len(reasons) <= (known or 0):
+        return None
+    return reasons[-1]
+
+
+def exit_reason(killed):
+    """Why the core is gone, as the log and the status say it."""
+    return EXIT_KILLED % killed if killed else EXIT_UNEXPECTED
+
+
+def go_memory_limit(physical):
+    """GOMEMLIMIT for the core in bytes, or None while physical memory is unknown.
+
+    Go's soft limit makes the collector work harder as the heap nears it, so
+    garbage that a slow-growing core would otherwise keep is returned first.
+    Unknown memory sets no limit rather than guess one.
+    """
+    if type(physical) is not int or physical <= 0:
+        return None
+    return max(physical * GOMEMLIMIT_PERCENT // 100, GOMEMLIMIT_FLOOR)
+
+
+def memory_restart_limit(physical):
+    """The resident size above which the watchdog restarts the core, or None while memory is unknown."""
+    if type(physical) is not int or physical <= 0:
+        return None
+    return physical * MEMORY_RESTART_PERCENT // 100
+
+
+def memory_text(value):
+    """A byte count as the log and the status note show it."""
+    if value >= 1024 ** 3:
+        return '%.1f GB' % (value / 1024 ** 3)
+    return '%d MB' % (value // 1024 ** 2)
+
+
+# FreeBSD amd64 struct kinfo_proc, as process_identity.metadata() reads it:
+# ki_pid at 72 and ki_start at 336 put segsz_t ki_rssize, the resident set in
+# pages, at 264, right after vm_size_t ki_size.
+KINFO_SIZE = 1088
+KINFO_PID = 72
+KINFO_RSSIZE = 264
+
+
+def resident_bytes(raw, pid):
+    """The resident size one kern.proc.pid record gives for pid, in bytes; None for any other layout."""
+    if (not isinstance(raw, bytes) or len(raw) != KINFO_SIZE
+            or struct.unpack_from('=i', raw)[0] != KINFO_SIZE
+            or struct.unpack_from('=i', raw, KINFO_PID)[0] != pid):
+        return None
+    pages = struct.unpack_from('=q', raw, KINFO_RSSIZE)[0]
+    return pages * os.sysconf('SC_PAGE_SIZE') if pages >= 0 else None
+
+
 def atomic_write(path, content, mode=0o600, durable=True):
     """Replace path in one step; durable also forces the new content to disk first."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1287,6 +1413,8 @@ class System:
         # Told about a failure that must not fail the operation it happened in;
         # the Manager points it at the core's log.
         self.report = report
+        # hw.physmem, once it has been read.
+        self._physical = None
 
     def _core_group(self, config=None):
         return core_group(process_reader=self.process_reader, signaler=os.kill,
@@ -1310,9 +1438,11 @@ class System:
             raise Error(detail or 'Transparent routing failed without a native diagnostic.')
         return result
 
-    def run(self, args, timeout=45, check=True, cwd=None, input=None):
+    def run(self, args, timeout=45, check=True, cwd=None, input=None, env=None):
         try:
             options = {'input': input} if input is not None else {}
+            if env is not None:
+                options['env'] = env
             result = subprocess.run(args, capture_output=True, timeout=timeout, cwd=cwd, **options)
         except (subprocess.TimeoutExpired, OSError):
             raise Error("A system operation failed or timed out.") from None
@@ -1593,14 +1723,18 @@ class System:
     def start(self, config, transparent):
         data = parse_yaml(Path(config).read_bytes())
         needs_dns = data.get('dns', {}).get('enable') and data.get('dns', {}).get('listen') == '127.0.0.1:1053'
-        if transparent and self.run(["/usr/sbin/service", "sing-box", "onestatus"], check=False).returncode == 0:
+        if transparent and self.singbox_owns_routing():
             raise Error("Sing-box already owns transparent routing.")
         if self.running():
             raise Error("Mihomo is already running; an existing process must be stopped before starting another.")
         self.recover_reloads()
         self.destroy_tun()
-        self.run(["/usr/sbin/daemon", "-P", DAEMON_PID, "-p", PID, "-f", "-o", "/var/log/mihomo.log",
-                  "-t", "mihomo", "/usr/local/bin/mihomo", "-d", HOME, "-f", str(config)])
+        # -H makes the supervisor reopen the log when newsyslog(8) has rotated
+        # it (reopen_logs()); without it every later line went to the rotated
+        # file. daemon(8) hands its environment, and so GOMEMLIMIT, to the core.
+        self.run(["/usr/sbin/daemon", "-H", "-P", DAEMON_PID, "-p", PID, "-f", "-o", "/var/log/mihomo.log",
+                  "-t", "mihomo", "/usr/local/bin/mihomo", "-d", HOME, "-f", str(config)],
+                 env=self.core_environment())
         owner = self._core_group(config)
         try:
             process_record = self._ownership(owner.record_started)
@@ -1608,6 +1742,10 @@ class System:
             with contextlib.suppress(Error):
                 self._ownership(owner.stop)
             raise
+        # Without the marker the rotation leaves this supervisor alone, which
+        # costs the log lines until the next start, never the core.
+        with contextlib.suppress(OwnershipError, OSError):
+            owner.mark_reopenable(process_record)
         tun_claimed = False
         for _ in range(30):
             if self.running():
@@ -2214,17 +2352,92 @@ class System:
     def watch(self):
         owner = self._watch_group()
         if not self._ownership(owner.running):
-            self.run(["/usr/sbin/daemon", "-P", WATCH_PID, "-p", WATCH_CHILD_PID, "-f", "-o", "/var/log/mihomo.log",
-                      "-t", "mihomo-watch", "/usr/local/bin/python3", SCRIPT, "watch"])
+            self.run(["/usr/sbin/daemon", "-H", "-P", WATCH_PID, "-p", WATCH_CHILD_PID, "-f", "-o",
+                      "/var/log/mihomo.log", "-t", "mihomo-watch", "/usr/local/bin/python3", SCRIPT, "watch"])
             try:
-                self._ownership(owner.record_started)
+                record = self._ownership(owner.record_started)
             except Error:
                 with contextlib.suppress(Error):
                     self._ownership(owner.stop)
                 raise
+            with contextlib.suppress(OwnershipError, OSError):
+                owner.mark_reopenable(record)
 
     def stop_watch(self):
         self._ownership(self._watch_group().stop)
+
+    def reopen_logs(self):
+        """Have every supervisor proven to run with -H reopen /var/log/mihomo.log; how many were asked.
+
+        newsyslog(8) runs this after it rotates the log, hourly from cron, so
+        it takes no manager lock: the ownership journals and markers are read
+        as they stand, and each identity is proven again right before the
+        signal. A supervisor that is not proven is not signalled.
+        """
+        asked, failure = 0, None
+        for group in (self._core_group(), self._watch_group()):
+            try:
+                asked += bool(group.reopen_output())
+            except (OwnershipError, OSError) as error:
+                failure = error
+        if failure is not None:
+            raise Error('A Mihomo log supervisor could not be proven; it was not signalled.') from failure
+        return asked
+
+    def singbox_owns_routing(self):
+        return self.run(["/usr/sbin/service", "sing-box", "onestatus"], check=False).returncode == 0
+
+    def physical_memory(self):
+        """hw.physmem in bytes, or None while it cannot be read; a successful reading is kept."""
+        if self._physical is None:
+            with contextlib.suppress(Error):
+                result = self.run(['/sbin/sysctl', '-n', 'hw.physmem'], timeout=10, check=False)
+                text = result.stdout.decode('ascii', errors='replace').strip()
+                if result.returncode == 0 and re.fullmatch(r'[1-9][0-9]{0,19}', text):
+                    self._physical = int(text)
+        return self._physical
+
+    def core_environment(self):
+        """The environment the core starts with: this one, with Go's soft memory limit when it is known."""
+        environment = dict(os.environ)
+        limit = go_memory_limit(self.physical_memory())
+        if limit is not None:
+            environment['GOMEMLIMIT'] = '%dMiB' % (limit // (1024 * 1024))
+        return environment
+
+    def core_usage(self):
+        """The running core's recorded identity and its resident bytes, or None when either is not proven.
+
+        Read from the same kern.proc.pid record the ownership checks read,
+        between two of them, so the size belongs to the recorded process.
+        """
+        try:
+            group = self._core_group()
+            record = group.discover(adopt=False)
+            if record is None or not group.same(record['child']):
+                return None
+            child = record['child']
+            raw = process_identity.kernel_value('kern.proc.pid', child['pid'])
+            if not group.same(child):
+                return None
+        except (OwnershipError, OSError, RuntimeError, ValueError, AttributeError):
+            return None
+        return {'core': dns_probe.core_identity(child), 'resident': resident_bytes(raw, child['pid'])}
+
+    def kill_reasons(self, pid):
+        """Every reason the kernel message buffer gives for killing a Mihomo process with this pid, or None.
+
+        None when dmesg cannot be read, which tells nothing either way.
+        """
+        if type(pid) is not int:
+            return None
+        try:
+            result = self.run(['/sbin/dmesg'], timeout=15, check=False)
+        except Error:
+            return None
+        if result.returncode:
+            return None
+        return kernel_kill_reasons(result.stdout.decode(errors='replace'), pid)
 
 
 def fetch_subscription(url, user_agent, proxy="127.0.0.1:7891", run=subprocess.run, sleep=time.sleep):
@@ -2303,6 +2516,9 @@ class Manager:
         # The latest verdict on the running core's DNS, which the routing
         # adapter requires before it redirects captured devices' DNS.
         self.dns_health_file = self.path(dns_probe.HEALTH_FILE)
+        # Whether a start left the core running, and the automatic restarts
+        # made for it; see RESTART_FILE.
+        self.restart_file = self.path(RESTART_FILE)
         # Probes are timed with the system-wide monotonic clock, which the
         # routing adapter, another process, reads the verdict's age with.
         self.clock = time.monotonic
@@ -2310,6 +2526,15 @@ class Manager:
         self.backup_transport = backup_transport or self._backup_transport
         self.proxy_api = proxy_api or self._proxy_api
         self._lock_depth = 0
+        # config.yaml as last parsed, with the stat identity it was read at.
+        self._applied_config = None
+        # subscription.yaml as the backup mirror last parsed it, by digest.
+        self._source_parse = None
+        # The core's usage, read at most once in the current watchdog tick:
+        # None outside a tick, empty until the tick reads it.
+        self._tick_usage = None
+        # When the memory guard last said it waits for the restart ladder.
+        self._memory_wait = None
         self._applied_dns = None
         self._ipv6_offer = None
         self._validating = None
@@ -2432,6 +2657,22 @@ class Manager:
                     return hashlib.sha256('|'.join(identity).encode()).hexdigest()
         return ''
 
+    def _source_parsed(self, content):
+        """subscription.yaml's content parsed, again only when its bytes change; the result is only read.
+
+        The watchdog mirrors the backup on every tick whether router DNS is on
+        or not, and a subscription is as large as the configuration rendered
+        from it: parsing both cost a 4 GB router two 0.69 s parses every five
+        seconds. The key is a digest of the very bytes read, which the
+        snapshot beside it is made from, so no rewrite can be answered from
+        an older parse. merge_yaml() copies its base and _reference_paths()
+        only reads, so the cached object is never changed.
+        """
+        digest = hashlib.sha256(content).digest()
+        if self._source_parse is None or self._source_parse[0] != digest:
+            self._source_parse = (digest, parse_yaml(content))
+        return self._source_parse[1]
+
     def _mirror_payload(self):
         settings = self.settings()
         payload = {key: json.dumps(settings[key], ensure_ascii=True, separators=(',', ':'))
@@ -2448,7 +2689,7 @@ class Manager:
                 break
         source = self._backup_read(self.source_file)
         payload['subscription_snapshot'] = base64.b64encode(gzip.compress(source, mtime=0)).decode() if source is not None else ''
-        data = parse_yaml(source) if source is not None else {}
+        data = self._source_parsed(source) if source is not None else {}
         local = []
         for path in self._reference_paths(data, actual):
             value = self._backup_read(self.path(path))
@@ -3043,25 +3284,57 @@ class Manager:
             return None
         return observed if isinstance(observed, dict) else None
 
+    def _applied_parse(self):
+        """config.yaml as parsed, and its stat identity; parsed again only when that identity changes.
+
+        The watchdog reads the applied configuration on every tick, and a
+        subscription's can be large: 470 KB of 9480 rules cost a 4 GB router
+        0.69 s of CPU to parse, every five seconds. Every writer replaces the
+        file whole (atomic_write()), so a rewrite has a new inode and new
+        times, and the identity below, which includes the change time, never
+        matches a parse of what was there before. A file that changes while
+        it is read is parsed but not kept.
+
+        The returned object is the cache itself, so it is only ever read:
+        applied_dns_shape() and redirect_configured() take values out of it,
+        and applied_config() hands every other caller a copy.
+        """
+        info = self.config_file.stat()
+        key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if self._applied_config is not None and self._applied_config[0] == key:
+            return self._applied_config
+        data = parse_yaml(self.config_file.read_bytes())
+        after = self.config_file.stat()
+        if key != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            self._applied_config = None
+            return None, data
+        self._applied_config = (key, data)
+        return self._applied_config
+
+    def applied_config(self):
+        """The applied configuration, parsed at most once per version of config.yaml.
+
+        A private copy: what a caller does to it never reaches the cache.
+        Raises Error or OSError as parsing the file would.
+        """
+        return copy.deepcopy(self._applied_parse()[1])
+
     def applied_dns_shape(self):
         """The parts of the applied configuration the DNS scope depends on, or None.
 
-        Status is republished on every watchdog tick, and a subscription's
-        configuration can be large enough that parsing it that often costs a
-        small router real time, so only the values the answer depends on are
-        kept, and the file is read again only when its identity changes:
-        every writer replaces it whole.
+        Status is republished on every watchdog tick, so only the values the
+        answer depends on are kept, alongside the parse they were read from.
         """
         try:
-            info = self.config_file.stat()
-            key = (info.st_ino, info.st_mtime_ns, info.st_size)
-            if self._applied_dns is None or self._applied_dns[0] != key:
-                generated = parse_yaml(self.config_file.read_bytes())
+            key, generated = self._applied_parse()
+            if key is None or self._applied_dns is None or self._applied_dns[0] != key:
                 tun = generated.get('tun') if isinstance(generated.get('tun'), dict) else {}
                 dns = generated.get('dns') if isinstance(generated.get('dns'), dict) else {}
-                self._applied_dns = (key, {'ipv6': generated.get('ipv6'), 'tun': {'enable': tun.get('enable')},
-                                           'dns': {'enable': dns.get('enable'), 'listen': dns.get('listen'),
-                                                   'ipv6': dns.get('ipv6')}})
+                shape = {'ipv6': generated.get('ipv6'), 'tun': {'enable': tun.get('enable')},
+                         'dns': {'enable': dns.get('enable'), 'listen': dns.get('listen'),
+                                 'ipv6': dns.get('ipv6')}}
+                self._applied_dns = (key, shape) if key is not None else None
+                return shape
         except (Error, OSError):
             self._applied_dns = None
             return None
@@ -3422,11 +3695,33 @@ class Manager:
         if running and ipv6_restricted(settings):
             notes.append(self.restricted_note(settings, dns_scope))
         dns_note = ' '.join(note for note in notes if note)
+        # An automatic restart that waits, or that the budget refused, is said
+        # until a start or a stop ends it, whoever republishes meanwhile. A
+        # restart the watchdog cannot make now (held) promises no time.
+        error = str(error) if error else ''
+        restart = self.restart_record()
+        notice = ''
+        if restart['paused']:
+            notice = MEMORY_PAUSED if restart['paused'] == 'memory' else RESTART_PAUSED
+        elif not running and restart['pending'] is not None:
+            notice = (RESTART_HELD % restart['pending']['reason'] if restart['held'] else
+                      RESTART_PENDING % (restart['pending']['reason'],
+                                         time.strftime('%H:%M:%S', time.localtime(restart['pending']['at']))))
+        if notice and notice not in error:
+            error = notice + (' ' + error if error else '')
         stopped = observed.get('stopped')
         if not running and isinstance(stopped, str) and stopped and not error.startswith(stopped):
             # A scope change left the service stopped: say so until a start
             # or a stop replaces the record, whatever else this call reports.
             error = stopped + (' ' + error if error else '')
+        last = restart['last']
+        restart_note = RESTART_NOTE % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last['time'])),
+                                       last['reason']) if last else ''
+        core_memory = None
+        if running:
+            usage = self.core_usage()
+            if usage is not None and type(usage.get('resident')) is int:
+                core_memory = usage['resident']
         redirect_note = ''
         if settings.get('tcp_redirect') is True and routing_active and not tcp_redirect:
             redirect_note = ('TCP stays on the TUN: port %d is taken by another listener.' % REDIRECT_PORT
@@ -3441,6 +3736,10 @@ class Manager:
                   "tcp_redirect_note": redirect_note,
                   "dns_active": dns_active, "dns_scope": dns_scope, "dns_redirect": dns_redirect,
                   "dns_note": dns_note, "dns_fallback": settings["dns_fallback"],
+                  "restart_note": restart_note, "last_restart": dict(last) if last else None,
+                  # No limit while held: the memory guard does not run then.
+                  "core_memory": core_memory, "core_memory_limit": None if restart['held'] else
+                      memory_restart_limit(self.physical_memory()),
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
                   "error": bounded_routing_diagnostic(error), "backup_warning": self.backup_warning_file.read_text()
                       if self.backup_warning_file.exists() else BACKUP_WARNING
@@ -3469,7 +3768,8 @@ class Manager:
 
     def redirect_configured(self):
         with contextlib.suppress(Error, OSError):
-            listeners = parse_yaml(self.config_file.read_bytes()).get('listeners')
+            # Read, never changed: the cached parse itself.
+            listeners = self._applied_parse()[1].get('listeners')
             return isinstance(listeners, list) and any(
                 isinstance(item, dict) and item.get('name') == REDIRECT_LISTENER for item in listeners)
         return False
@@ -3705,6 +4005,13 @@ class Manager:
 
     def stop(self, settings=None, reason=None, withdrawal='the service stopped'):
         settings = settings or self.settings()
+        self.forget_usage()
+        # Every stop is meant, so the watchdog must not restart this core, nor
+        # make a restart that still waits; a start that follows arms it again.
+        # A stop and start nobody asked for, whose start fails, plans its own
+        # restart afterwards (restart_failed_cycle()).
+        with contextlib.suppress(OSError):
+            self.disarm_restart()
         # This stop, and whatever start follows it, now explains the service.
         self.annotate_observation(self.dns_observation(), stopped=None)
         # Restore direct DNS before stopping the listener, even for fail-closed policy.
@@ -3732,6 +4039,7 @@ class Manager:
     def start(self, settings=None, reaching=None):
         original = settings or self.settings()
         settings = routing_settings(original)
+        self.forget_usage()
         if not settings["service_enabled"]:
             self.publish_status(settings)
             return {"running": False, "message": "The service is administratively stopped."}
@@ -3830,6 +4138,8 @@ class Manager:
         except (Error, OSError) as error:
             self.stop(settings, reason=error)
             raise
+        # From here an exit without a stop is the watchdog's to restart.
+        self.arm_restart()
         status = self.publish_status(settings, dns_active)
         # Whatever scope change an earlier watchdog left unfinished, this start
         # decided the scope afresh and published what it did.
@@ -3960,7 +4270,14 @@ class Manager:
                     latest = self.settings()
                     if (latest["subscription_url"], latest["device"]) != (settings["subscription_url"], settings["device"]):
                         raise Error("Subscription settings changed during download. The response was discarded.")
-                    result = self.apply(content, latest)
+                    running = self.system.running()
+                    try:
+                        result = self.apply(content, latest)
+                    except (Error, OSError, ValueError, TypeError, KeyError) as error:
+                        # Mostly run from cron, with nobody there to press Start.
+                        if running:
+                            self.restart_failed_cycle(latest, RESTART_CYCLE_UPDATE, error)
+                        raise
                 self.log("Subscription validated and applied.")
                 self.update_status("completed")
                 return result
@@ -3982,12 +4299,364 @@ class Manager:
         atomic_write(path, str(process.pid).encode())
         return {"queued": True}
 
+    def core_usage(self):
+        """The running core's identity and resident bytes, as System.core_usage() proves them, or None.
+
+        Inside a watchdog tick it is read once, for the memory guard and the
+        status alike: each reading proves the core's ownership again, which
+        costs a kern.boottime sysctl process. A stop or a start in between
+        (forget_usage()) makes the next caller read the new core.
+        """
+        if self._tick_usage:
+            return self._tick_usage[0]
+        usage = None
+        reader = getattr(self.system, 'core_usage', None)
+        if reader is not None:
+            with contextlib.suppress(Error, OSError):
+                usage = reader()
+        if self._tick_usage is not None:
+            self._tick_usage.append(usage)
+        return usage
+
+    def forget_usage(self):
+        """The core is about to change: the tick's reading of its usage no longer holds."""
+        if self._tick_usage:
+            self._tick_usage.clear()
+
+    def physical_memory(self):
+        """hw.physmem in bytes, as System.physical_memory() reads it, or None."""
+        reader = getattr(self.system, 'physical_memory', None)
+        if reader is None:
+            return None
+        with contextlib.suppress(Error, OSError):
+            return reader()
+        return None
+
+    def restart_record(self):
+        """The automatic restart's record (RESTART_FILE); an unreadable one reads as empty.
+
+        armed: a start left the core running and no stop has ended it, so its
+        exit is one to restart; core: that core's identity, whose pid the
+        kernel names when it kills it; kills: how many kernel kill lines that
+        pid already had when the core was armed, None when dmesg could not
+        say. attempts: when automatic restarts were made, on the system-wide
+        monotonic clock the DNS probes use, so a new watchdog counts the same
+        ones. pending: a restart waiting for its time, with why and the
+        wall-clock time it is due at for the status. held: the watchdog's
+        last tick could make no restart and guard no memory, because the
+        backup guard failed or the rescue of a stopped core did not finish.
+        paused: the budget refused one, and what met the spent budget:
+        'exit' or 'memory'. last: when and why the last automatic restart
+        succeeded. An empty record arms nothing, so an exit it cannot vouch
+        for is not restarted; the next tick that finds a core running arms it
+        again.
+        """
+        record = {'armed': False, 'core': None, 'kills': None, 'attempts': [], 'pending': None, 'held': False,
+                  'paused': False, 'last': None}
+        try:
+            value = json.loads(self.restart_file.read_bytes())
+        except (OSError, ValueError):
+            return record
+
+        def number(item):
+            # Finite and in range: the status formats these as local times,
+            # and every stop publishes the status.
+            return isinstance(item, (int, float)) and not isinstance(item, bool) and -1e11 < item < 1e11
+
+        pending, last = (value.get(key) if isinstance(value, dict) else None for key in ('pending', 'last'))
+        if (not isinstance(value, dict) or value.get('version') != 1
+                or set(value) != {'version', *record}
+                or type(value['armed']) is not bool or type(value['held']) is not bool
+                or not (value['paused'] is False or value['paused'] in ('exit', 'memory'))
+                or not (value['core'] is None or dns_probe.core_identity(value['core']) == value['core'])
+                or not (value['kills'] is None or (type(value['kills']) is int and 0 <= value['kills'] <= 65536))
+                or not isinstance(value['attempts'], list) or len(value['attempts']) > 16
+                or not all(number(item) for item in value['attempts'])
+                or not (pending is None or (isinstance(pending, dict) and set(pending) == {'reason', 'due', 'at'}
+                                            and isinstance(pending['reason'], str)
+                                            and number(pending['due']) and number(pending['at'])))
+                or not (last is None or (isinstance(last, dict) and set(last) == {'time', 'reason'}
+                                         and isinstance(last['reason'], str) and number(last['time'])))):
+            return record
+        record.update({key: value[key] for key in record})
+        return record
+
+    def write_restart_record(self, record):
+        """Replace the record when it changed; runtime state, so not forced to disk."""
+        if record == self.restart_record():
+            return
+        atomic_write(self.restart_file, (json.dumps(dict(record, version=1), sort_keys=True) + '\n').encode(),
+                     durable=False)
+
+    def recent_attempts(self, record, now):
+        """The automatic restarts within the rolling window that ends now."""
+        return [moment for moment in record['attempts'] if 0 <= now - moment < RESTART_WINDOW]
+
+    def kill_reasons(self, core):
+        """The kernel's kill lines for this core's pid so far (System.kill_reasons()), or None when unknown."""
+        reader = getattr(self.system, 'kill_reasons', None)
+        pid = core.get('pid') if isinstance(core, dict) else None
+        if reader is None or pid is None:
+            return None
+        with contextlib.suppress(Error, OSError):
+            reasons = reader(pid)
+            return reasons if isinstance(reasons, list) else None
+        return None
+
+    def kills_known(self, core):
+        """How many kernel kill lines this core's pid has before it can have any; see restart_record()."""
+        reasons = self.kill_reasons(core)
+        return min(len(reasons), 65536) if reasons is not None else None
+
+    def arm_restart(self):
+        """Record that a start left the core running: an exit without a stop is now restarted.
+
+        A start also ends a restart that waited or was refused; the attempts
+        stay counted, because the watchdog's own restarts come through here.
+        """
+        identity = getattr(self.system, 'core_identity', None)
+        core = None
+        with contextlib.suppress(Error, OSError):
+            core = identity() if identity is not None else None
+        record = self.restart_record()
+        record.update(armed=True, core=core, kills=self.kills_known(core), pending=None, held=False, paused=False)
+        # A record that cannot be written arms on the watchdog's next tick.
+        with contextlib.suppress(OSError):
+            self.write_restart_record(record)
+
+    def disarm_restart(self):
+        """Record that the core stops on purpose, so nothing restarts it, nor a restart still waiting."""
+        record = self.restart_record()
+        record.update(armed=False, core=None, kills=None, pending=None, held=False)
+        self.write_restart_record(record)
+
+    def clear_restart_history(self):
+        """An administrative start, restart or stop: the budget, a pause and the last restart are forgotten."""
+        record = self.restart_record()
+        record.update(attempts=[], pending=None, paused=False, last=None)
+        self.write_restart_record(record)
+
+    def hold_restart(self, held):
+        """Record whether this tick could act on the core at all; the status reads it (see restart_record())."""
+        record = self.restart_record()
+        if record['held'] is not held:
+            record['held'] = held
+            with contextlib.suppress(OSError):
+                self.write_restart_record(record)
+
+    def restart_blocked(self, settings):
+        """Why the core must stay down although nobody stopped it, as a RESTART_BLOCKERS key, or ''.
+
+        Stop, remove, suspend and every stop the manager makes itself disarm
+        the record first, so they never reach here; these are the intents a
+        record cannot hold.
+        """
+        if not settings.get('service_enabled'):
+            return 'disabled'
+        if self.stopped_reason():
+            # A scope change whose rollback failed leaves the service stopped
+            # until a start or a stop, as the status says.
+            return 'scope'
+        owns = getattr(self.system, 'singbox_owns_routing', None)
+        if settings.get('transparent') and owns is not None:
+            with contextlib.suppress(Error, OSError):
+                if owns():
+                    return 'sing-box'
+        return ''
+
+    def schedule_restart(self, settings, record, reason):
+        """Plan the restart of a core that just exited: when, or why not."""
+        now = self.clock()
+        record['pending'] = None
+        blocked = self.restart_blocked(settings)
+        if blocked:
+            self.core_log(RESTART_DECLINED_LOG % (reason, RESTART_BLOCKERS[blocked]))
+        elif record['paused'] or len(self.recent_attempts(record, now)) >= RESTART_BUDGET:
+            # A pause the memory guard began keeps saying so.
+            record['paused'] = record['paused'] or 'exit'
+            self.core_log('Mihomo stopped (%s); %s' % (reason, RESTART_PAUSE_TAIL))
+        else:
+            delay = RESTART_DELAYS[min(len(self.recent_attempts(record, now)), len(RESTART_DELAYS) - 1)]
+            record['pending'] = {'reason': reason, 'due': now + delay, 'at': time.time() + delay}
+            self.core_log(RESTART_SCHEDULED_LOG % (reason, delay))
+        self.write_restart_record(record)
+
+    def recover_core(self, settings):
+        """Restart a core that exited without a stop, once its crash rescue is done.
+
+        The tick that finds the core a start left running gone (armed) asks
+        the kernel message buffer why, by the recorded pid, and plans the
+        restart RESTART_DELAYS after it; a later tick makes it, through the
+        start action's own path. Only a kill line the pid did not have when
+        the core was armed is this core's. Returns the status of an attempt,
+        or None, and the caller then publishes as it always has.
+        """
+        record = self.restart_record()
+        if record['armed']:
+            killed = kernel_kill_reason(self.kill_reasons(record['core']), record['kills'])
+            record.update(armed=False, core=None, kills=None)
+            self.schedule_restart(settings, record, exit_reason(killed))
+            return None
+        pending = record['pending']
+        if pending is None:
+            return None
+        blocked = self.restart_blocked(settings)
+        if blocked:
+            record['pending'] = None
+            self.write_restart_record(record)
+            self.core_log(RESTART_DECLINED_LOG % (pending['reason'], RESTART_BLOCKERS[blocked]))
+            return None
+        if self.clock() < pending['due']:
+            return None
+        return self.restart_core(record, pending['reason'])
+
+    def guard_memory(self, settings):
+        """Keep the record in step with the running core, and restart it once its memory passes the limit.
+
+        Whatever started the core that runs now, its exit is one to restart,
+        and a restart still waiting for an earlier one has nothing left to do.
+        A resident size above MEMORY_RESTART_PERCENT of physical memory is
+        restarted here, inside the budget and on the exit's ladder counted
+        from the last attempt, before the kernel has to kill a process for
+        memory; the soft limit the core starts with should keep it from
+        getting there. Returns the status of a restart, or None.
+        """
+        usage = self.core_usage() or {}
+        record = self.restart_record()
+        core = usage.get('core')
+        if not record['armed'] or record['pending'] is not None or (core is not None and record['core'] != core):
+            if core is not None and record['core'] != core:
+                record.update(core=core, kills=self.kills_known(core))
+            record.update(armed=True, pending=None)
+            self.write_restart_record(record)
+        limit = memory_restart_limit(self.physical_memory())
+        resident = usage.get('resident')
+        if limit is None or type(resident) is not int or resident <= limit:
+            return None
+        sizes = (memory_text(resident), memory_text(limit))
+        now = self.clock()
+        recent = self.recent_attempts(record, now)
+        if record['paused'] or len(recent) >= RESTART_BUDGET:
+            if not record['paused']:
+                record['paused'] = 'memory'
+                self.write_restart_record(record)
+                self.core_log(MEMORY_PAUSED_LOG % sizes)
+            return None
+        if self.restart_blocked(settings):
+            return None
+        if recent:
+            # A new core that is above the limit again at once is not torn
+            # down, routing and DNS with it, on every tick: the next restart
+            # waits as long after the last attempt as one after an exit would.
+            due = recent[-1] + RESTART_DELAYS[min(len(recent), len(RESTART_DELAYS) - 1)]
+            if now < due:
+                if self._memory_wait != due:
+                    self._memory_wait = due
+                    self.core_log(MEMORY_WAIT_LOG % (sizes + (round(now - recent[-1]), round(due - now))))
+                return None
+        self.core_log(MEMORY_RESTART_LOG % sizes)
+        return self.restart_core(record, MEMORY_RESTART_REASON % sizes, settings)
+
+    def restart_core(self, record, reason, stop=None):
+        """Make one automatic restart: the start action's path, after a stop when the core still runs.
+
+        stop holds the settings to stop a running core with first, as the
+        memory guard asks. The attempt counts before it is made, so a start
+        that fails, or a watchdog that dies in it, spends the budget too.
+        """
+        now = self.clock()
+        attempts = self.recent_attempts(record, now) + [now]
+        record.update(attempts=attempts, pending=None)
+        self.write_restart_record(record)
+        self.core_log(RESTART_ATTEMPT_LOG % (len(attempts), RESTART_BUDGET))
+        try:
+            if stop is not None:
+                # The new core replays the proxy selections saved here.
+                self.proxy_tick()
+                self.stop(stop, withdrawal='Mihomo was restarted')
+            # As dispatch('start'). The tick that gets here passed the backup
+            # guard, so no restored backup is pending and this reconciles
+            # nothing; the settings are read afresh after it.
+            self._restore_for_start()
+            status = self.start()
+        except (Error, OSError, ValueError, TypeError, KeyError) as error:
+            return self.restart_failed(reason, error)
+        if not status.get('running'):
+            return status
+        record = self.restart_record()
+        record['last'] = {'time': time.time(), 'reason': reason}
+        self.write_restart_record(record)
+        self.core_log(RESTART_DONE_LOG)
+        return self.publish_status(dns_active=bool(status.get('dns_active')))
+
+    def restart_failed(self, reason, error):
+        """Plan the next attempt after one that failed, or pause once the budget is spent."""
+        failure = bounded_routing_diagnostic(error) or 'the service could not start'
+        # The failed start's own stop disarmed the record and dropped nothing else.
+        record = self.restart_record()
+        now = self.clock()
+        attempts = self.recent_attempts(record, now)
+        if len(attempts) >= RESTART_BUDGET:
+            record.update(pending=None, paused='exit')
+            self.core_log(RESTART_FAILED_LOG % (failure, RESTART_PAUSE_TAIL))
+        else:
+            delay = RESTART_DELAYS[min(len(attempts), len(RESTART_DELAYS) - 1)]
+            record['pending'] = {'reason': reason, 'due': now + delay, 'at': time.time() + delay}
+            self.core_log(RESTART_FAILED_LOG % (failure, RESTART_RETRY_LOG % delay))
+        self.write_restart_record(record)
+        # The failed start published whether Unbound still forwards; the next
+        # tick's rescue acts on that.
+        active = False
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            active = bool(json.loads(self.status_file.read_bytes()).get('dns_active'))
+        return self.publish_status(dns_active=active, error=RESTART_FAILED % failure)
+
+    def restart_failed_cycle(self, settings, cause, error):
+        """Plan the restart of a core that a stop and start nobody asked for left down.
+
+        A WAN change (wan-restart), the watchdog's re-apply for new router DNS
+        upstreams and a subscription update stop the running core and start
+        it again. When that start fails, its stop has disarmed the record and
+        the core is down without anyone meaning it to be, which on a router
+        nobody watches is the same as an exit: the restart follows on the
+        same ladder, inside the same budget, unless restart_blocked() holds
+        it. The administrator's own Start, Restart and changes fail in front
+        of them and are not retried. Callers pass only a cycle that found the
+        core running; whatever goes wrong here leaves their error to report.
+        """
+        with contextlib.suppress(Error, OSError, ValueError, TypeError, KeyError):
+            if self.system.running():
+                return
+            record = self.restart_record()
+            if record['armed'] or record['pending'] is not None:
+                return
+            self.schedule_restart(settings, record, cause % (bounded_routing_diagnostic(error)
+                                                             or 'the service could not start'))
+            # Said now rather than at the next tick, beside the cycle's own error.
+            stored = {}
+            with contextlib.suppress(OSError, ValueError):
+                stored = json.loads(self.status_file.read_bytes())
+            stored = stored if isinstance(stored, dict) else {}
+            self.publish_status(settings, dns_active=bool(stored.get('dns_active')), error=stored.get('error') or '')
+
     def watchdog_tick(self):
+        # The memory guard and the status share one reading of the core's
+        # usage per tick (core_usage()).
+        self._tick_usage = []
+        try:
+            return self._guarded_tick()
+        finally:
+            self._tick_usage = None
+
+    def _guarded_tick(self):
         try:
             self._guard_backup()
         except Error as error:
             # Backup preservation must not disable the local crash rescue path.
             # Only the running-settings rewrite and mirror need the XML guard.
+            # Neither the automatic restart nor the memory guard runs here,
+            # and the status says so (hold_restart()).
+            self.hold_restart(True)
             settings = self.settings()
             active = False
             with contextlib.suppress(OSError, ValueError):
@@ -4077,25 +4746,47 @@ class Manager:
                     'Routing cleanup failed and will be retried.', error) + ' '
             with contextlib.suppress(OSError):
                 self.dns_health_file.unlink(missing_ok=True)
+            restored = False
             if active and (restores_direct_dns(settings) or not settings['service_enabled'] or (self.state / 'dns-reload-pending').exists()):
                 try:
                     self.system.dns(False, settings)
                     active = False
                 except (Error, OSError):
+                    self.hold_restart(True)
                     return self.publish_status(settings, active, error=routing_error + 'Direct DNS recovery failed and will be retried.')
                 self.scope_move_file.unlink(missing_ok=True)
+                restored = True
+            # Until the rescue is complete no restart is made, and the status
+            # promises none.
+            self.hold_restart(bool(routing_error))
+            if not routing_error:
+                # The rescue is complete -- capture withdrawn, and direct DNS
+                # back wherever it has to be -- so the core may come back.
+                recovered = self.recover_core(settings)
+                if recovered is not None:
+                    return recovered
+            if restored:
+                restart = self.restart_record()
                 return self.publish_status(settings, error=routing_error or (
                     'Direct DNS was restored.' if self.stopped_reason() else
+                    # The restart notice already says that Mihomo stopped.
+                    'Direct DNS and routing were restored automatically.'
+                    if restart['pending'] is not None or restart['paused'] else
                     "Mihomo exited. Direct DNS and routing were restored automatically."))
             if routing_error:
                 return self.publish_status(settings, active, error=routing_error)
         else:
+            self.hold_restart(False)
             if interrupted:
                 # Its new core runs, or its old one still does, and what
                 # Unbound does may not be what the status says: a restart
                 # decides the scope afresh and settles both.
                 return self.move_dns_scope(settings, self.reach_now(settings)[0], self.observed_ipv6(),
                                            IPV6_FINISH_LOG, check=False)
+            # Before anything else acts on a core that is about to be replaced.
+            restarted = self.guard_memory(settings)
+            if restarted is not None:
+                return restarted
             if active and self.unbound_validating():
                 # DNSSEC was switched on after the forward zone was written.
                 # Unbound now validates what Mihomo answers, and every signed
@@ -4143,14 +4834,18 @@ class Manager:
                 self.observe_dns_redirect()
         if settings.get('router_dns'):
             upstreams, ipv6 = self.router_context(settings)
-            data = parse_yaml(self.config_file.read_bytes())
+            data = self.applied_config()
             # A declared offer is a status note (publish_status()), not an error.
             if (ipv6 and not ipv6_restricted(settings)
                     and not (data.get('ipv6') is True and data.get('dns', {}).get('ipv6') is True)):
                 return self.publish_status(settings, active, error='IPv6 is now being advertised to clients while Mihomo IPv6 is disabled. Disable router DNS or validate IPv6 support.')
             pins = dns_transport_rules(upstreams)
             if self.system.running() and data.get('rules', [])[:len(pins)] != pins:
-                self.apply(self.source_file.read_bytes(), settings)
+                try:
+                    self.apply(self.source_file.read_bytes(), settings)
+                except (Error, OSError, ValueError, TypeError, KeyError) as error:
+                    self.restart_failed_cycle(settings, RESTART_CYCLE_APPLY, error)
+                    raise
             return self.publish_status(settings, active)
         return self.publish_status(settings, active)
 
@@ -4180,11 +4875,19 @@ class Manager:
             if not result['ok']:
                 raise Error(BACKUP_WARNING)
             return result
+        if action in {'start', 'restart', 'stop'}:
+            # The administrator has acted: the automatic restarts counted so
+            # far, a pause and the last restart's note are history now.
+            with contextlib.suppress(OSError):
+                self.clear_restart_history()
         if action in {'start', 'restart', 'boot'}:
             if action == 'restart' and self.system.running():
                 stored, checksum = self._stored_backup(verify=False)
                 if stored and (self._backup_read(self.backup_marker) or b'').strip() != checksum.encode():
-                    # Stop the old writer before applying newly restored intent.
+                    # Stop the old writer before applying newly restored intent;
+                    # this stop is meant too, whatever the restore then does.
+                    with contextlib.suppress(OSError):
+                        self.disarm_restart()
                     self.system.stop_watch()
                     self.system.stop()
             self._restore_for_start()
@@ -4286,25 +4989,19 @@ class Manager:
                 # address, and every DHCPv6 renewal would otherwise reset all
                 # proxied connections.
                 return {"running": True}
-            if action in {"restart", "wan-restart"} and self.system.running():
+            if action == 'wan-restart':
+                # newwanip runs this with nobody watching, and here the core
+                # runs: a stop and start that leaves it down is restarted.
+                try:
+                    if self.system.running():
+                        self.stop(settings)
+                    return self._start_or_resume(settings)
+                except (Error, OSError, ValueError, TypeError, KeyError) as error:
+                    self.restart_failed_cycle(settings, RESTART_CYCLE_WAN, error)
+                    raise
+            if action == "restart" and self.system.running():
                 self.stop(settings)
-            if self.system.running():
-                self.system.watch()
-                # A configuration that no longer parses fails here, as it
-                # always has, instead of reading as a request for nothing.
-                parse_yaml(self.config_file.read_bytes())
-                # Nothing is applied here, so what the last start published
-                # stands; the request alone cannot say whether a validating
-                # resolver declined it. Without a published value the request
-                # is reported, because a false positive costs the crash rescue
-                # one harmless restoration and a false negative skips it.
-                stored = None
-                with contextlib.suppress(OSError, ValueError):
-                    published = json.loads(self.status_file.read_bytes())
-                    if isinstance(published, dict) and 'dns_active' in published:
-                        stored = bool(published['dns_active'])
-                return self.publish_status(settings, self.applied_dns_requested(settings) and stored is not False)
-            return self.start(settings)
+            return self._start_or_resume(settings)
         if action == "status":
             try:
                 status = json.loads(self.status_file.read_bytes())
@@ -4312,6 +5009,26 @@ class Manager:
                 status = {}
             return self.publish_status(settings, bool(status.get("dns_active")), error=status.get('error', ''))
         raise Error("Unknown action.")
+
+    def _start_or_resume(self, settings):
+        """Start the core, or, when it already runs, make sure its watchdog does and republish."""
+        if self.system.running():
+            self.system.watch()
+            # A configuration that no longer parses fails here, as it
+            # always has, instead of reading as a request for nothing.
+            parse_yaml(self.config_file.read_bytes())
+            # Nothing is applied here, so what the last start published
+            # stands; the request alone cannot say whether a validating
+            # resolver declined it. Without a published value the request
+            # is reported, because a false positive costs the crash rescue
+            # one harmless restoration and a false negative skips it.
+            stored = None
+            with contextlib.suppress(OSError, ValueError):
+                published = json.loads(self.status_file.read_bytes())
+                if isinstance(published, dict) and 'dns_active' in published:
+                    stored = bool(published['dns_active'])
+            return self.publish_status(settings, self.applied_dns_requested(settings) and stored is not False)
+        return self.start(settings)
 
 
 def main():
@@ -4324,6 +5041,16 @@ def main():
         print("Mihomo state changes require root privileges.", file=sys.stderr)
         return 1
     manager = Manager()
+    if args.action == 'reopen-log':
+        # newsyslog(8) runs this from cron after it rotates mihomo.log. It
+        # takes no manager lock, which a start can hold for a minute, prints
+        # nothing when it succeeds, and succeeds when nothing runs.
+        try:
+            manager.system.reopen_logs()
+        except (Error, OSError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if args.action == "watch":
         reported = None
         while True:

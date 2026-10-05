@@ -90,6 +90,7 @@ elif args[0]!='info':
         for name in ('usr/local/bin/mihomo', 'usr/bin/mihomo_sub', 'usr/local/etc/rc.d/mihomo',
                      'usr/local/etc/rc.syshook.d/start/16-mihomo',
                      'usr/local/opnsense/scripts/mihomo/mihomo.py',
+                     'usr/local/opnsense/scripts/mihomo/reopen_log.sh',
                      'usr/local/opnsense/scripts/mihomo/setup_unbound.php'):
             path = self.project / 'src' / name
             path.parent.mkdir(parents=True, exist_ok=True)

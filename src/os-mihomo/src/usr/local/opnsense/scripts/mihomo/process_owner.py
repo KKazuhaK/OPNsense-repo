@@ -29,6 +29,12 @@ CORE_JOURNAL = STATE + '/process-identity.json'
 WATCH_PARENT_PID = '/var/run/mihomo-watch.pid'
 WATCH_CHILD_PID = '/var/run/mihomo-watch-child.pid'
 WATCH_JOURNAL = STATE + '/watch-process-identity.json'
+# Which supervisor was started with daemon -H, and so reopens its output file
+# on SIGHUP instead of exiting. A supervisor without -H dies from SIGHUP and
+# leaves its child writing into a pipe nobody reads, so only the one named
+# here, still alive and still the journal's parent, is ever signalled.
+CORE_REOPEN = STATE + '/log-reopen.json'
+WATCH_REOPEN = STATE + '/watch-log-reopen.json'
 # The core's loopback listener for PF-redirected transparent TCP. Both the
 # config renderer and the routing adapter must agree on it exactly.
 REDIRECT_LISTENER = 'opnsense-transparent-tcp'
@@ -150,7 +156,7 @@ def kernel_boot():
 class ProcessGroup:
     def __init__(self, tag, parent_pid, child_pid, journal, child_executable,
                  child_argv, process_reader=None, signaler=None, sleeper=None,
-                 boot_reader=None):
+                 boot_reader=None, reopen=None):
         self.tag = tag
         self.parent_pid = Path(parent_pid)
         self.child_pid = Path(child_pid)
@@ -161,6 +167,7 @@ class ProcessGroup:
         self.signaler = signaler or os.kill
         self.sleeper = sleeper or time.sleep
         self.boot_reader = boot_reader or kernel_boot
+        self.reopen = Path(reopen) if reopen is not None else None
         self._live_boot = None
 
     def live_boot(self):
@@ -334,13 +341,54 @@ class ProcessGroup:
         # discover() performs snapshot-checked journal and PID cleanup.
         self.discover(adopt=False)
 
+    def mark_reopenable(self, record):
+        """Remember that the supervisor of record, as just started, runs with daemon -H.
+
+        Its kernel title does not show the flag, so this marker, written by
+        the code that passed it, is the only proof reopen_output() accepts.
+        """
+        parent = stable(record.get('parent')) if isinstance(record, dict) else None
+        if self.reopen is None or not self.parent_matches(parent):
+            raise OwnershipError('The Mihomo supervisor identity could not be recorded.')
+        marker = {'version': 1, 'tag': self.tag, 'parent': parent}
+        atomic(self.reopen, (json.dumps(marker, sort_keys=True) + '\n').encode())
+
+    def reopen_output(self):
+        """Have the supervisor reopen its output file after a rotation; whether it was asked.
+
+        Only a supervisor the marker names, which is still alive and still the
+        parent the ownership journal records, is signalled. Anything older --
+        a supervisor started before the marker existed, by a release without
+        -H -- is left alone: SIGHUP would end it instead.
+        """
+        if self.reopen is None:
+            return False
+        try:
+            content, _ = secure_read(self.reopen)
+        except FileNotFoundError:
+            return False
+        try:
+            marker = json.loads(content)
+        except (UnicodeError, ValueError, TypeError) as error:
+            raise OwnershipError('The Mihomo log reopen marker is invalid.') from error
+        if (not isinstance(marker, dict) or set(marker) != {'version', 'tag', 'parent'}
+                or marker.get('version') != 1 or marker.get('tag') != self.tag
+                or not self.parent_matches(marker.get('parent'))):
+            raise OwnershipError('The Mihomo log reopen marker is invalid.')
+        record, _ = self.load()
+        if record is None or stable(record['parent']) != stable(marker['parent']):
+            return False
+        # send() proves the identity again immediately before the signal.
+        return self.send(record['parent'], signal.SIGHUP)
+
 
 def core_group(root='/', process_reader=None, signaler=None, sleeper=None, config=CONFIG):
     return ProcessGroup(
         'mihomo', rooted(root, CORE_PARENT_PID), rooted(root, CORE_CHILD_PID),
         rooted(root, CORE_JOURNAL), CORE,
         [CORE, '-d', str(rooted(root, HOME)), '-f', str(rooted(root, config))],
-        process_reader=process_reader, signaler=signaler, sleeper=sleeper)
+        process_reader=process_reader, signaler=signaler, sleeper=sleeper,
+        reopen=rooted(root, CORE_REOPEN))
 
 
 def watch_group(root='/', process_reader=None, signaler=None, sleeper=None):
@@ -348,4 +396,4 @@ def watch_group(root='/', process_reader=None, signaler=None, sleeper=None):
         'mihomo-watch', rooted(root, WATCH_PARENT_PID), rooted(root, WATCH_CHILD_PID),
         rooted(root, WATCH_JOURNAL), PYTHON,
         [PYTHON, str(rooted(root, SCRIPT)), 'watch'], process_reader=process_reader,
-        signaler=signaler, sleeper=sleeper)
+        signaler=signaler, sleeper=sleeper, reopen=rooted(root, WATCH_REOPEN))

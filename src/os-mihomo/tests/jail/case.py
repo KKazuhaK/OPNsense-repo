@@ -430,6 +430,37 @@ assert ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/dots/dot[@u
 assert_host_dns_restored()
 recovery_seconds = time.monotonic() - started
 passed('Actual SIGKILL clears owned capture rules, restores private native defaults and removes TUN while native DNS remains usable')
+
+
+def restarted_core():
+    """Whether a core other than the killed one runs, as the status action sees it once the watchdog's tick ends."""
+    try:
+        return running() and int(Path('/var/run/mihomo-child.pid').read_text()) != pid
+    except (OSError, ValueError):
+        return False
+
+
+# Nobody stopped that core, so the watchdog starts it again ten seconds after
+# it noticed the exit, through the start action's own path.
+wait_for(restarted_core, 60, 'The watchdog did not restart a core that exited without a stop')
+automatic_restart_seconds = time.monotonic() - started
+status = action('status')['result']
+assert status['running'] and status['routing_active'] and status['error'] == '', status
+assert status['last_restart']['reason'] == 'exited unexpectedly', status
+assert status['restart_note'].endswith('(exited unexpectedly).'), status
+restart_log = Path('/var/log/mihomo.log').read_text()
+assert 'Mihomo stopped (exited unexpectedly); restarting it automatically in 10 seconds.' in restart_log
+assert 'Mihomo restarted automatically.' in restart_log
+assert_private_routing(True)
+assert_core_host_dns_marker()
+# The resident size the status reads from kern.proc.pid is the one ps reports.
+restarted_pid = int(Path('/var/run/mihomo-child.pid').read_text())
+resident = int(command(['/bin/ps', '-o', 'rss=', '-p', str(restarted_pid)]).stdout) * 1024
+assert isinstance(status['core_memory'], int) and abs(status['core_memory'] - resident) <= max(resident // 5, 8 << 20), \
+    (status['core_memory'], resident)
+physical = int(command(['/sbin/sysctl', '-n', 'hw.physmem']).stdout)
+assert status['core_memory_limit'] == physical // 2, status
+passed('The watchdog restarts a core that exited without a stop, with capture and DNS as after Start')
 action('start')
 action('disable-transparent')
 assert ET.parse('/conf/config.xml').find('./filter/rule') is None
@@ -515,6 +546,9 @@ assert not command(['/sbin/pfctl', '-a', 'mihomo', '-sn']).stdout.strip()
 assert '127.0.0.1:1053 (' not in command(['/sbin/pfctl', '-ss', '-vv']).stdout.decode()
 status = action('status')['result']
 assert status['running'] is False and status['dns_redirect'] is False, status
+# The watchdog restarts the core ten seconds after it noticed the exit; the
+# Start below comes first and makes that restart itself.
+assert 'is restarted automatically at about' in status['error'], status
 assert not health.exists()
 assert not zone.exists() and ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/forwarding/enabled') == '1'
 passed('Actual SIGKILL withdraws the DNS redirect and its states; the listed client is answered by Unbound again')
@@ -793,6 +827,7 @@ passed('Actual fresh package installation starts proxy ports without TUN or DNS 
 assert_private_routing(False)
 report = {'ok': True, 'checks': checks, 'package_sha256': hashlib.sha256(Path('/root/new.pkg').read_bytes()).hexdigest(),
           'package_version': new_manifest['version'], 'crash_recovery_seconds': round(recovery_seconds, 3),
+          'automatic_restart_seconds': round(automatic_restart_seconds, 3),
           'unbound_dnssec': dnssec, 'dns_redirect_seconds': dns_redirect_seconds, 'ipv6_scope_seconds': ipv6_seconds,
           'cold_numeric_gateway_cycle': {'routes': list(gateway_cycle.values()),
                                          'interface': 'lo2', 'active_and_stopped_copy_verified': True},

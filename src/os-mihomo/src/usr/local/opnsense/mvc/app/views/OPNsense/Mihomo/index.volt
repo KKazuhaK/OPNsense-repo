@@ -57,6 +57,12 @@ $(function () {
         $(window).scrollTop(0);
     }
 
+    /* Byte counts as the backend's log writes them. */
+    function size(bytes) {
+        return bytes >= 1073741824 ? (bytes / 1073741824).toFixed(1) + ' GB'
+            : Math.floor(bytes / 1048576) + ' MB';
+    }
+
     /* The framework HTML-escapes every array response on the way out, so a
        value is only intact once it is decoded on arrival. Decoding the whole
        response in one place rather than at each element is the difference
@@ -377,6 +383,18 @@ $(function () {
             state = state || {};
             $('#mihomo-service').attr('class', 'label label-' + (state.running ? 'success' : 'default'))
                 .text(state.running ? '{{ lang._('Running') }}' : '{{ lang._('Stopped') }}');
+            /* The core's resident memory beside the size the watchdog restarts
+               it above, and when and why it last restarted the core itself. */
+            const serviceNotes = [];
+            if (typeof state.core_memory === 'number') {
+                serviceNotes.push('{{ lang._('Core memory: %s') }}'.replace('%s', size(state.core_memory))
+                    + (typeof state.core_memory_limit === 'number'
+                       ? ' ' + '{{ lang._('(restarted above %s)') }}'.replace('%s', size(state.core_memory_limit)) : ''));
+            }
+            if (state.restart_note) {
+                serviceNotes.push(state.restart_note);
+            }
+            $('#mihomo-service-note').text(serviceNotes.join(' '));
             const routed = state.routing_active === true;
             $('#mihomo-transparent').attr('class', 'label label-' + (routed ? 'success' : 'default'))
                 .text(routed ? '{{ lang._('Active') }}' : '{{ lang._('Off') }}');
@@ -514,7 +532,7 @@ $(function () {
                     </td></tr>
             </thead>
             <tbody>
-                <tr><td>{{ lang._('Service') }}</td><td><span id="mihomo-service" class="label label-default">-</span></td></tr>
+                <tr><td>{{ lang._('Service') }}</td><td><span id="mihomo-service" class="label label-default">-</span> <small id="mihomo-service-note" class="text-muted"></small></td></tr>
                 <tr><td>{{ lang._('Transparent routing') }}</td><td><span id="mihomo-transparent" class="label label-default">-</span></td></tr>
                 <tr><td>{{ lang._('DNS integration') }}</td><td><span id="mihomo-dns" class="label label-default">-</span> <small id="mihomo-dns-note" class="text-muted"></small></td></tr>
                 <tr><td>{{ lang._('Fast TCP path') }}</td><td><span id="mihomo-tcp-redirect" class="label label-default">-</span> <small id="mihomo-tcp-redirect-note" class="text-muted"></small></td></tr>
@@ -528,6 +546,7 @@ $(function () {
                         <div class="help-block">{{ lang._('Stop the service before repairing an edited saved backup. Repair validates and imports its saved configuration, then updates its checksum.') }}</div>
                         <div class="hidden" data-for="help_for_service">
                             {{ lang._('Starts or stops the proxy core. Installation and upgrades start proxy ports only; the router keeps its own routing and DNS until transparent routing is enabled below.') }}
+                            {{ lang._('When the core exits without a Stop, or its memory passes half of the router\'s, the watchdog restarts it, at most three times an hour; after that it waits for Start.') }}
                         </div>
                     </td>
                 </tr>

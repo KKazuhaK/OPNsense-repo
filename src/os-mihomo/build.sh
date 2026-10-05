@@ -35,6 +35,7 @@ chmod 0755 "$STAGEDIR/usr/local/bin/mihomo" "$STAGEDIR/usr/bin/mihomo_sub" \
     "$STAGEDIR/usr/local/etc/rc.d/mihomo" \
     "$STAGEDIR/usr/local/etc/rc.syshook.d/start/16-mihomo" \
     "$STAGEDIR/usr/local/opnsense/scripts/mihomo/mihomo.py" \
+    "$STAGEDIR/usr/local/opnsense/scripts/mihomo/reopen_log.sh" \
     "$STAGEDIR/usr/local/opnsense/scripts/mihomo/setup_unbound.php"
 
 # User state and runtime configuration are deliberately absent from the package.

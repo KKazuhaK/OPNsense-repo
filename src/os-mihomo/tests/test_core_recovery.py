@@ -891,12 +891,20 @@ class ConfigCacheTests(RecoveryCase):
         data['rules'] = pins + data['rules']
         m.atomic_write(self.manager.config_file, m.yaml.safe_dump(data).encode())
         with mock.patch.object(self.manager, 'router_context', return_value=('forward-addr: 192.0.2.53@853\n', False)), \
-                mock.patch.object(m, 'parse_yaml', wraps=m.parse_yaml) as parse, \
                 mock.patch.object(self.manager, 'apply') as apply:
-            for _ in range(4):
-                self.tick()
+            with mock.patch.object(m, 'parse_yaml', wraps=m.parse_yaml) as parse:
+                for _ in range(4):
+                    self.tick()
+            # UFS with soft updates settles the change time of the renamed
+            # file a few milliseconds after the rename, so the first tick
+            # after a rewrite may parse it once more; the ticks after that
+            # must not parse it at all.
+            self.assertLessEqual(self.config_parses(parse.call_args_list), 2)
+            with mock.patch.object(m, 'parse_yaml', wraps=m.parse_yaml) as parse:
+                for _ in range(4):
+                    self.tick()
         apply.assert_not_called()
-        self.assertEqual(1, self.config_parses(parse.call_args_list))
+        self.assertEqual(0, self.config_parses(parse.call_args_list))
 
     def test_the_backup_mirror_parses_the_subscription_once_per_version(self):
         # The mirror runs on every tick, router DNS or not; the subscription

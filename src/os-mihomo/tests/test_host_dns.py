@@ -88,7 +88,10 @@ class HostDNSRecoveryTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, b'OK', b'')
         if args == ['/usr/sbin/service', 'sing-box', 'onestatus']:
             return subprocess.CompletedProcess(args, 1, b'', b'')
+        if args == ['/sbin/sysctl', '-n', 'hw.physmem']:
+            return subprocess.CompletedProcess(args, 0, b'4294967296\n', b'')
         if args[0] == '/usr/sbin/daemon':
+            self.daemon_environment = options.get('env')
             self.alive, self.present = True, True
             self.resolver.write_bytes(b'search localdomain\nnameserver 198.18.0.2\n')
             return subprocess.CompletedProcess(args, 0, b'', b'')
@@ -223,6 +226,14 @@ class HostDNSRecoveryTests(unittest.TestCase):
                 mock.patch.object(self.system, '_core_group', return_value=owned):
             self.system.start(candidate, transparent=True)
         self.assertTrue(self.alive)
+        # The supervisor reopens the log on SIGHUP, and the core starts with
+        # Go's soft memory limit: 30% of these 4 GiB.
+        daemon = next(command for command in self.commands if command[0] == '/usr/sbin/daemon')
+        self.assertEqual(['/usr/sbin/daemon', '-H', '-P', m.DAEMON_PID, '-p', m.PID, '-f', '-o', '/var/log/mihomo.log'],
+                         daemon[:9])
+        self.assertEqual('1228MiB', self.daemon_environment['GOMEMLIMIT'])
+        self.assertEqual(os.environ.get('PATH'), self.daemon_environment.get('PATH'))
+        owned.mark_reopenable.assert_called_once_with({'owned': True})
         self.assertTrue(self.pending.exists())
         self.assertEqual(stat.S_IMODE(self.pending.stat().st_mode), 0o600)
         self.assertEqual(self.reload_count(), 0)

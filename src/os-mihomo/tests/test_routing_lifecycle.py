@@ -677,16 +677,23 @@ class CapturedDnsHealthTests(unittest.TestCase):
                 self.assertTrue(self.armed(self.tick()))
                 self.system.alive = False
                 self.system.events.clear()
+                lines = len(self.log())
                 status = self.tick()
                 self.assertEqual(['routing-disable', 'destroy-tun'], self.system.events)
                 self.assertFalse(status['dns_redirect'])
                 self.assertFalse(self.manager.dns_redirect_armed())
                 self.assertFalse(self.manager.dns_health_file.exists())
-                self.assertTrue(self.log()[-1].endswith(m.DNS_WITHDRAWN_LOG % 'Mihomo exited'))
+                # The withdrawal is logged first, then the restart it is
+                # followed by once the rescue is done.
+                logged = self.log()[lines:]
+                self.assertEqual(2, len(logged), logged)
+                self.assertTrue(logged[0].endswith(m.DNS_WITHDRAWN_LOG % 'Mihomo exited'))
+                self.assertTrue(logged[1].endswith(m.RESTART_SCHEDULED_LOG % (m.EXIT_UNEXPECTED, 10)))
                 self.assertNotIn('dns-on', self.system.events)
-                # A later tick finds nothing more to withdraw or log.
+                # A later tick, before the restart is due, finds nothing more
+                # to withdraw or log.
                 lines = len(self.log())
-                self.tick()
+                self.tick(seconds=4)
                 self.assertEqual(lines, len(self.log()))
         previous = self.system.identity
         self.manager.dispatch('start')

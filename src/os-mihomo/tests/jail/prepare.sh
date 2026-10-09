@@ -24,6 +24,9 @@ cp -L "/usr/local/bin/$target_python" "$jail_root/usr/local/bin/python3"
 for name in php curl; do cp -L "/usr/local/bin/$name" "$jail_root/usr/local/bin/$name"; done
 mkdir -p "$jail_root/usr/sbin"
 cp -L /usr/sbin/daemon "$jail_root/usr/sbin/"
+# The stale-connection scan drops held client sockets with tcpdrop; the case
+# drops one of its own loopback sockets with it.
+cp -L /usr/sbin/tcpdrop "$jail_root/usr/sbin/"
 cp -a /etc/rc.subr "$jail_root/etc/"
 cp -L /usr/local/sbin/pkg-static "$jail_root/usr/local/sbin/pkg"
 cp -L /usr/local/sbin/unbound "$jail_root/usr/local/sbin/"
@@ -80,7 +83,7 @@ for required in script/load_phalcon.php app/config/AppConfig.php app/config/conf
     [ -f "$jail_root/usr/local/opnsense/mvc/$required" ] || { echo "Missing native framework: $required" >&2; exit 1; }
 done
 printf '%s\n' 'include_path="/usr/local/etc/inc:/usr/local/opnsense/mvc"' 'memory_limit=1G' 'date.timezone=UTC' 'display_errors=stderr' 'html_errors=Off' > "$jail_root/usr/local/etc/php.ini"
-for binary in "/usr/local/bin/$target_python" /usr/local/bin/php /usr/local/bin/curl /usr/local/sbin/unbound /usr/local/sbin/unbound-checkconf /usr/bin/awk /usr/bin/sed /usr/bin/date /usr/bin/pkill /usr/bin/pgrep /usr/bin/install /usr/bin/tar /usr/bin/netstat /usr/bin/sockstat /sbin/pfctl /usr/local/lib/php/*/*.so /usr/local/lib/python"$python_version"/lib-dynload/*.so; do
+for binary in "/usr/local/bin/$target_python" /usr/local/bin/php /usr/local/bin/curl /usr/local/sbin/unbound /usr/local/sbin/unbound-checkconf /usr/bin/awk /usr/bin/sed /usr/bin/date /usr/bin/pkill /usr/bin/pgrep /usr/bin/install /usr/bin/tar /usr/bin/netstat /usr/bin/sockstat /usr/sbin/tcpdrop /sbin/pfctl /usr/local/lib/php/*/*.so /usr/local/lib/python"$python_version"/lib-dynload/*.so; do
   [ -f "$binary" ] || continue
   ldd -f '%p\n' "$binary" 2>/dev/null | while read -r library; do
     case "$library" in /*) mkdir -p "$jail_root$(dirname "$library")"; [ -f "$jail_root$library" ] || cp -L "$library" "$jail_root$library" ;; esac

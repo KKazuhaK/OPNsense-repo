@@ -7,6 +7,7 @@ import copy
 import fcntl
 import gzip
 import hashlib
+import http.client
 import io
 import ipaddress
 import json
@@ -154,6 +155,63 @@ MEMORY_PAUSED_LOG = ('Mihomo uses %s of memory, above the restart limit of %s, b
                      'paused.')
 MEMORY_WAIT_LOG = ('Mihomo uses %s of memory, above the restart limit of %s; an automatic restart was made '
                    '%d seconds ago, so it is restarted in about %d seconds if it is still above the limit then.')
+# The core's relay can hold fast TCP path connections long after their client
+# has gone. It copies each direction until EOF, half-closes the side that
+# copy wrote to and then waits for the opposite copy without a deadline, so a
+# pair whose second direction never ends keeps both of its sockets open for
+# good. Which direction ended first decides what ends the wait:
+# - The client finished: its socket on the redirect listener is in CLOSE_WAIT,
+#   or CLOSED once the client reset it, and the relay reads the server side.
+#   Closing the connection through the controller closes that side and ends
+#   the relay.
+# - The core finished toward the client: its FIN was acknowledged, so the
+#   client socket is in FIN_WAIT_2, and the relay reads the client socket. The
+#   controller's close does not reach that read; it closes the server side and
+#   stops listing the connection, whose client socket then stays held unseen.
+#   Dropping the client socket in the kernel with tcpdrop(8) ends the read and
+#   the relay.
+# The watchdog matches the core's connections to the kernel's sockets on the
+# listener at most once every STALE_INTERVAL seconds of the system-wide
+# monotonic clock. A client socket in CLOSED has its connections closed at
+# once and one in CLOSE_WAIT once STALE_IDLE seconds pass without a byte
+# moving; a FIN_WAIT_2 socket is dropped once it has stayed so for STALE_IDLE
+# seconds, without a byte moving on any connection listed for it. The count
+# of the running core is kept in /var/run for every status.
+STALE_FILE = '/var/run/mihomo-stale-connections.json'
+STALE_INTERVAL = 60
+STALE_IDLE = 300
+# Client sockets whose client finished first; the controller closes their
+# connections.
+STALE_CLIENT_DONE_STATES = frozenset(('CLOSED', 'CLOSE_WAIT'))
+# A client socket the core finished toward, which tcpdrop drops. Only a
+# CLOSED socket may share its endpoint: the kernel has already taken that one
+# out of the table tcpdrop looks a four-tuple up in, so the drop can only
+# reach the FIN_WAIT_2 socket. Any other state beside it, and every other
+# state on its own, ESTABLISHED above all, is never acted on.
+STALE_HELD_STATE = 'FIN_WAIT_2'
+STALE_HELD_STATES = frozenset((STALE_HELD_STATE, 'CLOSED'))
+# Seconds one scan may spend dropping and closing; what is left waits for the
+# next scan, so the watchdog's own checks are not held up behind a long
+# backlog.
+STALE_CLOSE_BUDGET = 5
+# FreeBSD's tool for dropping one TCP socket named by its four-tuple, and how
+# long one call may take.
+TCPDROP = '/usr/sbin/tcpdrop'
+STALE_DROP_TIMEOUT = 5
+# The controller's list is read up to this size, with this long a wait for
+# each read: Mihomo encodes even 50000 connections well within it, and a
+# controller that does not answer holds the tick up no longer than that.
+STALE_LIST_LIMIT = 64 * 1024 * 1024
+STALE_LIST_TIMEOUT = 5
+# Only these keys of the list's objects are kept while it is parsed: the
+# response itself, every connection and its metadata.
+CONNECTION_FIELDS = frozenset(('connections', 'id', 'metadata', 'upload', 'download',
+                               'network', 'type', 'sourceIP', 'sourcePort', 'inboundPort'))
+NETSTAT_LIMIT = 64 * 1024 * 1024
+STALE_LOG = ('Closed %d stale connections of the fast TCP path (%d whose client had closed, %d half-closed '
+             'and idle for 5 minutes, %d held open by a client that never closed).')
+STALE_DEFERRED_LOG = ' %d more are closed at the next scan.'
+STALE_FAILED_LOG = 'Closing stale connections of the fast TCP path failed (%s); the next scan follows in a minute.'
 # A firewall state table this large is not read for a status hint.
 STATE_TABLE_LIMIT = 64 * 1024 * 1024
 UNBOUND_GENERATED = '/var/unbound/etc/zz-mihomo.conf'
@@ -193,6 +251,21 @@ class Error(Exception):
 
 class BackupIntegrityError(Error):
     pass
+
+
+# tcpdrop found no socket for the four-tuple (ESRCH): the socket netstat
+# listed ended before the drop reached it, as when its client finally sends
+# its FIN or a reset. The scan skips it instead of failing; see
+# Manager.reap_stale_connections().
+class NoSuchSocketError(Error):
+    pass
+
+
+# What a scan for stale fast TCP path connections may meet from the
+# controller, netstat or an answer neither gave as expected; none of it may
+# end the watchdog's tick.
+STALE_FAILURES = (Error, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RuntimeError,
+                  http.client.HTTPException)
 
 
 def bounded_routing_diagnostic(value):
@@ -1384,6 +1457,174 @@ def resident_bytes(raw, pid):
     return pages * os.sysconf('SC_PAGE_SIZE') if pages >= 0 else None
 
 
+def ipv4_endpoint(address, port):
+    """An IPv4 address and a TCP port as one client endpoint, (dotted address, port), or None.
+
+    An IPv4-mapped IPv6 address counts as its IPv4 address; any other
+    IPv6 address, a port outside 1-65535 or anything unparseable is None.
+    """
+    if isinstance(port, str) and re.fullmatch(r'[0-9]{1,5}', port):
+        port = int(port)
+    if type(port) is not int or not 0 < port < 65536 or not isinstance(address, str):
+        return None
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    if parsed.version == 6:
+        parsed = parsed.ipv4_mapped
+    return (str(parsed), port) if parsed is not None else None
+
+
+def listener_sockets(output, port):
+    """The kernel's TCP sockets on 127.0.0.1:port in `netstat -an -p tcp` output, by client endpoint.
+
+    FreeBSD prints an IPv4 endpoint as a.b.c.d.port. A line counts only when
+    it has the protocol, both queue sizes, the local endpoint exactly
+    127.0.0.1.port and an IPv4 client endpoint; the listener's own LISTEN
+    line, headers, other sockets and IPv6 are skipped. The value is the set
+    of states the endpoint's sockets are in: an old socket the core still
+    holds can share its endpoint with a new one. A state that is missing or
+    unknown is kept as it reads, so it holds the endpoint back like any
+    state the caller does not act on.
+    """
+    local = '127.0.0.1.%d' % port
+    sockets = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if (len(fields) < 5 or not fields[0].startswith('tcp') or fields[3] != local
+                or not re.fullmatch(r'[0-9]+', fields[1]) or not re.fullmatch(r'[0-9]+', fields[2])):
+            continue
+        address, separator, client_port = fields[4].rpartition('.')
+        endpoint = ipv4_endpoint(address, client_port) if separator and ':' not in address else None
+        if endpoint is not None:
+            sockets.setdefault(endpoint, set()).add(fields[5] if len(fields) > 5 else '')
+    return sockets
+
+
+def listener_listed(output, port):
+    """Whether `netstat -an -p tcp` output has the LISTEN line of 127.0.0.1:port itself.
+
+    The line is the protocol, both queue sizes, the local endpoint exactly
+    127.0.0.1.port, the foreign endpoint *.* and the state LISTEN; one on
+    every address (*.port) or on another port does not count.
+    """
+    pattern = r'^tcp\S*[ \t]+[0-9]+[ \t]+[0-9]+[ \t]+127\.0\.0\.1\.%d[ \t]+\*\.\*[ \t]+LISTEN[ \t]*$' % port
+    return re.search(pattern, output, re.MULTILINE) is not None
+
+
+def fast_path_connections(listed, port):
+    """The fast TCP path's connections in the controller's GET /connections answer: (id, endpoint, bytes).
+
+    Only TCP from a Redir inbound counts, and, where the core names the
+    inbound's port, only one on the redirect port: an administrator's own
+    redir listener is not the plugin's. Entries without a usable id, client
+    endpoint or byte counters are left out. Raises ValueError when the
+    answer is not a connection list; Mihomo answers null for none.
+    """
+    if not isinstance(listed, dict) or 'connections' not in listed:
+        raise ValueError('the answer holds no connection list')
+    entries = listed['connections']
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise ValueError('the answer holds no connection list')
+    connections = []
+    for entry in entries:
+        metadata = entry.get('metadata') if isinstance(entry, dict) else None
+        if (not isinstance(metadata, dict) or metadata.get('type') != 'Redir'
+                or metadata.get('network') != 'tcp'):
+            continue
+        inbound = metadata.get('inboundPort')
+        if isinstance(inbound, str) and re.fullmatch(r'[0-9]{1,5}', inbound):
+            inbound = int(inbound)
+        if type(inbound) is int and inbound not in (0, port):
+            continue
+        ident, upload, download = entry.get('id'), entry.get('upload'), entry.get('download')
+        endpoint = ipv4_endpoint(metadata.get('sourceIP'), metadata.get('sourcePort'))
+        if (not isinstance(ident, str) or not re.fullmatch(r'[0-9A-Za-z-]{1,64}', ident) or endpoint is None
+                or type(upload) is not int or type(download) is not int or upload < 0 or download < 0):
+            continue
+        connections.append((ident, endpoint, upload + download))
+    return connections
+
+
+def stale_connections(connections, sockets, seen, now):
+    """Which fast TCP path connections to close through the controller, and the half-closed ones still being watched.
+
+    connections are fast_path_connections() of a list read before sockets,
+    the listener_sockets() netstat gave after it: every connection in the
+    list then has its client socket among them, under its endpoint, unless
+    the core has let go of it since. These are the connections whose client
+    finished first, so the relay waits on the server side, which the
+    controller's close ends. An endpoint whose sockets are all CLOSED is
+    over, and its connections are closed at once ('closed'). One whose
+    sockets are all in CLOSE_WAIT or CLOSED is watched by connection id: seen
+    maps an id to when it was first found so and its upload plus download
+    then, and a connection is closed ('idle') once STALE_IDLE seconds have
+    passed with those bytes unchanged; a change starts the wait again. Any
+    other state on the endpoint holds every connection on it back:
+    ESTABLISHED may still be alive, and a FIN_WAIT_2 socket is
+    held_sockets()'s to drop, since closing its connection here would only
+    hide it. Returns the [(id, reason)] to close, those whose client closed
+    first, and the new seen, which forgets every id no longer half-closed or
+    listed.
+    """
+    closed, idle, watched = [], [], {}
+    for ident, endpoint, total in connections:
+        states = sockets.get(endpoint)
+        if not states or not states <= STALE_CLIENT_DONE_STATES:
+            continue
+        if states == {'CLOSED'}:
+            closed.append((ident, 'closed'))
+            continue
+        since, before = seen.get(ident, (now, total))
+        if before != total:
+            since = now
+        watched[ident] = (since, total)
+        if now - since >= STALE_IDLE:
+            idle.append((ident, 'idle'))
+    return closed + idle, watched
+
+
+def held_sockets(connections, sockets, held, now):
+    """Which client sockets in FIN_WAIT_2 to drop with tcpdrop, and those still being watched.
+
+    connections and sockets are as for stale_connections(). A FIN_WAIT_2
+    client socket means the core finished toward the client and its relay
+    reads the client socket, which only a drop in the kernel ends. Such a
+    socket is watched by its client endpoint, whether the controller still
+    lists a connection for it or not: a connection closed through the
+    controller, or forgotten by the core, leaves its socket held and
+    unlisted. held maps an endpoint to when it was first found so and the
+    upload plus download of the connections listed for it then, None while
+    none is. The endpoint is due once STALE_IDLE seconds have passed with
+    those bytes unchanged: a listed total that differs starts the wait
+    again, and a list that no longer names it keeps the wait, because the
+    core has then let go of its connection and nothing moves on it any more.
+    Only an endpoint whose sockets are FIN_WAIT_2, or FIN_WAIT_2 beside
+    CLOSED ones tcpdrop cannot reach, is watched (STALE_HELD_STATES), so an
+    endpoint is never both closed through the controller and dropped.
+    Returns the [endpoint] to drop and the new held, which forgets every
+    endpoint no longer in FIN_WAIT_2 or no longer listed by netstat.
+    """
+    totals = {}
+    for _, endpoint, total in connections:
+        totals[endpoint] = totals.get(endpoint, 0) + total
+    due, watched = [], {}
+    for endpoint, states in sockets.items():
+        if STALE_HELD_STATE not in states or not states <= STALE_HELD_STATES:
+            continue
+        total = totals.get(endpoint)
+        since, before = held.get(endpoint, (now, total))
+        if total is not None and total != before:
+            since, before = now, total
+        watched[endpoint] = (since, before)
+        if now - since >= STALE_IDLE:
+            due.append(endpoint)
+    return due, watched
+
+
 def atomic_write(path, content, mode=0o600, durable=True):
     """Replace path in one step; durable also forces the new content to disk first."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2439,6 +2680,64 @@ class System:
             return None
         return kernel_kill_reasons(result.stdout.decode(errors='replace'), pid)
 
+    def redirect_sockets(self, port):
+        """The kernel's TCP sockets on the loopback redirect listener, by client endpoint (listener_sockets()).
+
+        One netstat process; raises Error when it fails, prints more than
+        NETSTAT_LIMIT bytes or lists no LISTEN line of the listener itself
+        (listener_listed()), so a list it could not read never reads as
+        empty. Its exit status alone does not tell: when the kernel's socket
+        list or the memory for it cannot be had, netstat -p tcp only warns on
+        stderr and exits 0 having printed nothing, and that happens under
+        the memory pressure a leaking core brings. The listener's line is
+        always there in a complete list: the routing helper loads the
+        redirect only once it has found the running core bound to it.
+        """
+        result = self.run(['/usr/bin/netstat', '-an', '-p', 'tcp'], timeout=30, check=False)
+        if result.returncode:
+            raise Error('netstat exited with status %d' % result.returncode)
+        if len(result.stdout) > NETSTAT_LIMIT:
+            raise Error('netstat printed more than %d MB' % (NETSTAT_LIMIT // (1024 * 1024)))
+        output = result.stdout.decode(errors='replace')
+        if not listener_listed(output, port):
+            warning = result.stderr.decode(errors='replace').strip()
+            raise Error('netstat listed no listener on 127.0.0.1.%d%s' % (port, ': ' + warning if warning else ''))
+        return listener_sockets(output, port)
+
+    def drop_redirect_socket(self, port, endpoint):
+        """Drop the kernel's TCP socket between 127.0.0.1:port and a client endpoint with tcpdrop(8).
+
+        One tcpdrop process per socket. The kernel interface beneath it,
+        net.inet.tcp.drop, takes two sockaddr_storage structures in an order
+        only its C headers define; a mistake there could not be noticed off
+        FreeBSD, while tcpdrop is the base system's own tool for this and is
+        what released the held sockets on a router by hand. Its cost, one
+        process a socket, is bounded by the scan's budget, and a longer
+        backlog goes on at the next scan. Raises Error unless tcpdrop exits
+        0 and reports this very socket dropped, and NoSuchSocketError when
+        it exits 1 warning of ESRCH for this very socket: the kernel's lookup
+        by four-tuple found nothing, so the socket had already ended. tcpdrop
+        names the socket in its warning; the error keeps only the reason, so
+        a failure reads the same for every socket and is logged once.
+        """
+        address, client = endpoint
+        if ipv4_endpoint(address, client) != (address, client) or type(port) is not int or not 0 < port < 65536:
+            raise Error('tcpdrop takes only an IPv4 client endpoint on the redirect listener')
+        name = '127.0.0.1 %d %s %d' % (port, address, client)
+        result = self.run([TCPDROP, '127.0.0.1', str(port), address, str(client)], timeout=STALE_DROP_TIMEOUT,
+                          check=False)
+        if not result.returncode and name + ': dropped' in result.stdout.decode(errors='replace').splitlines():
+            return
+        stderr = result.stderr.decode(errors='replace')
+        warning = stderr.replace(name + ': ', '').replace('tcpdrop: ', '').strip()
+        if result.returncode:
+            message = 'tcpdrop exited with status %d%s' % (result.returncode, ': ' + warning if warning else '')
+            # warn(3) of the failed sysctl, which names exactly this socket.
+            if result.returncode == 1 and stderr.strip() == 'tcpdrop: %s: No such process' % name:
+                raise NoSuchSocketError(message)
+            raise Error(message)
+        raise Error('tcpdrop did not report the socket dropped')
+
 
 def fetch_subscription(url, user_agent, proxy="127.0.0.1:7891", run=subprocess.run, sleep=time.sleep):
     try:
@@ -2519,6 +2818,9 @@ class Manager:
         # Whether a start left the core running, and the automatic restarts
         # made for it; see RESTART_FILE.
         self.restart_file = self.path(RESTART_FILE)
+        # How many stale fast TCP path connections the watchdog closed for
+        # the running core; see STALE_FILE.
+        self.stale_file = self.path(STALE_FILE)
         # Probes are timed with the system-wide monotonic clock, which the
         # routing adapter, another process, reads the verdict's age with.
         self.clock = time.monotonic
@@ -2543,6 +2845,12 @@ class Manager:
         # looked, what at, how many looks in a row disagree with the scope in
         # force, and when a failed change may be tried again.
         self._reach = None
+        # The watchdog's scans for stale fast TCP path connections: when the
+        # last began, for which core, its half-closed connections and its
+        # FIN_WAIT_2 client sockets being watched, those of the latter
+        # tcpdrop found already gone, how many it closed, and the failure
+        # last logged.
+        self._stale = None
 
     def path(self, path):
         return self.root / path.lstrip("/")
@@ -2990,7 +3298,13 @@ class Manager:
             except (Error, OSError, ValueError, TypeError, UnicodeError, EOFError, zlib.error):
                 raise Error('The Mihomo configuration backup could not be restored; its saved copy was retained.') from None
 
-    def _proxy_api(self, method, path, payload=None):
+    def _proxy_api(self, method, path, payload=None, limit=2 * 1024 * 1024, timeout=2, fields=None):
+        """One request to the core's external controller, its answer parsed as JSON.
+
+        limit bounds what is read. fields, when given, keeps only those keys
+        of every object while the answer is parsed, so a long connection list
+        never holds all of its fields in memory at once.
+        """
         if self.root != Path('/'):
             return {'proxies': {}} if method == 'GET' else {}
         settings = self.settings()
@@ -3000,11 +3314,15 @@ class Manager:
             data=json.dumps(payload).encode() if payload is not None else None, method=method,
             headers={'Authorization': 'Bearer ' + settings['secret'], 'Content-Type': 'application/json'})
         opener = urlrequest.build_opener(urlrequest.ProxyHandler({}), LocalAPIHandler())
-        with opener.open(request, timeout=2) as response:
-            value = response.read(2 * 1024 * 1024 + 1)
-        if len(value) > 2 * 1024 * 1024:
-            raise ValueError()
-        return json.loads(value) if value else {}
+        with opener.open(request, timeout=timeout) as response:
+            value = response.read(limit + 1)
+        if len(value) > limit:
+            raise ValueError('the answer is larger than %d MB' % (limit // (1024 * 1024)))
+        if not value:
+            return {}
+        if fields is None:
+            return json.loads(value)
+        return json.loads(value, object_pairs_hook=lambda pairs: {key: item for key, item in pairs if key in fields})
 
     def proxy_tick(self):
         if not self.system.running():
@@ -3717,11 +4035,14 @@ class Manager:
         last = restart['last']
         restart_note = RESTART_NOTE % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last['time'])),
                                        last['reason']) if last else ''
-        core_memory = None
+        core_memory = stale_closed = None
         if running:
             usage = self.core_usage()
             if usage is not None and type(usage.get('resident')) is int:
                 core_memory = usage['resident']
+            # Counted for the core that runs now: a new core starts from 0.
+            if usage is not None and usage.get('core') is not None:
+                stale_closed = self.stale_closed(usage['core'])
         redirect_note = ''
         if settings.get('tcp_redirect') is True and routing_active and not tcp_redirect:
             redirect_note = ('TCP stays on the TUN: port %d is taken by another listener.' % REDIRECT_PORT
@@ -3740,6 +4061,7 @@ class Manager:
                   # No limit while held: the memory guard does not run then.
                   "core_memory": core_memory, "core_memory_limit": None if restart['held'] else
                       memory_restart_limit(self.physical_memory()),
+                  "stale_connections_closed": stale_closed,
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
                   "error": bounded_routing_diagnostic(error), "backup_warning": self.backup_warning_file.read_text()
                       if self.backup_warning_file.exists() else BACKUP_WARNING
@@ -4639,6 +4961,157 @@ class Manager:
             stored = stored if isinstance(stored, dict) else {}
             self.publish_status(settings, dns_active=bool(stored.get('dns_active')), error=stored.get('error') or '')
 
+    def stale_closed(self, core):
+        """How many stale connections the watchdog closed for this core (STALE_FILE); 0 for any other core.
+
+        The record names the core it counts for, so a new core reads 0 until
+        its own first closure replaces it; an unreadable record reads as 0.
+        """
+        try:
+            value = json.loads(self.stale_file.read_bytes())
+        except (OSError, ValueError):
+            return 0
+        if (not isinstance(value, dict) or set(value) != {'version', 'core', 'closed'} or value['version'] != 1
+                or dns_probe.core_identity(value['core']) != value['core'] or value['core'] != core
+                or type(value['closed']) is not int or not 0 <= value['closed'] < 2 ** 53):
+            return 0
+        return value['closed']
+
+    def tcp_redirect_armed(self, settings):
+        """Whether the routing adapter last reported the fast TCP path's redirect loaded on its own port."""
+        if not settings.get('transparent') or settings.get('tcp_redirect') is not True:
+            return False
+        with contextlib.suppress(OSError, ValueError):
+            routing = json.loads((self.state / 'routing-state.json').read_bytes())
+            return (isinstance(routing, dict) and routing.get('active') is True
+                    and type(routing.get('tcp_redirect_port')) is int
+                    and routing['tcp_redirect_port'] == REDIRECT_PORT)
+        return False
+
+    def reap_stale_connections(self, settings):
+        """Release the fast TCP path's connections whose client has gone; see STALE_FILE.
+
+        Runs at most once every STALE_INTERVAL seconds, only while the core
+        runs with proven ownership and the redirect is loaded: the TUN path
+        has no kernel socket per connection to consult. The controller's
+        list is read before netstat, so every connection in it already has
+        its client socket in netstat's list. Client sockets in FIN_WAIT_2 are
+        dropped with tcpdrop (held_sockets()), the connections of those in
+        CLOSE_WAIT or CLOSED closed through the controller
+        (stale_connections()). Both stop after STALE_CLOSE_BUDGET seconds in
+        all, and each at its own first failure; the rest waits for the next
+        scan. A socket tcpdrop no longer finds (NoSuchSocketError) ended
+        after netstat listed it, so it is skipped without counting it or
+        stopping the drops behind it, and waits from the start if it is in
+        FIN_WAIT_2 again; only a second miss on an endpoint netstat kept
+        listing in FIN_WAIT_2 in between is a failure. A scan that released
+        something logs one line with the count by reason, and a scan's
+        failures are logged together once, until a scan has none or they
+        change. Nothing here raises: this is housekeeping beside the
+        watchdog's own work, which must go on whatever the controller,
+        netstat or tcpdrop answer.
+        """
+        state = self._stale
+        if state is None:
+            state = self._stale = {'at': None, 'core': None, 'seen': {}, 'held': {}, 'vanished': set(), 'closed': 0,
+                                   'failure': None}
+        failures = []
+        stage = 'the scan could not run'
+        try:
+            usage = self.core_usage() or {}
+            core = usage.get('core')
+            reader = getattr(self.system, 'redirect_sockets', None)
+            dropper = getattr(self.system, 'drop_redirect_socket', None)
+            if core is None or reader is None or dropper is None or not self.tcp_redirect_armed(settings):
+                state.update(seen={}, held={}, vanished=set())
+                return
+            now = self.clock()
+            if state['at'] is not None and 0 <= now - state['at'] < STALE_INTERVAL:
+                return
+            state['at'] = now
+            if state['core'] != core:
+                # The ids, the sockets and the count belong to one core.
+                state.update(core=core, seen={}, held={}, vanished=set(), closed=self.stale_closed(core))
+            stage = 'the controller did not list the connections'
+            listed = self.proxy_api('GET', '/connections', limit=STALE_LIST_LIMIT, timeout=STALE_LIST_TIMEOUT,
+                                    fields=CONNECTION_FIELDS)
+            connections = fast_path_connections(listed, REDIRECT_PORT)
+            stage = 'netstat did not list the sockets'
+            sockets = reader(REDIRECT_PORT)
+            due, state['seen'] = stale_connections(connections, sockets, state['seen'], now)
+            drops, state['held'] = held_sockets(connections, sockets, state['held'], now)
+            # A missed endpoint is remembered only while netstat goes on
+            # listing it in FIN_WAIT_2; one that left is a new socket if it
+            # comes back.
+            state['vanished'] = {endpoint for endpoint in state['vanished'] if endpoint in state['held']}
+            stage = 'the scan could not finish'
+
+            def drop(endpoint):
+                try:
+                    dropper(REDIRECT_PORT, endpoint)
+                except NoSuchSocketError:
+                    # The socket ended between netstat and tcpdrop, which a
+                    # backlog dropped over the whole budget after one
+                    # listing makes likelier: nothing failed. A miss again
+                    # after netstat listed it in FIN_WAIT_2 for a whole new
+                    # wait means the kernel does not find what netstat
+                    # shows, a failure to be logged.
+                    if endpoint in state['vanished']:
+                        raise
+                    state['vanished'].add(endpoint)
+                    state['held'].pop(endpoint, None)
+                    return False
+                state['held'].pop(endpoint, None)
+                state['vanished'].discard(endpoint)
+                return True
+
+            def close(ident):
+                # Mihomo stops listing a connection it closed, so the next
+                # scan forgets its id.
+                self.proxy_api('DELETE', '/connections/' + urlparse.quote(ident, safe=''))
+                return True
+
+            # Drops go first, while netstat's listing is youngest: tcpdrop
+            # names a socket by its four-tuple, and the sooner it runs, the
+            # less chance a held socket has ended and its client reused the
+            # port meanwhile. A close names its connection by id. A failure
+            # of one kind stops only that kind: tcpdrop failing must not keep
+            # the controller from closing, nor the other way round.
+            counts, left, started = {'closed': 0, 'idle': 0, 'held': 0}, 0, self.clock()
+            for failed, act, work in (('tcpdrop did not drop a socket', drop,
+                                       [(endpoint, 'held') for endpoint in drops]),
+                                      ('the controller did not close a connection', close, due)):
+                for position, (key, reason) in enumerate(work):
+                    if self.clock() - started >= STALE_CLOSE_BUDGET:
+                        left += len(work) - position
+                        break
+                    try:
+                        released = act(key)
+                    except STALE_FAILURES as error:
+                        failures.append('%s: %s' % (failed, bounded_routing_diagnostic(error) or type(error).__name__))
+                        left += len(work) - position
+                        break
+                    if released:
+                        counts[reason] += 1
+            done = sum(counts.values())
+            if done:
+                state['closed'] += done
+                # Runtime state for the status, so not forced to disk; a record
+                # that cannot be written only leaves the status behind.
+                record = {'version': 1, 'core': core, 'closed': state['closed']}
+                with contextlib.suppress(OSError):
+                    atomic_write(self.stale_file, (json.dumps(record, sort_keys=True) + '\n').encode(), durable=False)
+                self.core_log(STALE_LOG % (done, counts['closed'], counts['idle'], counts['held'])
+                              + (STALE_DEFERRED_LOG % left if left else ''))
+        except STALE_FAILURES as error:
+            failures.append('%s: %s' % (stage, bounded_routing_diagnostic(error) or type(error).__name__))
+        failure = '; '.join(failures) or None
+        if failure is None:
+            state['failure'] = None
+        elif failure != state['failure']:
+            state['failure'] = failure
+            self.core_log(STALE_FAILED_LOG % failure)
+
     def watchdog_tick(self):
         # The memory guard and the status share one reading of the core's
         # usage per tick (core_usage()).
@@ -4832,6 +5305,9 @@ class Manager:
                     return self.publish_status(settings, active, error=routing_status_error(
                         'Transparent routing recovery failed and will be retried.', error))
                 self.observe_dns_redirect()
+                # After the refresh, whose routing state says whether the
+                # redirect is loaded; it never fails the tick.
+                self.reap_stale_connections(settings)
         if settings.get('router_dns'):
             upstreams, ipv6 = self.router_context(settings)
             data = self.applied_config()

@@ -1,0 +1,139 @@
+#!/bin/sh
+set -eu
+
+die() { echo "error: $*" >&2; exit 1; }
+restore_plugins=no
+case "$#:$*" in
+    0:) ;;
+    1:--restore-plugins) restore_plugins=yes ;;
+    *) die 'usage: client.sh [--restore-plugins]' ;;
+esac
+[ "$(id -u)" -eq 0 ] || die 'run this bootstrap as root on OPNsense'
+root="${KAZUHA_REPO_ROOT:-}"
+case "$root" in ''|/*) ;; *) die 'repository root must be absolute' ;; esac
+root="${root%/}"
+for tool in fetch pkg sha256 opnsense-version; do command -v "$tool" >/dev/null 2>&1 || die "missing $tool"; done
+series="$(opnsense-version -x)"
+case "$series" in [0-9][0-9].[17]) ;; *) die 'invalid OPNsense release series' ;; esac
+suffix="/$series"
+[ "$series" != '26.7' ] || suffix=''
+tmp_base="${TMPDIR:-/tmp}"
+work="$(mktemp -d "${tmp_base%/}/kazuha-bootstrap.XXXXXX")"
+changed=no
+committed=no
+keys="$root/usr/local/etc/pkg/keys"
+repos="$root/usr/local/etc/pkg/repos"
+
+cleanup() {
+    if [ "$changed" = yes ] && [ "$committed" != yes ]; then
+        for item in key config old_repo; do
+            case "$item" in key) target="$keys/kazuha.pub" ;; config) target="$repos/kazuha.conf" ;; old_repo) target="$repos/opnwall.conf" ;; esac
+            if [ -f "$work/backup_$item" ]; then
+                cp -p "$work/backup_$item" "$target.restore"
+                mv -f "$target.restore" "$target"
+            elif [ "$item" != old_repo ]; then
+                rm -f "$target"
+            fi
+        done
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+mkdir -p "$work/repos" "$work/db" "$work/cache"
+fetch -q -o "$work/kazuha.pub" https://kkazuhak.github.io/OPNsense-repo/kazuha.pub
+[ "$(sha256 -q "$work/kazuha.pub")" = '92e83cb0267c3ef27cb355bc2f045c3449fd5c741d1030c7a90c879b00fa5e9b' ] || die 'public key fingerprint verification failed'
+
+configuration() {
+    # pkg expands the ABI placeholder when reading this configuration.
+    # shellcheck disable=SC2016
+    printf 'kazuha: {\n  url: "https://kkazuhak.github.io/OPNsense-repo/repo/${ABI}%s",\n  signature_type: "pubkey",\n  pubkey: "%s",\n  priority: 10,\n  enabled: yes\n}\n' "$suffix" "$1"
+}
+configuration "$work/kazuha.pub" > "$work/repos/kazuha.conf"
+candidate_pkg() {
+    pkg -4 -o "REPOS_DIR=$work/repos" -o "PKG_DBDIR=$work/db" -o "PKG_CACHEDIR=$work/cache" "$@"
+}
+catalog_version() {
+    package="$1"
+    catalog="$work/catalog"
+    candidate_pkg rquery -r kazuha '%n %v' "$package" > "$catalog"
+    selected=''
+    while IFS=' ' read -r catalog_name catalog_version extra; do
+        [ "$catalog_name" = "$package" ] || die "invalid signed catalog entry for $package"
+        [ -z "$extra" ] || die "invalid signed catalog entry for $package"
+        case "$catalog_version" in ''|*[!0-9A-Za-z._,+~-]*) die "invalid catalog version for $package" ;; esac
+        if [ -z "$selected" ]; then
+            selected="$catalog_version"
+        else
+            relation="$(pkg version -t "$catalog_version" "$selected")" || die "cannot compare catalog versions for $package"
+            case "$relation" in
+                '>') selected="$catalog_version" ;;
+                '<'|'=') ;;
+                *) die "cannot compare catalog versions for $package" ;;
+            esac
+        fi
+    done < "$catalog"
+    [ -n "$selected" ] || return 1
+    printf '%s\n' "$selected"
+}
+# Check the signed repository and download its plugin before changing router files.
+candidate_pkg update -f -r kazuha
+version="$(catalog_version os-kazuha-repo)" || die 'the repository plugin is unavailable for this series'
+candidate_pkg fetch -y -r kazuha "os-kazuha-repo-$version"
+
+for item in key config old_repo; do
+    case "$item" in key) target="$keys/kazuha.pub" ;; config) target="$repos/kazuha.conf" ;; old_repo) target="$repos/opnwall.conf" ;; esac
+    [ ! -L "$target" ] || die 'repository files must not be symbolic links'
+    [ ! -e "$target" ] || [ -f "$target" ] || die 'repository files must be regular files'
+    [ ! -f "$target" ] || cp -p "$target" "$work/backup_$item"
+done
+install -d -m 0755 "$keys" "$repos"
+changed=yes
+install -m 0644 "$work/kazuha.pub" "$keys/.kazuha.pub.bootstrap"
+mv -f "$keys/.kazuha.pub.bootstrap" "$keys/kazuha.pub"
+configuration /usr/local/etc/pkg/keys/kazuha.pub > "$work/kazuha.conf"
+install -m 0644 "$work/kazuha.conf" "$repos/.kazuha.conf.bootstrap"
+mv -f "$repos/.kazuha.conf.bootstrap" "$repos/kazuha.conf"
+pkg -4 update -f -r kazuha
+pkg -4 -o "PKG_CACHEDIR=$work/cache" install -U -y -r kazuha "os-kazuha-repo-$version"
+
+# Retire only the original unsigned upstream configuration, never a custom repository.
+if [ -f "$repos/opnwall.conf" ]; then
+    old="$(tr -d '[:space:]' < "$repos/opnwall.conf")"
+    # Match the original literal pkg placeholder and configuration exactly.
+    # shellcheck disable=SC2016
+    case "$old" in
+        'opnwall:{url:"https://opnwall.github.io/OPNsense-repo/repo/${ABI}",priority:10,enabled:yes}'|'opnwall:{url:"https://opnwall.github.io/OPNsense-repo/repo/${ABI}",signature_type:"none",priority:10,enabled:yes}')
+            rm -f "$repos/opnwall.conf"
+            ;;
+    esac
+fi
+committed=yes
+echo 'Signed Kazuha repository installed and registered for firmware updates.'
+
+if [ "$restore_plugins" = yes ]; then
+    manifest_hook="$root/usr/local/opnsense/scripts/firmware/repos/kazuha.sh"
+    [ -f "$manifest_hook" ] || die 'the installed repository plugin has no restore manifest support'
+    sh "$manifest_hook" manifest > "$work/manifest"
+    # Resolve every desired name against this series' signed catalog first.
+    # Recorded versions describe the backup; restored machines use compatible
+    # current packages rather than installing old dependencies from another ABI.
+    while read -r plugin recorded extra; do
+        [ -n "$plugin" ] || continue
+        [ -z "$extra" ] || die 'invalid plugin restore manifest'
+        printf '%s\n' "$plugin" | LC_ALL=C grep -Eq '^os-[a-z0-9][a-z0-9-]*$' || die 'invalid plugin name in restore manifest'
+        printf '%s\n' "$recorded" | LC_ALL=C grep -Eq '^[0-9][0-9A-Za-z._,+~-]*$' || die 'invalid plugin version in restore manifest'
+        [ "$plugin" != os-kazuha-repo ] || continue
+        available_version="$(catalog_version "$plugin")" || die "restored plugin is unavailable for $series: $plugin"
+        printf '%s-%s\n' "$plugin" "$available_version" >> "$work/restore-packages"
+    done < "$work/manifest"
+    if [ -f "$work/restore-packages" ]; then
+        set --
+        while IFS= read -r package; do set -- "$@" "$package"; done < "$work/restore-packages"
+        pkg -4 install -U -y -r kazuha "$@"
+        sh "$manifest_hook" mirror
+        echo 'Plugins from the restored configuration were installed from the signed catalog.'
+    else
+        echo 'No additional plugins were recorded in the restored configuration.'
+    fi
+fi

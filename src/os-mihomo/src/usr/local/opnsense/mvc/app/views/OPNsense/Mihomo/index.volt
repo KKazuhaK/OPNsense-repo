@@ -384,12 +384,20 @@ $(function () {
             $('#mihomo-service').attr('class', 'label label-' + (state.running ? 'success' : 'default'))
                 .text(state.running ? '{{ lang._('Running') }}' : '{{ lang._('Stopped') }}');
             /* The core's resident memory beside the size the watchdog restarts
-               it above, and when and why it last restarted the core itself. */
+               it above, how many stale fast TCP path connections it closed for
+               this core, and when and why it last restarted the core itself.
+               The count shows while the fast TCP path runs, or once it is not
+               zero: without the path nothing is ever counted. */
             const serviceNotes = [];
             if (typeof state.core_memory === 'number') {
                 serviceNotes.push('{{ lang._('Core memory: %s') }}'.replace('%s', size(state.core_memory))
                     + (typeof state.core_memory_limit === 'number'
                        ? ' ' + '{{ lang._('(restarted above %s)') }}'.replace('%s', size(state.core_memory_limit)) : ''));
+            }
+            if (typeof state.stale_connections_closed === 'number'
+                    && (state.tcp_redirect || state.stale_connections_closed > 0)) {
+                serviceNotes.push('{{ lang._('Stale connections closed: %s') }}'
+                    .replace('%s', String(state.stale_connections_closed)));
             }
             if (state.restart_note) {
                 serviceNotes.push(state.restart_note);
@@ -716,7 +724,8 @@ $(function () {
                     <td><input type="checkbox" id="tcp_redirect">
                         <div class="hidden" data-for="help_for_tcpredirect">
                             {{ lang._('Send captured IPv4 TCP to Mihomo through a firewall redirect instead of the gVisor TUN. The TUN caps each TCP connection at about 20 KB in flight, which on Wi-Fi limits a single download to a few tens of Mbps; the redirect uses the kernel TCP stack instead. UDP, QUIC, DNS and IPv6 stay on the TUN, and TCP falls back to the TUN whenever the redirect is not ready.') }}<br>
-                            {{ lang._('Firewall rules see redirected TCP as addressed to 127.0.0.1 port 7894. Block rules that match a destination host or port no longer apply to captured TCP, and pass rules limited to destination hosts or ports no longer match it, so it falls to the default block. A LAN rule that sets a gateway still matches and sends the redirected connection toward that gateway, where it is lost. Before enabling this, place a rule without a gateway that passes TCP from the captured sources to 127.0.0.1 port 7894 above any such rules, or keep those sources out of capture.') }}
+                            {{ lang._('Firewall rules see redirected TCP as addressed to 127.0.0.1 port 7894. Block rules that match a destination host or port no longer apply to captured TCP, and pass rules limited to destination hosts or ports no longer match it, so it falls to the default block. A LAN rule that sets a gateway still matches and sends the redirected connection toward that gateway, where it is lost. Before enabling this, place a rule without a gateway that passes TCP from the captured sources to 127.0.0.1 port 7894 above any such rules, or keep those sources out of capture.') }}<br>
+                            {{ lang._('Mihomo keeps some redirected connections open after the device has gone: once one side of a connection has finished, it waits for the other side without a time limit. Once a minute the watchdog closes those whose device socket is closed, and those half-closed in either direction without any data for five minutes, dropping the device socket with tcpdrop where the server finished first; the status shows how many it closed since the core started.') }}
                         </div>
                     </td>
                 </tr>

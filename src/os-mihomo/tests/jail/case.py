@@ -461,6 +461,61 @@ assert isinstance(status['core_memory'], int) and abs(status['core_memory'] - re
 physical = int(command(['/sbin/sysctl', '-n', 'hw.physmem']).stdout)
 assert status['core_memory_limit'] == physical // 2, status
 passed('The watchdog restarts a core that exited without a stop, with capture and DNS as after Start')
+# The stale-connection scan reads the kernel's view with the installed module's
+# unchanged netstat call and parser, which also require the listener's own
+# LISTEN line in real output. The server side of a real loopback connection to
+# the core's mixed port exists as soon as the handshake ends, so it is listed
+# under the client's endpoint whether or not the core accepted it.
+if '/usr/local/opnsense/scripts/mihomo' not in sys.path:
+    sys.path.insert(0, '/usr/local/opnsense/scripts/mihomo')
+native_spec = importlib.util.spec_from_file_location('native_mihomo', '/usr/local/opnsense/scripts/mihomo/mihomo.py')
+native_manager = importlib.util.module_from_spec(native_spec)
+native_spec.loader.exec_module(native_manager)
+with socket.create_connection(('127.0.0.1', 7890), timeout=3) as client:
+    client_endpoint = client.getsockname()[:2]
+    listed_sockets = native_manager.System().redirect_sockets(7890)
+assert listed_sockets.get(client_endpoint) == {'ESTABLISHED'}, (client_endpoint, listed_sockets)
+passed('netstat lists the core\'s loopback sockets by client endpoint as the stale-connection scan reads them')
+# tcpdrop as the scan runs it, on a socket shaped like the leak: a loopback
+# listener's accepted socket in FIN_WAIT_2 whose owner still reads it, because
+# that side finished sending and the client never does. The listener and both
+# ends are this test's own, so nothing the core or another service holds is
+# touched.
+native_system = native_manager.System()
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held_listener:
+    held_listener.bind(('127.0.0.1', 0))
+    held_listener.listen(1)
+    held_port = held_listener.getsockname()[1]
+    with socket.create_connection(('127.0.0.1', held_port), timeout=3) as held_client:
+        held_endpoint = held_client.getsockname()[:2]
+        held_server, _ = held_listener.accept()
+        with held_server:
+            held_server.shutdown(socket.SHUT_WR)
+            wait_for(lambda: native_system.redirect_sockets(held_port).get(held_endpoint) == {'FIN_WAIT_2'}, 10,
+                     'The accepted socket did not reach FIN_WAIT_2 after its owner finished sending')
+            native_system.drop_redirect_socket(held_port, held_endpoint)
+            # The read the core's relay blocks in ends at once. ECONNABORTED is
+            # what the kernel sets on the socket tcpdrop dropped, so it also
+            # shows the listener's side was dropped rather than the client's,
+            # whose reset would read ECONNRESET here.
+            held_server.settimeout(3)
+            try:
+                held_server.recv(1)
+            except ConnectionAbortedError:
+                pass
+            else:
+                raise AssertionError('The dropped socket did not wake its reader with ECONNABORTED')
+            assert native_system.redirect_sockets(held_port).get(held_endpoint, set()) <= {'CLOSED'}
+            # The kernel no longer finds a dropped socket, so a second drop
+            # fails with ESRCH, which the module tells apart as a socket that
+            # has already ended, and its error does not name the socket.
+            try:
+                native_system.drop_redirect_socket(held_port, held_endpoint)
+            except native_manager.NoSuchSocketError as error:
+                assert str(error) == 'tcpdrop exited with status 1: No such process', str(error)
+            else:
+                raise AssertionError('tcpdrop did not report a socket it had already dropped as not found')
+passed('tcpdrop drops a loopback FIN_WAIT_2 socket by its four-tuple and wakes the reader holding it')
 action('start')
 action('disable-transparent')
 assert ET.parse('/conf/config.xml').find('./filter/rule') is None

@@ -602,8 +602,12 @@ assert '127.0.0.1:1053 (' not in command(['/sbin/pfctl', '-ss', '-vv']).stdout.d
 status = action('status')['result']
 assert status['running'] is False and status['dns_redirect'] is False, status
 # The watchdog restarts the core ten seconds after it noticed the exit; the
-# Start below comes first and makes that restart itself.
-assert 'is restarted automatically at about' in status['error'], status
+# Start below comes first and makes that restart itself. The client is handed
+# back as soon as the redirect is withdrawn, which happens before the same
+# tick restores DNS and publishes the scheduled restart, so wait for the
+# notice instead of reading it once.
+wait_for(lambda: 'is restarted automatically at about' in action('status')['result']['error'], 8,
+         'The watchdog did not publish the scheduled restart after SIGKILL')
 assert not health.exists()
 assert not zone.exists() and ET.parse('/conf/config.xml').findtext('./OPNsense/unboundplus/forwarding/enabled') == '1'
 passed('Actual SIGKILL withdraws the DNS redirect and its states; the listed client is answered by Unbound again')

@@ -1,4 +1,4 @@
-# frps (frp server) configuration for OPNsense.  frp 0.71.0, TOML format.
+# frps (frp server) configuration for OPNsense.  frp 0.71.1, TOML format.
 #
 # frps parses this file with --strict_config, which is on by default: one
 # unknown or misspelled key aborts the daemon with exit status 1 instead of

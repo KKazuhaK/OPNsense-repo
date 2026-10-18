@@ -1,4 +1,4 @@
-frp 0.71.0 reverse proxy integration for OPNsense, covering both daemons.
+frp 0.71.1 reverse proxy integration for OPNsense, covering both daemons.
 
 The package installs the frps server and the frpc client, an rc.d service and
 configd actions for each side, and a VPN page that edits the TOML documents the

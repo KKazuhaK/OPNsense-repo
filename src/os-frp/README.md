@@ -18,8 +18,8 @@ the form does not model.
 
 | | |
 | --- | --- |
-| Plugin version | `1.0.1` |
-| Bundled frp | `0.71.0` |
+| Plugin version | `1.0.2` |
+| Bundled frp | `0.71.1` |
 | Target | OPNsense 26.7, `FreeBSD:15:amd64`, Python 3.13 |
 
 The build script accepts the FreeBSD 15 amd64 ABI only. Do not force-install the
@@ -66,8 +66,8 @@ with the sample configuration in place and both services stopped.
 
 ```text
 Makefile                                                 make package / pin-checksum / test / clean
-build.sh                                                 builds dist/os-frp-1.0.1.pkg on FreeBSD 15
-vendor/frp_0.71.0_freebsd_amd64.tar.gz                   upstream release archive, digest pinned
+build.sh                                                 builds dist/os-frp-1.0.2.pkg on FreeBSD 15
+vendor/frp_0.71.1_freebsd_amd64.tar.gz                   upstream release archive, digest pinned
 vendor/frp_sha256_checksums.txt                          the release's published checksums
 packaging/freebsd/                                       pkg metadata and the four lifecycle hooks
 src/etc/rc.conf.d/frps.sample                            rc.conf defaults, server
@@ -98,7 +98,7 @@ Build on a native FreeBSD 15 amd64 or OPNsense host with `pkg` available.
 Put the upstream release archive in `vendor/`:
 
 ```text
-vendor/frp_0.71.0_freebsd_amd64.tar.gz
+vendor/frp_0.71.1_freebsd_amd64.tar.gz
 ```
 
 Pin its digest once, after checking it against the checksum published with the
@@ -108,7 +108,7 @@ frp release:
 make pin-checksum
 ```
 
-That writes `vendor/frp_0.71.0_freebsd_amd64.tar.gz.sha256`. Without it the build
+That writes `vendor/frp_0.71.1_freebsd_amd64.tar.gz.sha256`. Without it the build
 falls back to `vendor/frp_sha256_checksums.txt`, the checksum file published with
 the frp release, and uses the line for this archive. From then on the
 build compares the archive against the recorded digest and stops on a mismatch,
@@ -122,7 +122,7 @@ Then:
 make package
 ```
 
-The result is `dist/os-frp-1.0.1.pkg`. `build.sh` can also be called directly:
+The result is `dist/os-frp-1.0.2.pkg`. `build.sh` can also be called directly:
 
 ```sh
 ABI=native sh build.sh
@@ -147,7 +147,7 @@ The build refuses to produce a package when:
 ## Install
 
 ```sh
-pkg add -f os-frp-1.0.1.pkg
+pkg add -f os-frp-1.0.2.pkg
 ```
 
 Refresh the web interface. The menu gains a **Services > frp** heading with

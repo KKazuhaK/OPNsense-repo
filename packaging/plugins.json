@@ -133,19 +133,19 @@
     "os-frp": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "stage": {"src": "/"},
       "deps": {},
       "vendored": [
         {
-          "artifact": "vendor/frp_0.71.0_freebsd_amd64.tar.gz",
-          "sha256": "207c85353dd66e9ef1125a8ee60e4fd4a562f364bc584c4a5ff55e7ac7355bb8",
-          "sha256_file": "vendor/frp_0.71.0_freebsd_amd64.tar.gz.sha256",
+          "artifact": "vendor/frp_0.71.1_freebsd_amd64.tar.gz",
+          "sha256": "c45ced953a4534f3a40e59fbfa476ec8b231275bcec939e2a40345a1300577ff",
+          "sha256_file": "vendor/frp_0.71.1_freebsd_amd64.tar.gz.sha256",
           "checksums_file": "vendor/frp_sha256_checksums.txt",
           "archive": "tar.gz",
           "members": {
-            "frp_0.71.0_freebsd_amd64/frps": "/usr/local/sbin/frps",
-            "frp_0.71.0_freebsd_amd64/frpc": "/usr/local/sbin/frpc"
+            "frp_0.71.1_freebsd_amd64/frps": "/usr/local/sbin/frps",
+            "frp_0.71.1_freebsd_amd64/frpc": "/usr/local/sbin/frpc"
           }
         }
       ],

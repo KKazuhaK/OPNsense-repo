@@ -12,7 +12,7 @@ for side in frps frpc; do
         if [ -f "$state/$side.rc.conf.upgrade" ]; then
             cp -p "$state/$side.rc.conf.upgrade" "/etc/rc.conf.d/$side"
         else
-            install -m 0644 "/etc/rc.conf.d/$side.sample" "/etc/rc.conf.d/$side"
+            install -m 0644 "/usr/local/share/frp/$side.rc.conf.sample" "/etc/rc.conf.d/$side"
         fi
     fi
     rm -f "$state/$side.rc.conf.upgrade"

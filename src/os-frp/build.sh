@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-frp}"
-VERSION="${VERSION:-1.0.1}"
+VERSION="${VERSION:-1.0.2}"
 ORIGIN="${ORIGIN:-opnsense/os-frp}"
 COMMENT="${COMMENT:-frp reverse proxy server and client integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/KKazuhaK/}"
@@ -10,7 +10,7 @@ WWW="${WWW:-https://github.com/fatedier/frp}"
 PREFIX="${PREFIX:-/usr/local}"
 FORMAT="${FORMAT:-txz}"
 ABI="${ABI:-native}"
-FRP_VERSION="${FRP_VERSION:-0.71.0}"
+FRP_VERSION="${FRP_VERSION:-0.71.1}"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 DISTFILE="$SCRIPT_DIR/vendor/frp_${FRP_VERSION}_freebsd_amd64.tar.gz"
@@ -72,6 +72,9 @@ FILES
 # The package version and the version file the GUI reads must never drift.
 grep -q "\"product_version\":\"$VERSION\"" "$SCRIPT_DIR/src/usr/local/opnsense/version/frp" ||
     die "src/usr/local/opnsense/version/frp does not declare product_version $VERSION"
+
+[ "$(cat "$SCRIPT_DIR/FRP_VERSION")" = "$FRP_VERSION" ] || die "FRP_VERSION pin differs from build version"
+[ "$(cat "$SCRIPT_DIR/src/usr/local/share/frp/FRP_VERSION")" = "$FRP_VERSION" ] || die "installed FRP_VERSION differs from build version"
 
 [ -f "$DISTFILE" ] || die "missing vendored upstream archive: vendor/$(basename "$DISTFILE")"
 

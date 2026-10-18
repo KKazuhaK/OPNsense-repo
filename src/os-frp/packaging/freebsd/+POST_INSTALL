@@ -6,13 +6,26 @@ install -d -m 0700 "$state"
 mkdir -p /etc/rc.conf.d /usr/local/etc/frp /var/log
 
 for side in frps frpc; do
+    # pkg can retain obsolete .sample files as unowned files during upgrade.
+    # Remove only the unchanged shipped defaults; preserve administrator edits.
+    legacy="/etc/rc.conf.d/$side.sample"
+    if [ -f "$legacy" ] && [ ! -L "$legacy" ]; then
+        if cmp -s "$legacy" "/usr/local/share/frp/$side.rc.conf.sample"; then
+            rm -f "$legacy"
+        else
+            echo "Warning: modified $legacy remains in boot configuration discovery; review it manually." >&2
+        fi
+    fi
+done
+
+for side in frps frpc; do
     # Restore the stashed rc.conf.d fragment, or seed it from the sample.  An
     # existing live file is never touched.
     if [ ! -f "/etc/rc.conf.d/$side" ]; then
         if [ -f "$state/$side.rc.conf.upgrade" ]; then
             cp -p "$state/$side.rc.conf.upgrade" "/etc/rc.conf.d/$side"
         else
-            install -m 0644 "/etc/rc.conf.d/$side.sample" "/etc/rc.conf.d/$side"
+            install -m 0644 "/usr/local/share/frp/$side.rc.conf.sample" "/etc/rc.conf.d/$side"
         fi
     fi
     rm -f "$state/$side.rc.conf.upgrade"

@@ -1,5 +1,5 @@
 PKG_NAME?=	os-frp
-VERSION?=	1.0.2
+VERSION?=	1.0.3
 PYTHON?=	python3.13
 
 .PHONY: package pin-checksum test clean

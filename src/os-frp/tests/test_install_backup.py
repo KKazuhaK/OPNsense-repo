@@ -84,6 +84,26 @@ else:
     def calls(self):
         return self.events.read_text().splitlines() if self.events.exists() else []
 
+    def test_upgrade_removes_only_unchanged_obsolete_samples(self):
+        for side in ['frps', 'frpc']:
+            text = (PACKAGE / ('src/usr/local/share/frp/' + side + '.rc.conf.sample')).read_text()
+            self.write('usr/local/share/frp/' + side + '.rc.conf.sample', text)
+            self.write('etc/rc.conf.d/' + side + '.sample', text)
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for side in ['frps', 'frpc']:
+            self.assertFalse((self.root / ('etc/rc.conf.d/' + side + '.sample')).exists())
+            self.assertTrue((self.root / ('etc/rc.conf.d/' + side)).exists())
+
+    def test_modified_obsolete_sample_is_preserved_with_warning(self):
+        legacy = self.write('etc/rc.conf.d/frpc.sample', 'frpc_enable="YES"\n# local edit\n')
+        self.write('usr/local/share/frp/frpc.rc.conf.sample', 'frpc_enable="NO"\n')
+        before = legacy.read_bytes()
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertIn('review it manually', result.stderr)
+
     def test_legacy_files_without_xml_are_enrolled_without_enabling_or_restarting_daemons(self):
         restart = self.write('var/db/os-frp/frps.restart', 'outgoing restart marker')
         result = self.run_hook()

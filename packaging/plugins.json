@@ -133,7 +133,7 @@
     "os-frp": {
       "staging": "tree",
       "abi": "target",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "stage": {"src": "/"},
       "deps": {},
       "vendored": [

@@ -2,7 +2,7 @@
 set -eu
 
 PKG_NAME="${PKG_NAME:-os-frp}"
-VERSION="${VERSION:-1.0.2}"
+VERSION="${VERSION:-1.0.3}"
 ORIGIN="${ORIGIN:-opnsense/os-frp}"
 COMMENT="${COMMENT:-frp reverse proxy server and client integration for OPNsense}"
 MAINTAINER="${MAINTAINER:-https://github.com/KKazuhaK/}"
@@ -36,8 +36,8 @@ while IFS= read -r required; do
     [ -n "$required" ] || continue
     [ -e "$SCRIPT_DIR/$required" ] || die "missing required file: $required"
 done <<'FILES'
-src/etc/rc.conf.d/frps.sample
-src/etc/rc.conf.d/frpc.sample
+src/usr/local/share/frp/frps.rc.conf.sample
+src/usr/local/share/frp/frpc.rc.conf.sample
 src/usr/local/etc/frp/frps.toml.sample
 src/usr/local/etc/frp/frpc.toml.sample
 src/usr/local/etc/rc.d/frps

@@ -77,6 +77,27 @@ namespace {
             repairCheck($status['running'] === false && $status['backup_warning'] === $warning,
                         'Stale or malformed runtime status hid the repair warning.');
         }
+        $settled = ['running' => false, 'watched' => false, 'dns_active' => false, 'restart_pending' => false];
+        foreach ([['running' => false, 'dns_active' => false, 'updated' => time() - 60],
+                  ['running' => false, 'watched' => false, 'dns_active' => false, 'updated' => time() - 60],
+                  array_merge($settled, ['restart_pending' => true, 'updated' => time() - 60]),
+                  ['running' => false, 'watched' => true, 'dns_active' => false, 'updated' => time() - 60],
+                  ['running' => false, 'watched' => false, 'dns_active' => true, 'updated' => time() - 60],
+                  ['running' => true, 'watched' => false, 'dns_active' => false, 'updated' => time() - 60],
+                  ['running' => false, 'watched' => false, 'dns_active' => false, 'updated' => 'invalid']] as $stale) {
+            file_put_contents($statusPath, json_encode($stale));
+            repairCheck($controller->statusAction()['error'] === 'Service status is unavailable.',
+                        'An old status that something should still be refreshing was trusted.');
+        }
+        foreach (['' => '', 'start failed' => 'The core did not start.'] as $error) {
+            file_put_contents($statusPath, json_encode($settled + [
+                'service_enabled' => $error === '' ? false : true, 'transparent' => true,
+                'updated' => time() - 3600, 'error' => $error, 'backup_warning' => '']));
+            $status = $controller->statusAction();
+            repairCheck($status['running'] === false && $status['transparent'] === true && $status['error'] === $error
+                        && $status['backup_warning'] === $warning,
+                        'A stopped service with no watchdog read as an unavailable status.');
+        }
         file_put_contents($statusPath, json_encode(['running' => true, 'updated' => time(), 'backup_warning' => '']));
         $status = $controller->statusAction();
         repairCheck($status['running'] === true && $status['backup_warning'] === $warning,
@@ -102,7 +123,7 @@ namespace {
         $answer = $controller->__call('repairBackupAction', []);
         repairCheck($answer['status'] === 'ok' && \OPNsense\Core\Backend::$calls === ['mihomo repair-backup'],
                     'POST repair did not reach the installed configd action.');
-        echo "Mihomo repair remains reachable with absent/stale status, trusts only bounded private warnings, and requires POST.\n";
+        echo "Mihomo repair remains reachable with absent/stale status, a stopped service reads as stopped, trusts only bounded private warnings, and requires POST.\n";
     } finally {
         foreach (scandir($directory) as $name) {
             if ($name !== '.' && $name !== '..') {

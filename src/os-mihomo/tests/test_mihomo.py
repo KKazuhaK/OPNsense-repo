@@ -64,8 +64,9 @@ class FakeSystem:
         # The helper leaves a validating resolver alone and says so.
         self.forwarded = enabled and not self.dnssec
         return self.forwarded
-    def watch(self): pass
-    def stop_watch(self): pass
+    def watch(self): self.watching_now = True
+    def stop_watch(self): self.watching_now = False
+    def watching(self): return getattr(self, 'watching_now', False)
     def destroy_tun(self): self.events.append('destroy-tun')
     def remove(self): self.events.append('remove-owned-integration')
     def tun(self): self.events.append('assign-tun')
@@ -112,6 +113,20 @@ class StateTests(unittest.TestCase):
 
     def snapshot(self):
         return {p.name: p.read_bytes() for p in self.manager.state.iterdir() if p.is_file()}
+
+    def test_status_says_whether_a_watchdog_still_refreshes_it(self):
+        # The page trusts an old status only when nothing refreshes it: a
+        # stop ends the watchdog before it publishes the stopped state.
+        self.assertTrue(self.system.alive)
+        self.assertIs(json.loads(self.manager.status_file.read_bytes())['watched'], True)
+        self.manager.dispatch('stop')
+        status = json.loads(self.manager.status_file.read_bytes())
+        self.assertIs(status['running'], False)
+        self.assertIs(status['watched'], False)
+        self.assertIs(status['dns_active'], False)
+        self.assertIs(status['restart_pending'], False)
+        self.manager.dispatch('start')
+        self.assertIs(json.loads(self.manager.status_file.read_bytes())['watched'], True)
 
     def test_fresh_install_is_proxy_only_and_cannot_enable_without_subscription(self):
         self.assertTrue(self.system.alive)

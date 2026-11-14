@@ -2607,6 +2607,9 @@ class System:
     def stop_watch(self):
         self._ownership(self._watch_group().stop)
 
+    def watching(self):
+        return self._ownership(self._watch_group().running)
+
     def reopen_logs(self):
         """Have every supervisor proven to run with -H reopen /var/log/mihomo.log; how many were asked.
 
@@ -3965,6 +3968,14 @@ class Manager:
         return self.publish_status(settings, not direct, error='' if direct else
                                    'Direct DNS recovery failed and will be retried.')
 
+    def watched(self):
+        if not hasattr(self.system, 'watching'):
+            return None
+        try:
+            return bool(self.system.watching())
+        except (Error, OSError):
+            return None
+
     def publish_status(self, settings=None, dns_active=False, error=""):
         settings = settings or self.settings()
         running = self.system.running()
@@ -4063,6 +4074,12 @@ class Manager:
                       memory_restart_limit(self.physical_memory()),
                   "stale_connections_closed": stale_closed,
                   "service_enabled": settings["service_enabled"], "overrides": overrides,
+                  # Whether a watchdog keeps refreshing this status. Without
+                  # one nothing changes it until the next action publishes,
+                  # so its age says nothing about whether it still holds.
+                  "watched": self.watched(),
+                  # Only a watchdog carries out a planned restart.
+                  "restart_pending": bool(not running and restart['pending'] is not None),
                   "error": bounded_routing_diagnostic(error), "backup_warning": self.backup_warning_file.read_text()
                       if self.backup_warning_file.exists() else BACKUP_WARNING
                       if self.proxy_warning_file.exists() else '', "updated": time.time()}

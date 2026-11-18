@@ -622,7 +622,7 @@ def prepare_release(site, source, commit, packages):
         else:
             # Every other plugin is published through its committed staging record.
             plugin_record(source, name)
-            verify_source_package(candidate, source, plugin=name)
+            verified_package = verify_source_package(candidate, source, plugin=name)
             if abi == INDEPENDENT_ABI:
                 repositories = {t['repository'] for t in targets}
                 repositories.update('repo/' + p.name for p in (site / 'repo').glob('FreeBSD:*:amd64'))
@@ -637,7 +637,12 @@ def prepare_release(site, source, commit, packages):
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(candidate, path)
             if name != 'os-mihomo':
-                additional.append({'path': destination, 'sha256': digest, 'name': name, 'abi': abi})
+                entry = {'path': destination, 'sha256': digest, 'name': name, 'abi': abi}
+                if name == 'os-nethub-agent':
+                    if verified_package['package_sha256'] != digest:
+                        raise ValueError('NetHub package changed during release preparation.')
+                    entry['frp_version'] = verified_package['frp_version']
+                additional.append(entry)
     if seen != set(by_tuple):
         raise ValueError('Every enabled target requires its own native tested package.')
     report = {'schema_version': 2, 'source_commit': commit, 'packages': released, 'additional_packages': additional,
@@ -805,8 +810,15 @@ def verify(site, source=None):
         extra = release_path(site, entry['path'])
         if extra.resolve() not in listed or hashlib.sha256(extra.read_bytes()).hexdigest() != entry['sha256']:
             raise ValueError('Additional release package differs from the signed report.')
+        plugin = entry.get('name', 'os-sing-box')
+        if 'frp_version' in entry and (plugin != 'os-nethub-agent'
+                or not isinstance(entry['frp_version'], str)
+                or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', entry['frp_version'])):
+            raise ValueError('Invalid published NetHub frp version.')
         if source:
-            verify_source_package(extra, source, plugin=entry.get('name', 'os-sing-box'))
+            verified_package = verify_source_package(extra, source, plugin=plugin)
+            if 'frp_version' in entry and entry['frp_version'] != verified_package['frp_version']:
+                raise ValueError('Published NetHub frp version differs from the verified package.')
     # Catalogs offer only the newest version; every other published archive must
     # carry the digest the signed report recorded for it.
     superseded = {}
@@ -846,9 +858,8 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
         spec = importlib.util.spec_from_file_location('nethub_release_package', source_path(source, 'packaging/nethub_package.py'))
         adapter = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(adapter)
-        adapter.verify_registered_candidate(package, source_path(source, record['source_lock']),
-                                            source_path(source, record['build_record']), record)
-        return
+        return adapter.verify_registered_candidate(package, source_path(source, record['source_lock']),
+                                                   source_path(source, record['build_record']), record)
     if record is None:
         expected = {'/' + str(p.relative_to(src / 'src')): p.read_bytes() for p in (src / 'src').rglob('*')
                     if p.is_file() and p.suffix not in {'.xz', '.pyc', '.pyo'} and '__pycache__' not in p.parts

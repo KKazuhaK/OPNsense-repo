@@ -80,7 +80,16 @@ class ServiceController extends ApiControllerBase
         $raw = @file_get_contents('/var/run/mihomo-status.json');
         $status = is_string($raw) ? json_decode($raw, true) : null;
         $warning = $this->backupWarning();
-        if (!is_array($status) || !is_numeric($status['updated'] ?? null) || time() - $status['updated'] > 20) {
+        /* The watchdog refreshes the status every few seconds, so an old one
+           it should have refreshed means nobody is watching. A stopped core
+           with no watchdog, no DNS still forwarded to it and no restart
+           planned -- a stop, or a start that failed -- stays as published
+           until the next action publishes again, however long ago that was. */
+        $settled = is_array($status) && ($status['running'] ?? null) === false
+            && ($status['watched'] ?? null) === false && ($status['dns_active'] ?? null) === false
+            && ($status['restart_pending'] ?? null) === false;
+        if (!is_array($status) || !is_numeric($status['updated'] ?? null)
+                || (!$settled && time() - $status['updated'] > 20)) {
             return ['running' => false, 'dns_active' => false,
                     'transparent' => false, 'backup_warning' => $warning,
                     'error' => gettext('Service status is unavailable.')];

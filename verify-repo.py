@@ -20,7 +20,8 @@ VERSION_PATTERN = r'[0-9][0-9A-Za-z._,+]*'
 PHASES = ('pre-install', 'post-install', 'pre-deinstall', 'post-deinstall')
 REGISTRY = 'packaging/plugins.json'
 RECORD_FIELDS = {'staging', 'abi', 'version', 'stage', 'shared', 'deps', 'vendored', 'generated',
-                 'version_file', 'reason', 'notes'}
+                 'version_file', 'reason', 'notes', 'source_lock', 'build_record',
+                 'build_record_sha256', 'package_sha256'}
 VENDOR_FIELDS = {'artifact', 'sha256', 'sha256_file', 'checksums_file', 'archive',
                  'members', 'install'}
 SOURCE_NOISE = {'.pyc', '.pyo'}
@@ -271,7 +272,12 @@ def plugin_records(source):
             raise ValueError('Invalid committed plugin staging record: ' + str(plugin))
         if set(record) - RECORD_FIELDS:
             raise ValueError('Unknown fields in the staging record for ' + plugin + ': ' + ', '.join(sorted(set(record) - RECORD_FIELDS)))
-        if record.get('staging') not in {'tree', 'repository', 'unsupported'}:
+        if record.get('staging') == 'nethub-upstream':
+            upstream_fields = {'staging', 'abi', 'version', 'source_lock', 'build_record',
+                               'build_record_sha256', 'package_sha256'}
+            if plugin != 'os-nethub-agent' or set(record) != upstream_fields:
+                raise ValueError('Invalid NetHub upstream staging record.')
+        elif record.get('staging') not in {'tree', 'repository', 'unsupported'}:
             raise ValueError('Unsupported staging shape for ' + plugin + '.')
     return value['plugins']
 
@@ -834,6 +840,15 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
         allowed = abi_allowed(record, manifest['abi'])
     if manifest['name'] != plugin or not allowed:
         raise ValueError('Release package has incorrect identity or ABI.')
+    if record and record['staging'] == 'nethub-upstream':
+        if manifest['version'] != record['version']:
+            raise ValueError('NetHub package version differs from the committed staging record.')
+        spec = importlib.util.spec_from_file_location('nethub_release_package', source_path(source, 'packaging/nethub_package.py'))
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        adapter.verify_registered_candidate(package, source_path(source, record['source_lock']),
+                                            source_path(source, record['build_record']), record)
+        return
     if record is None:
         expected = {'/' + str(p.relative_to(src / 'src')): p.read_bytes() for p in (src / 'src').rglob('*')
                     if p.is_file() and p.suffix not in {'.xz', '.pyc', '.pyo'} and '__pycache__' not in p.parts
@@ -852,6 +867,17 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
             expected['/usr/local/bin/' + binary] = lzma.decompress((src / 'src/usr/local/bin' / asset).read_bytes())
     else:
         expected = record_files(src, record, manifest, plugin, source)
+    verify_file_inventory(package, manifest, expected)
+    expected_scripts = {}
+    for phase in PHASES:
+        hook = hook_source(src, phase)
+        if hook is not None:
+            expected_scripts[phase] = module.transform_hook(src, phase, target) if module else hook.read_text()
+    verify_lifecycle_hooks(manifest, expected_scripts)
+
+
+def verify_file_inventory(package, manifest, expected):
+    """Compare a reconstructed inventory using both package archive readers."""
     actual = manifest['files']
     archive_paths = archive_members(package)
     if any('__pycache__' in Path(name).parts or Path(name).suffix in {'.pyc', '.pyo'} for name in archive_paths.values()):
@@ -869,12 +895,15 @@ def verify_source_package(package, source, plugin='os-mihomo', binary='mihomo', 
         archived = subprocess.check_output(['tar', '-xOf', str(package), '-P', '--', archive_paths[path]])
         if archived != content:
             raise ValueError('Package archive differs from its manifest: ' + path)
+
+
+def verify_lifecycle_hooks(manifest, expected):
+    """Compare exact source hooks, allowing libpkg's documented encoding."""
     scripts = manifest.get('scripts') or {}
     if set(scripts) - set(PHASES):
         raise ValueError('Package lifecycle hook differs from source.')
     for phase in PHASES:
-        hook = hook_source(src, phase)
-        content = None if hook is None else module.transform_hook(src, phase, target) if module else hook.read_text()
+        content = expected.get(phase)
         if content is None:
             if phase in scripts:
                 raise ValueError('Package lifecycle hook differs from source.')

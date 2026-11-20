@@ -163,6 +163,113 @@ class SharedPolicyTests(unittest.TestCase):
         self.assertEqual({}, record['routes'])
         self.assertEqual([], harness.saved)
 
+    class RenameHarness(SyncHarness):
+        def __init__(self, live, present):
+            super().__init__(live)
+            self.present = set(present)
+
+        def interface_names(self):
+            return set(self.present)
+
+    @staticmethod
+    def tunnel_routes(interface, flags):
+        gateway = {'family': 4, 'destination': '10.110.0.0/16', 'scope': '',
+                   'gateway': '10.220.15.239', 'interface': interface,
+                   'flags': 'UG' + flags, 'discard': ''}
+        direct = {'family': 4, 'destination': '10.220.15.239/32', 'scope': '',
+                  'gateway': 'interface', 'interface': interface,
+                  'flags': 'UH' + flags, 'discard': ''}
+        return {route.route_key(value): value for value in (gateway, direct)}
+
+    def test_owned_routes_follow_a_tunnel_interface_rename(self):
+        # The OPNsense OpenConnect service creates tun30000, lets vpnc-script
+        # install routes and then renames the live interface to ocvpn0.
+        journal = self.tunnel_routes('tun30000', 'S')
+        live = self.tunnel_routes('ocvpn0', 'S')
+        system = self.tunnel_routes('ocvpn0', '')
+        for strict in (True, False):
+            with self.subTest(strict=strict):
+                record = {'fib': 1, 'routes': json.loads(json.dumps(journal))}
+                harness = self.RenameHarness(dict(live), {'vtnet0', 'ocvpn0'})
+                harness.sync(record, dict(system), strict=strict, native=system)
+                self.assertEqual(live, record['routes'])
+                self.assertEqual(live, harness.saved[-1]['routes'])
+
+    def test_rename_back_before_stop_is_followed_too(self):
+        journal = self.tunnel_routes('ocvpn0', 'S')
+        live = self.tunnel_routes('tun30000', 'S')
+        system = self.tunnel_routes('tun30000', '')
+        record = {'fib': 1, 'routes': json.loads(json.dumps(journal))}
+        harness = self.RenameHarness(dict(live), {'vtnet0', 'tun30000'})
+        harness.sync(record, dict(system), native=system)
+        self.assertEqual(live, record['routes'])
+
+    def test_interface_change_without_a_rename_stays_foreign(self):
+        journal = self.tunnel_routes('tun30000', 'S')
+        live = self.tunnel_routes('ocvpn0', 'S')
+        system = self.tunnel_routes('ocvpn0', '')
+        gateway_key = next(key for key, value in live.items()
+                           if value['gateway'] != 'interface')
+        direct_key = next(key for key in live if key != gateway_key)
+        cases = {
+            'old name still exists': (live, system, {'tun30000', 'ocvpn0'}, journal),
+            'new name does not exist': (live, system, {'vtnet0'}, journal),
+            # The direct route really was renamed and is followed; the
+            # gateway route also changed its gateway and remains foreign.
+            'gateway changed too': (
+                {**live, gateway_key: {**live[gateway_key], 'gateway': '10.220.15.1'}},
+                {**system, gateway_key: {**system[gateway_key], 'gateway': '10.220.15.1'}},
+                {'ocvpn0'},
+                {**journal, direct_key: live[direct_key]}),
+            'main table disagrees': (
+                live, self.tunnel_routes('vtnet0', ''), {'ocvpn0', 'vtnet0'}, journal),
+            'main table lacks the route': (live, {}, {'ocvpn0'}, journal),
+        }
+        for name, (current, native, present, expected) in cases.items():
+            with self.subTest(name):
+                record = {'fib': 1, 'routes': json.loads(json.dumps(journal))}
+                harness = self.RenameHarness(dict(current), present)
+                with self.assertRaisesRegex(policy.RoutingError, 'owned elsewhere'):
+                    harness.sync(record, dict(native), native=native)
+                self.assertEqual(expected, record['routes'])
+                self.assertEqual(expected != journal, bool(harness.saved))
+
+    def test_rename_between_add_and_readback_is_journaled(self):
+        # Mirroring takes seconds; the tunnel can be renamed mid-way.
+        system = self.tunnel_routes('tun30000', '')
+        renamed = self.tunnel_routes('ocvpn0', 'S')
+
+        class Harness(self.RenameHarness):
+            def route_command(inner, action, _fib, value):
+                self.assertEqual('add', action)
+                key = route.route_key(value)
+                inner.live[key] = renamed[key]
+
+        for present, verified in (({'ocvpn0'}, True), ({'ocvpn0', 'tun30000'}, False)):
+            with self.subTest(present=present):
+                record = {'fib': 1, 'routes': {}}
+                harness = Harness({}, present)
+                if verified:
+                    harness.sync(record, dict(system), native=system)
+                    self.assertEqual(renamed, record['routes'])
+                else:
+                    with self.assertRaisesRegex(policy.RoutingError, 'could not be verified'):
+                        harness.sync(record, dict(system), native=system)
+                    self.assertEqual({}, record['routes'])
+                self.assertNotIn('pending_route', record)
+
+    def test_rename_is_not_looked_up_without_a_changed_interface(self):
+        live = self.tunnel_routes('ocvpn0', 'S')
+        system = self.tunnel_routes('ocvpn0', '')
+
+        class Harness(self.SyncHarness):
+            def interface_names(inner):
+                raise AssertionError('No interface lookup without a candidate.')
+
+        record = {'fib': 1, 'routes': json.loads(json.dumps(live))}
+        Harness(dict(live)).sync(record, dict(system), native=system)
+        self.assertEqual(live, record['routes'])
+
     def test_ambiguous_direct_default_add_is_preserved_without_adoption(self):
         wanted = {**forwarding('0.0.0.0/0', flags=''), 'gateway': 'interface',
                   'interface': 'tun_test'}
